@@ -1576,6 +1576,9 @@ unsafe fn emit_exact_clap(
     info: &PluginInfo,
     frames_count: u32,
 ) -> ExactEmit {
+    if !event.metadata().is_none() {
+        return ExactEmit::Unsupported;
+    }
     let sample_offset = event.sample_offset();
     if sample_offset >= frames_count {
         return ExactEmit::Invalid;

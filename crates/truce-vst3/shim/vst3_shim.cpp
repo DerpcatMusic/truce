@@ -8,6 +8,7 @@
  */
 
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -309,27 +310,123 @@ struct Vst3ParamDescriptor {
     const char* group;
 };
 
-struct Vst3MidiEvent {
-    uint32_t sample_offset;
-    uint8_t status;
+struct Vst3NativeEvent {
+    uint32_t kind;
+    int32_t sample_offset;
+    int32_t bus_index;
+    uint32_t flags;
+    int16_t channel;
+    int16_t pitch;
+    int32_t note_id;
+    uint32_t type_id;
+    int32_t length;
+    float velocity;
+    float tuning;
+    double value;
+    double ppq_position;
+    const uint8_t* bytes;
+    uint32_t len;
     uint8_t data1;
     uint8_t data2;
-    // Event bus index the event arrived on / goes out on, mapped to
-    // `Event::port`. Zero for single-port plugins. Mirrors `port` in
-    // `truce-vst3/src/ffi.rs`.
-    uint8_t port;
-    // The host's noteId on note on/off and note-expression events;
-    // -1 when the host assigned none (and on every other event kind).
-    // Full int32 because hosts hand out arbitrary per-voice counters,
-    // not pitches.
-    int32_t note_id;
-    // Full-precision note-expression value (0..=1) for status-0xF0
-    // events; 0.0 otherwise. Carried separately from data2 so the
-    // host's double survives the crossing unquantized.
-    double ne_value;
 };
-static_assert(sizeof(Vst3MidiEvent) == 24 && alignof(Vst3MidiEvent) == 8,
-              "layout must match truce-vst3/src/ffi.rs");
+static_assert(sizeof(Vst3NativeEvent) == 72, "Vst3NativeEvent size");
+static_assert(alignof(Vst3NativeEvent) == 8, "Vst3NativeEvent alignment");
+static_assert(offsetof(Vst3NativeEvent, kind) == 0, "Vst3NativeEvent.kind");
+static_assert(offsetof(Vst3NativeEvent, sample_offset) == 4, "Vst3NativeEvent.sample_offset");
+static_assert(offsetof(Vst3NativeEvent, bus_index) == 8, "Vst3NativeEvent.bus_index");
+static_assert(offsetof(Vst3NativeEvent, flags) == 12, "Vst3NativeEvent.flags");
+static_assert(offsetof(Vst3NativeEvent, channel) == 16, "Vst3NativeEvent.channel");
+static_assert(offsetof(Vst3NativeEvent, pitch) == 18, "Vst3NativeEvent.pitch");
+static_assert(offsetof(Vst3NativeEvent, note_id) == 20, "Vst3NativeEvent.note_id");
+static_assert(offsetof(Vst3NativeEvent, type_id) == 24, "Vst3NativeEvent.type_id");
+static_assert(offsetof(Vst3NativeEvent, length) == 28, "Vst3NativeEvent.length");
+static_assert(offsetof(Vst3NativeEvent, velocity) == 32, "Vst3NativeEvent.velocity");
+static_assert(offsetof(Vst3NativeEvent, tuning) == 36, "Vst3NativeEvent.tuning");
+static_assert(offsetof(Vst3NativeEvent, value) == 40, "Vst3NativeEvent.value");
+static_assert(offsetof(Vst3NativeEvent, ppq_position) == 48, "Vst3NativeEvent.ppq_position");
+static_assert(offsetof(Vst3NativeEvent, bytes) == 56, "Vst3NativeEvent.bytes");
+static_assert(offsetof(Vst3NativeEvent, len) == 64, "Vst3NativeEvent.len");
+static_assert(offsetof(Vst3NativeEvent, data1) == 68, "Vst3NativeEvent.data1");
+static_assert(offsetof(Vst3NativeEvent, data2) == 69, "Vst3NativeEvent.data2");
+
+enum Vst3SdkEventType : uint16_t {
+    kVst3NoteOnEvent = 0,
+    kVst3NoteOffEvent = 1,
+    kVst3DataEvent = 2,
+    kVst3PolyPressureEvent = 3,
+    kVst3NoteExpressionValueEvent = 4,
+    kVst3NoteExpressionTextEvent = 5,
+    kVst3ChordEvent = 6,
+    kVst3ScaleEvent = 7,
+    kVst3LegacyMidiCcOutEvent = 65535,
+};
+static_assert(kVst3NoteOnEvent == 0 && kVst3NoteOffEvent == 1,
+              "VST3 note event discriminants");
+static_assert(kVst3DataEvent == 2 && kVst3PolyPressureEvent == 3,
+              "VST3 data/pressure discriminants");
+static_assert(kVst3NoteExpressionValueEvent == 4
+                  && kVst3NoteExpressionTextEvent == 5,
+              "VST3 expression discriminants");
+static_assert(kVst3ChordEvent == 6 && kVst3ScaleEvent == 7,
+              "VST3 chord/scale discriminants");
+static_assert(kVst3LegacyMidiCcOutEvent == 65535,
+              "VST3 legacy MIDI CC discriminant");
+
+struct alignas(8) Vst3SdkEvent {
+    int32 busIndex;
+    int32 sampleOffset;
+    double ppqPosition;
+    uint16_t flags;
+    uint16_t type;
+    char pad[4];
+    union {
+        struct { int16_t channel; int16_t pitch; float tuning; float velocity; int32 length; int32 noteId; } noteOn;
+        struct { int16_t channel; int16_t pitch; float velocity; int32 noteId; float tuning; } noteOff;
+        struct { uint32_t size; uint32_t dataType; const uint8_t* bytes; } data;
+        struct { int16_t channel; int16_t pitch; float pressure; int32 noteId; } polyPressure;
+        struct { uint32_t typeId; int32_t noteId; double value; } noteExpressionValue;
+        struct { uint8_t controlNumber; int8_t channel; int8_t value; int8_t value2; } midiCCOut;
+    };
+};
+static_assert(sizeof(Vst3SdkEvent) == 48, "VST3 Event size");
+static_assert(alignof(Vst3SdkEvent) == 8, "VST3 Event alignment");
+static_assert(offsetof(Vst3SdkEvent, busIndex) == 0, "VST3 Event.busIndex");
+static_assert(offsetof(Vst3SdkEvent, sampleOffset) == 4, "VST3 Event.sampleOffset");
+static_assert(offsetof(Vst3SdkEvent, ppqPosition) == 8, "VST3 Event.ppqPosition");
+static_assert(offsetof(Vst3SdkEvent, flags) == 16, "VST3 Event.flags");
+static_assert(offsetof(Vst3SdkEvent, type) == 18, "VST3 Event.type");
+static_assert(offsetof(Vst3SdkEvent, pad) == 20, "VST3 Event union padding");
+static_assert(offsetof(Vst3SdkEvent, noteOn) == 24, "VST3 Event.noteOn");
+static_assert(offsetof(Vst3SdkEvent, noteOn.channel) == 24, "VST3 NoteOn.channel");
+static_assert(offsetof(Vst3SdkEvent, noteOn.pitch) == 26, "VST3 NoteOn.pitch");
+static_assert(offsetof(Vst3SdkEvent, noteOn.tuning) == 28, "VST3 NoteOn.tuning");
+static_assert(offsetof(Vst3SdkEvent, noteOn.velocity) == 32, "VST3 NoteOn.velocity");
+static_assert(offsetof(Vst3SdkEvent, noteOn.length) == 36, "VST3 NoteOn.length");
+static_assert(offsetof(Vst3SdkEvent, noteOn.noteId) == 40, "VST3 NoteOn.noteId");
+static_assert(offsetof(Vst3SdkEvent, noteOff) == 24, "VST3 Event.noteOff");
+static_assert(offsetof(Vst3SdkEvent, noteOff.channel) == 24, "VST3 NoteOff.channel");
+static_assert(offsetof(Vst3SdkEvent, noteOff.pitch) == 26, "VST3 NoteOff.pitch");
+static_assert(offsetof(Vst3SdkEvent, noteOff.velocity) == 28, "VST3 NoteOff.velocity");
+static_assert(offsetof(Vst3SdkEvent, noteOff.noteId) == 32, "VST3 NoteOff.noteId");
+static_assert(offsetof(Vst3SdkEvent, noteOff.tuning) == 36, "VST3 NoteOff.tuning");
+static_assert(offsetof(Vst3SdkEvent, data) == 24, "VST3 Event.data");
+static_assert(offsetof(Vst3SdkEvent, data.size) == 24, "VST3 Data.size");
+static_assert(offsetof(Vst3SdkEvent, data.dataType) == 28, "VST3 Data.type");
+static_assert(offsetof(Vst3SdkEvent, data.bytes) == 32, "VST3 Data.bytes");
+static_assert(offsetof(Vst3SdkEvent, polyPressure) == 24, "VST3 Event.polyPressure");
+static_assert(offsetof(Vst3SdkEvent, polyPressure.channel) == 24, "VST3 Pressure.channel");
+static_assert(offsetof(Vst3SdkEvent, polyPressure.pitch) == 26, "VST3 Pressure.pitch");
+static_assert(offsetof(Vst3SdkEvent, polyPressure.pressure) == 28, "VST3 Pressure.value");
+static_assert(offsetof(Vst3SdkEvent, polyPressure.noteId) == 32, "VST3 Pressure.noteId");
+static_assert(offsetof(Vst3SdkEvent, noteExpressionValue) == 24, "VST3 Event.noteExpression");
+static_assert(offsetof(Vst3SdkEvent, noteExpressionValue.typeId) == 24, "VST3 Expression.typeId");
+static_assert(offsetof(Vst3SdkEvent, noteExpressionValue.noteId) == 28, "VST3 Expression.noteId");
+static_assert(offsetof(Vst3SdkEvent, noteExpressionValue.value) == 32, "VST3 Expression.value");
+static_assert(offsetof(Vst3SdkEvent, midiCCOut) == 24, "VST3 Event.midiCCOut");
+static_assert(offsetof(Vst3SdkEvent, midiCCOut.controlNumber) == 24, "VST3 MIDI CC.number");
+static_assert(offsetof(Vst3SdkEvent, midiCCOut.channel) == 25, "VST3 MIDI CC.channel");
+static_assert(offsetof(Vst3SdkEvent, midiCCOut.value) == 26, "VST3 MIDI CC.value");
+static_assert(offsetof(Vst3SdkEvent, midiCCOut.value2) == 27, "VST3 MIDI CC.value2");
 
 struct Vst3Transport {
     int32_t playing;
@@ -356,12 +453,10 @@ struct Vst3Callbacks {
     void (*destroy)(void*);
     void (*reset)(void*, double, uint32_t, int32_t);
     void (*process)(void*, const float**, float**, uint32_t, uint32_t, uint32_t,
-                    const Vst3MidiEvent*, uint32_t,
                     const Vst3Transport*, const Vst3ParamChange*, uint32_t, int32_t);
     /* 64-bit twin of process. Exactly one of the two runs per block,
      * chosen by the sample size negotiated in setupProcessing. */
     void (*process_f64)(void*, const double**, double**, uint32_t, uint32_t, uint32_t,
-                        const Vst3MidiEvent*, uint32_t,
                         const Vst3Transport*, const Vst3ParamChange*, uint32_t, int32_t);
     uint32_t (*param_count)(void*);
     double (*param_get_value)(void*, uint32_t);
@@ -379,37 +474,11 @@ struct Vst3Callbacks {
     // Latency + tail
     uint32_t (*get_latency)(void*);
     uint32_t (*get_tail)(void*);
-    // Output events
-    uint32_t (*get_output_event_count)(void*);
-    void (*get_output_event)(void*, uint32_t, Vst3MidiEvent*);
-    // SysEx input - shim calls this once per `kDataEvent` /
-    // `MIDI_SYSEX` event seen in the input event list, before
-    // calling `process`. Bytes are the inner SysEx payload (no
-    // 0xF0 / 0xF7 framing; VST3 hosts deliver the inner data per
-    // the SDK convention). Pointer is valid for the duration of
-    // this call only.
-    void (*push_sysex_input)(void*, uint32_t /*sample_offset*/, uint8_t /*port*/,
-                             const uint8_t* /*bytes*/, uint32_t /*len*/);
-    // SysEx output - shim queries after `process` to drain
-    // SysEx-shaped events the plug-in pushed. Bytes are the inner
-    // payload; the shim wraps them in `kDataEvent` + `MIDI_SYSEX`
-    // when forwarding to the host's output `IEventList`.
-    uint32_t (*get_output_sysex_count)(void*);
-    void (*get_output_sysex_event)(void*, uint32_t /*index*/,
-                                   uint32_t* /*sample_offset*/,
-                                   uint8_t* /*port*/,
-                                   const uint8_t** /*bytes*/,
-                                   uint32_t* /*len*/);
-    // Note-expression output - per-note MIDI 2.0 events the plug-in
-    // pushed, mapped to VST3 `kNoteExpressionValueEvent` (VST3 has no
-    // UMP). `note_id` correlates to the emitted note on/off.
-    uint32_t (*get_output_note_expression_count)(void*);
-    void (*get_output_note_expression)(void*, uint32_t /*index*/,
-                                       uint32_t* /*type_id*/,
-                                       int32_t* /*note_id*/,
-                                       uint32_t* /*sample_offset*/,
-                                       double* /*value*/,
-                                       uint8_t* /*port*/);
+    void (*begin_input_events)(void*, uint32_t /*num_frames*/);
+    uint32_t (*push_input_event)(void*, const Vst3NativeEvent*);
+    void (*begin_output_events)(void*);
+    uint32_t (*next_output_event)(void*, Vst3NativeEvent*);
+    void (*commit_output_event)(void*);
     // GUI
     int32_t (*gui_has_editor)(void*);
     void (*gui_get_size)(void*, uint32_t*, uint32_t*);
@@ -1406,12 +1475,13 @@ public:
                 memcpy(outPtrs[c], inPtrs[c], numFrames * sampleBytes);
         }
 
-        // Convert VST3 input events (note on/off) to Vst3MidiEvent
-        Vst3MidiEvent midiEvents[256];
-        uint32_t numMidi = 0;
+        // Traverse the host list directly in its original order. Rust owns the
+        // bounded queue and reports queue-full explicitly; no fixed C++ staging
+        // array can silently truncate a dense block.
+        if (g_cb->begin_input_events)
+            g_cb->begin_input_events(ctx, (uint32_t)numFrames);
 
-        if (data->inputEvents) {
-            // IEventList vtable: qi, addRef, release, getEventCount, getEvent, addEvent
+        if (data->inputEvents && g_cb->push_input_event) {
             struct IEventListVtbl {
                 tresult (*qi)(void*, const TUID, void**);
                 uint32 (*addRef)(void*);
@@ -1423,382 +1493,164 @@ public:
             struct { IEventListVtbl* vtbl; } *eventList =
                 (decltype(eventList))data->inputEvents;
 
-            // VST3 Event struct layout (must match SDK exactly)
-            // The union requires 8-byte alignment due to NoteExpressionValueEvent containing a double.
-            struct Vst3Event {
-                int32 busIndex;          // offset 0
-                int32 sampleOffset;      // offset 4
-                double ppqPosition;      // offset 8
-                uint16_t flags;          // offset 16
-                uint16_t type;           // offset 18
-                // 4 bytes padding here (union is 8-byte aligned)
-                union {
-                    struct { int16_t channel; int16_t pitch; float tuning; float velocity; int32 length; int32 noteId; } noteOn;
-                    struct { int16_t channel; int16_t pitch; float velocity; int32 noteId; float tuning; } noteOff;
-                    struct { int16_t channel; int16_t pitch; float pressure; int32 noteId; } polyPressure;
-                    struct { int32 typeId; int32 noteId; double value; } noteExpressionValue; // forces 8-byte alignment
-                    struct { uint8_t controlNumber; int8_t channel; int8_t value; int8_t value2; } midiCCOut;
-                    // kDataEvent - VST3 SDK `Event::DataEvent`. The
-                    // `type` discriminant (0 = MIDI_SYSEX) tells us
-                    // the byte stream's semantics; `bytes` is owned
-                    // by the host for the duration of the
-                    // `getEvent` call.
-                    struct { uint32_t size; uint32_t dataType; const uint8_t* bytes; } data;
-                };
-            };
-
-            int32 eventCount = eventList->vtbl->getEventCount(eventList);
-            for (int32 i = 0; i < eventCount && numMidi < 256; i++) {
-                Vst3Event ev = {};
+            const int32 eventCount = eventList->vtbl->getEventCount(eventList);
+            for (int32 i = 0; i < eventCount; i++) {
+                Vst3SdkEvent ev = {};
                 if (eventList->vtbl->getEvent(eventList, i, &ev) != kResultOk)
-                    continue;
+                    break;
 
-                // Stamp the event bus index onto whatever slot the
-                // switch fills next (numMidi only advances on a fill),
-                // and default the note-expression-only fields so the
-                // cases that don't carry them hand Rust clean values.
-                midiEvents[numMidi].port = ev.busIndex < 0 ? 0 : (uint8_t)ev.busIndex;
-                midiEvents[numMidi].note_id = -1;
-                midiEvents[numMidi].ne_value = 0.0;
-
+                Vst3NativeEvent native = {};
+                native.kind = ev.type;
+                native.sample_offset = ev.sampleOffset;
+                native.bus_index = ev.busIndex;
+                native.flags = ev.flags;
+                native.ppq_position = ev.ppqPosition;
+                native.note_id = -1;
                 switch (ev.type) {
-                    case 0: // kNoteOnEvent
-                        midiEvents[numMidi].sample_offset = ev.sampleOffset;
-                        midiEvents[numMidi].status = 0x90 | (ev.noteOn.channel & 0x0F);
-                        midiEvents[numMidi].data1 = ev.noteOn.pitch & 0x7F;
-                        midiEvents[numMidi].data2 = (uint8_t)(ev.noteOn.velocity * 127.0f);
-                        midiEvents[numMidi].note_id = ev.noteOn.noteId;
-                        numMidi++;
+                    case kVst3NoteOnEvent:
+                        native.channel = ev.noteOn.channel;
+                        native.pitch = ev.noteOn.pitch;
+                        native.note_id = ev.noteOn.noteId;
+                        native.length = ev.noteOn.length;
+                        native.velocity = ev.noteOn.velocity;
+                        native.tuning = ev.noteOn.tuning;
                         break;
-                    case 1: // kNoteOffEvent
-                        midiEvents[numMidi].sample_offset = ev.sampleOffset;
-                        midiEvents[numMidi].status = 0x80 | (ev.noteOff.channel & 0x0F);
-                        midiEvents[numMidi].data1 = ev.noteOff.pitch & 0x7F;
-                        midiEvents[numMidi].data2 = (uint8_t)(ev.noteOff.velocity * 127.0f);
-                        midiEvents[numMidi].note_id = ev.noteOff.noteId;
-                        numMidi++;
+                    case kVst3NoteOffEvent:
+                        native.channel = ev.noteOff.channel;
+                        native.pitch = ev.noteOff.pitch;
+                        native.note_id = ev.noteOff.noteId;
+                        native.velocity = ev.noteOff.velocity;
+                        native.tuning = ev.noteOff.tuning;
                         break;
-                    case 3: // kPolyPressureEvent
-                        midiEvents[numMidi].sample_offset = ev.sampleOffset;
-                        midiEvents[numMidi].status = 0xA0 | (ev.polyPressure.channel & 0x0F);
-                        midiEvents[numMidi].data1 = ev.polyPressure.pitch & 0x7F;
-                        midiEvents[numMidi].data2 = (uint8_t)(ev.polyPressure.pressure * 127.0f);
-                        numMidi++;
+                    case kVst3DataEvent:
+                        native.type_id = ev.data.dataType;
+                        native.bytes = ev.data.bytes;
+                        native.len = ev.data.size;
                         break;
-                    case 4: // kNoteExpressionValueEvent
-                        // status=0xF0 marker, data1=typeId, full-precision
-                        // value in ne_value, host voice counter in note_id
-                        // (Rust resolves it to channel/pitch via the map it
-                        // builds from note-on noteIds).
-                        // typeId: 0=volume, 1=pan, 2=tuning, 3=vibrato, 4=expression, 5=brightness
-                        // Custom typeIds (kCustomStart 100000+) don't fit
-                        // data1 and have no truce mapping; skip them.
-                        if (ev.noteExpressionValue.typeId > 5) break;
-                        midiEvents[numMidi].sample_offset = ev.sampleOffset;
-                        midiEvents[numMidi].status = 0xF0; // marker for note expression
-                        midiEvents[numMidi].data1 = (uint8_t)ev.noteExpressionValue.typeId;
-                        midiEvents[numMidi].data2 = 0;
-                        midiEvents[numMidi].note_id = ev.noteExpressionValue.noteId;
-                        midiEvents[numMidi].ne_value = ev.noteExpressionValue.value;
-                        numMidi++;
+                    case kVst3PolyPressureEvent:
+                        native.channel = ev.polyPressure.channel;
+                        native.pitch = ev.polyPressure.pitch;
+                        native.note_id = ev.polyPressure.noteId;
+                        native.velocity = ev.polyPressure.pressure;
                         break;
-                    case 65535: // kLegacyMIDICCOutEvent
-                        midiEvents[numMidi].sample_offset = ev.sampleOffset;
-                        switch (ev.midiCCOut.controlNumber) {
-                            case 128: // kCtrlAfterTouch: channel pressure
-                                midiEvents[numMidi].status = 0xD0 | (ev.midiCCOut.channel & 0x0F);
-                                midiEvents[numMidi].data1 = ev.midiCCOut.value & 0x7F;
-                                midiEvents[numMidi].data2 = 0;
-                                numMidi++;
-                                break;
-                            case 129: // kCtrlPitchBend
-                                midiEvents[numMidi].status = 0xE0 | (ev.midiCCOut.channel & 0x0F);
-                                midiEvents[numMidi].data1 = ev.midiCCOut.value & 0x7F;
-                                midiEvents[numMidi].data2 = ev.midiCCOut.value2 & 0x7F;
-                                numMidi++;
-                                break;
-                            case 130: // kCtrlProgramChange
-                                midiEvents[numMidi].status = 0xC0 | (ev.midiCCOut.channel & 0x0F);
-                                midiEvents[numMidi].data1 = ev.midiCCOut.value & 0x7F;
-                                midiEvents[numMidi].data2 = 0;
-                                numMidi++;
-                                break;
-                            default:
-                                if (ev.midiCCOut.controlNumber <= 127) {
-                                    midiEvents[numMidi].status = 0xB0 | (ev.midiCCOut.channel & 0x0F);
-                                    midiEvents[numMidi].data1 = ev.midiCCOut.controlNumber & 0x7F;
-                                    midiEvents[numMidi].data2 = ev.midiCCOut.value & 0x7F;
-                                    numMidi++;
-                                }
-                                break;
-                        }
+                    case kVst3NoteExpressionValueEvent:
+                        native.type_id = ev.noteExpressionValue.typeId;
+                        native.note_id = ev.noteExpressionValue.noteId;
+                        native.value = ev.noteExpressionValue.value;
                         break;
-                    case 2: // kDataEvent - SysEx and other variable-length blobs
-                        // SDK: `ivstevents.h` enumerates Event types as
-                        // kNoteOnEvent=0, kNoteOffEvent=1, kDataEvent=2,
-                        // kPolyPressureEvent=3, kNoteExpression*=4..5,
-                        // kChordEvent=6, kScaleEvent=7, and
-                        // kLegacyMIDICCOut=65535.
-                        // The `kMidiSysEx` discriminant inside the union is
-                        // separately 0 (per the SDK's `DataEvent::DataTypes`
-                        // enum). Anything other than `kMidiSysEx` is
-                        // undefined territory (future SDK extension); skip
-                        // silently.
-                        if (ev.data.dataType == 0 && ev.data.bytes && ev.data.size > 0
-                                && g_cb && g_cb->push_sysex_input) {
-                            g_cb->push_sysex_input(ctx, ev.sampleOffset,
-                                                   ev.busIndex < 0 ? 0 : (uint8_t)ev.busIndex,
-                                                   ev.data.bytes, ev.data.size);
-                        }
+                    default:
                         break;
                 }
+                const uint32_t result = g_cb->push_input_event(ctx, &native);
+                if (result == 4) // QueueFull: retain one ordered prefix.
+                    break;
             }
         }
 
         if (use64)
             g_cb->process_f64(ctx, (const double**)inPtrs, (double**)outPtrs,
                               numIn, numOut, numFrames,
-                              midiEvents, numMidi,
                               transportPtr, paramChanges, numParamChanges,
                               data->processMode);
         else
             g_cb->process(ctx, (const float**)inPtrs, (float**)outPtrs,
                           numIn, numOut, numFrames,
-                          midiEvents, numMidi,
                           transportPtr, paramChanges, numParamChanges,
                           data->processMode);
 
-        // Forward output events (MIDI output from instruments/effects)
-        if (data->outputEvents && g_cb->get_output_event_count) {
-            uint32_t outCount = g_cb->get_output_event_count(ctx);
-            if (outCount > 0) {
-                struct { void* vtbl; } *eventList = (decltype(eventList))data->outputEvents;
-                struct OEVtbl {
-                    tresult (*qi)(void*, const TUID, void**);
-                    uint32 (*addRef)(void*);
-                    uint32 (*release)(void*);
-                    int32 (*getEventCount)(void*);
-                    tresult (*getEvent)(void*, int32, void*);
-                    tresult (*addEvent)(void*, void*);
-                };
-                auto* vtbl = (OEVtbl*)eventList->vtbl;
+        // Drain exactly one globally ordered lossless stream. Rust validates
+        // each event and proposes note-ID lifecycle changes; those changes are
+        // committed only after the host accepts the corresponding SDK event.
+        if (data->outputEvents && g_cb->begin_output_events
+                && g_cb->next_output_event && g_cb->commit_output_event) {
+            struct OEVtbl {
+                tresult (*qi)(void*, const TUID, void**);
+                uint32 (*addRef)(void*);
+                uint32 (*release)(void*);
+                int32 (*getEventCount)(void*);
+                tresult (*getEvent)(void*, int32, void*);
+                tresult (*addEvent)(void*, void*);
+            };
+            struct { OEVtbl* vtbl; } *eventList =
+                (decltype(eventList))data->outputEvents;
+            enum OutputEventResult : uint32_t {
+                kOutputEnd = 0,
+                kOutputEmitted = 1,
+                kOutputUnsupported = 2,
+                kOutputInvalid = 3,
+                kOutputQueueFull = 4,
+            };
 
-                // Note on/off and poly key pressure are first-class
-                // VST3 Event types; CC, channel pressure, pitch bend,
-                // and program change ride `kLegacyMIDICCOutEvent`, the
-                // SDK's path for a plug-in emitting MIDI controllers to
-                // the host. Type ids and controller numbers are from the
-                // VST3 SDK (`ivstevents.h`, `ivstmidicontrollers.h`);
-                // the shim doesn't vendor the SDK, so they're named here.
-                enum {
-                    kNoteOnEvent = 0,
-                    kNoteOffEvent = 1,
-                    kPolyPressureEvent = 3,
-                    kLegacyMIDICCOutEvent = 65535,
-                };
-                enum {
-                    kCtrlAfterTouch = 128, // channel pressure
-                    kCtrlPitchBend = 129,
-                    kCtrlProgramChange = 130,
-                };
-                struct alignas(8) Vst3OutEvent {
-                    int32 busIndex;
-                    int32 sampleOffset;
-                    double ppqPosition;
-                    uint16_t flags;
-                    uint16_t type;
-                    char pad[4];
-                    union {
-                        struct { int16_t channel; int16_t pitch; float tuning; float velocity; int32 length; int32 noteId; } noteOn;
-                        struct { int16_t channel; int16_t pitch; float velocity; int32 noteId; float tuning; } noteOff;
-                        struct { int16_t channel; int16_t pitch; float pressure; int32 noteId; } polyPressure;
-                        struct { uint8_t controlNumber; int8_t channel; int8_t value; int8_t value2; } midiCCOut;
-                        struct { uint32_t typeId; int32 noteId; double value; } noteExpression;
-                    };
-                };
-                static_assert(sizeof(Vst3OutEvent) == 48,
-                              "must match the SDK Event size addEvent copies");
+            g_cb->begin_output_events(ctx);
+            OutputEventResult drainResult = kOutputEnd;
+            for (;;) {
+                Vst3NativeEvent native = {};
+                const uint32_t next = g_cb->next_output_event(ctx, &native);
+                if (next == kOutputEnd)
+                    break;
+                if (next == kOutputUnsupported || next == kOutputInvalid)
+                    continue;
+                if (next != kOutputEmitted) {
+                    drainResult = kOutputInvalid;
+                    break;
+                }
 
-                for (uint32_t i = 0; i < outCount; i++) {
-                    Vst3MidiEvent mev = {};
-                    g_cb->get_output_event(ctx, i, &mev);
-                    if (mev.status == 0) continue;
-
-                    Vst3OutEvent ev = {};
-                    ev.sampleOffset = mev.sample_offset;
-                    // Route to the plug-in's chosen event output bus,
-                    // clamped to the declared count (fall back to bus 0).
-                    ev.busIndex = (mev.port < g_desc->midi_output_ports) ? mev.port : 0;
-                    uint8_t st = mev.status & 0xF0;
-                    int16_t ch = mev.status & 0x0F;
-                    // Deterministic noteId `(channel << 7) | pitch` so a
-                    // plug-in's note-expression events (drained below) can
-                    // correlate to the note without shared state. Mirrors
-                    // `vst3_note_id` on the Rust side.
-                    int32 note_id = (int32(ch) << 7) | (mev.data1 & 0x7F);
-                    switch (st) {
-                    case 0x90: // note on
-                        ev.type = kNoteOnEvent;
-                        ev.noteOn.channel = ch;
-                        ev.noteOn.pitch = mev.data1;
-                        ev.noteOn.velocity = mev.data2 / 127.0f;
-                        ev.noteOn.noteId = note_id;
+                Vst3SdkEvent ev = {};
+                ev.busIndex = native.bus_index;
+                ev.sampleOffset = native.sample_offset;
+                ev.ppqPosition = native.ppq_position;
+                ev.flags = (uint16_t)native.flags;
+                ev.type = (uint16_t)native.kind;
+                switch (native.kind) {
+                    case kVst3NoteOnEvent:
+                        ev.noteOn.channel = native.channel;
+                        ev.noteOn.pitch = native.pitch;
+                        ev.noteOn.tuning = native.tuning;
+                        ev.noteOn.velocity = native.velocity;
+                        ev.noteOn.length = native.length;
+                        ev.noteOn.noteId = native.note_id;
                         break;
-                    case 0x80: // note off
-                        ev.type = kNoteOffEvent;
-                        ev.noteOff.channel = ch;
-                        ev.noteOff.pitch = mev.data1;
-                        ev.noteOff.velocity = mev.data2 / 127.0f;
-                        ev.noteOff.noteId = note_id;
+                    case kVst3NoteOffEvent:
+                        ev.noteOff.channel = native.channel;
+                        ev.noteOff.pitch = native.pitch;
+                        ev.noteOff.velocity = native.velocity;
+                        ev.noteOff.noteId = native.note_id;
+                        ev.noteOff.tuning = native.tuning;
                         break;
-                    case 0xA0: // poly key pressure
-                        ev.type = kPolyPressureEvent;
-                        ev.polyPressure.channel = ch;
-                        ev.polyPressure.pitch = mev.data1;
-                        ev.polyPressure.pressure = mev.data2 / 127.0f;
-                        ev.polyPressure.noteId = -1;
+                    case kVst3DataEvent:
+                        ev.data.size = native.len;
+                        ev.data.dataType = native.type_id;
+                        ev.data.bytes = native.bytes;
                         break;
-                    case 0xB0: // control change
-                        ev.type = kLegacyMIDICCOutEvent;
-                        ev.midiCCOut.controlNumber = mev.data1;
-                        ev.midiCCOut.channel = (int8_t)ch;
-                        ev.midiCCOut.value = (int8_t)mev.data2;
+                    case kVst3PolyPressureEvent:
+                        ev.polyPressure.channel = native.channel;
+                        ev.polyPressure.pitch = native.pitch;
+                        ev.polyPressure.pressure = native.velocity;
+                        ev.polyPressure.noteId = native.note_id;
                         break;
-                    case 0xD0: // channel pressure (mono aftertouch)
-                        ev.type = kLegacyMIDICCOutEvent;
-                        ev.midiCCOut.controlNumber = kCtrlAfterTouch;
-                        ev.midiCCOut.channel = (int8_t)ch;
-                        ev.midiCCOut.value = (int8_t)mev.data1;
+                    case kVst3NoteExpressionValueEvent:
+                        ev.noteExpressionValue.typeId = native.type_id;
+                        ev.noteExpressionValue.noteId = native.note_id;
+                        ev.noteExpressionValue.value = native.value;
                         break;
-                    case 0xE0: // pitch bend (data1 = LSB, data2 = MSB)
-                        ev.type = kLegacyMIDICCOutEvent;
-                        ev.midiCCOut.controlNumber = kCtrlPitchBend;
-                        ev.midiCCOut.channel = (int8_t)ch;
-                        ev.midiCCOut.value = (int8_t)mev.data1;
-                        ev.midiCCOut.value2 = (int8_t)mev.data2;
-                        break;
-                    case 0xC0: // program change
-                        ev.type = kLegacyMIDICCOutEvent;
-                        ev.midiCCOut.controlNumber = kCtrlProgramChange;
-                        ev.midiCCOut.channel = (int8_t)ch;
-                        ev.midiCCOut.value = (int8_t)mev.data1;
+                    case kVst3LegacyMidiCcOutEvent:
+                        ev.midiCCOut.controlNumber = (uint8_t)native.type_id;
+                        ev.midiCCOut.channel = (int8_t)native.channel;
+                        ev.midiCCOut.value = (int8_t)native.data1;
+                        ev.midiCCOut.value2 = (int8_t)native.data2;
                         break;
                     default:
                         continue;
-                    }
-                    vtbl->addEvent(data->outputEvents, &ev);
                 }
-            }
 
-            // Note-expression output - the plug-in's per-note MIDI 2.0
-            // events (PerNoteCC / PerNotePitchBend) mapped to VST3
-            // `kNoteExpressionValueEvent`. `noteId` matches the note-on
-            // emitted above (both use `(channel << 7) | pitch`). Bus 0.
-            if (g_cb->get_output_note_expression_count && g_cb->get_output_note_expression) {
-                struct OEVtbl {
-                    tresult (*qi)(void*, const TUID, void**);
-                    uint32 (*addRef)(void*);
-                    uint32 (*release)(void*);
-                    int32 (*getEventCount)(void*);
-                    tresult (*getEvent)(void*, int32, void*);
-                    tresult (*addEvent)(void*, void*);
-                };
-                struct { OEVtbl* vtbl; } *eventList =
-                    (decltype(eventList))data->outputEvents;
-                struct alignas(8) Vst3OutNoteExprEvent {
-                    int32 busIndex;
-                    int32 sampleOffset;
-                    double ppqPosition;
-                    uint16_t flags;
-                    uint16_t type;
-                    char pad[4];
-                    struct { uint32_t typeId; int32 noteId; double value; } noteExpression;
-                    /* The SDK's Event is sized by its largest union
-                     * member (48 bytes total); the host's addEvent
-                     * copies sizeof(Event), so a shorter local struct
-                     * would have it read past our stack object. Pad to
-                     * the full size ({} init zeroes it). */
-                    char sdkTailPad[8];
-                };
-                static_assert(sizeof(Vst3OutNoteExprEvent) == 48,
-                              "must match the SDK Event size addEvent copies");
-                uint32_t neCount = g_cb->get_output_note_expression_count(ctx);
-                for (uint32_t i = 0; i < neCount; i++) {
-                    uint32_t typeId = 0;
-                    int32 noteId = -1;
-                    uint32_t sampleOffset = 0;
-                    double value = 0.0;
-                    uint8_t port = 0;
-                    g_cb->get_output_note_expression(ctx, i, &typeId, &noteId,
-                                                     &sampleOffset, &value, &port);
-                    Vst3OutNoteExprEvent ev = {};
-                    ev.type = 4; // kNoteExpressionValueEvent (SDK ivstevents.h)
-                    /* Same bus as the correlated note-on (same clamp as
-                     * the channel-voice drain): hosts scope noteIds per
-                     * bus, so bus-0 expressions on a bus-1 note never
-                     * correlate. */
-                    ev.busIndex = (port < g_desc->midi_output_ports) ? port : 0;
-                    ev.sampleOffset = sampleOffset;
-                    ev.noteExpression.typeId = typeId;
-                    ev.noteExpression.noteId = noteId;
-                    ev.noteExpression.value = value;
-                    eventList->vtbl->addEvent(data->outputEvents, &ev);
+                if (eventList->vtbl->addEvent(data->outputEvents, &ev) != kResultOk) {
+                    drainResult = kOutputQueueFull;
+                    break;
                 }
+                g_cb->commit_output_event(ctx);
+                drainResult = kOutputEmitted;
             }
-
-            // SysEx output - separate slot from channel-voice
-            // because the payload is variable-length. We build a
-            // VST3 `kDataEvent` (type 2) with `dataType = 0`
-            // (`kMidiSysEx`) pointing at the bytes Rust hands us.
-            // The host's `addEvent` is the SDK's
-            // `IEventList::addEvent`, which copies the event +
-            // its inline bytes into the host's own buffer before
-            // returning - so the pointer staying valid only for
-            // the duration of the call is the right contract.
-            if (g_cb->get_output_sysex_count && g_cb->get_output_sysex_event) {
-                struct OEVtbl {
-                    tresult (*qi)(void*, const TUID, void**);
-                    uint32 (*addRef)(void*);
-                    uint32 (*release)(void*);
-                    int32 (*getEventCount)(void*);
-                    tresult (*getEvent)(void*, int32, void*);
-                    tresult (*addEvent)(void*, void*);
-                };
-                struct { OEVtbl* vtbl; } *eventList =
-                    (decltype(eventList))data->outputEvents;
-                uint32_t sysexCount = g_cb->get_output_sysex_count(ctx);
-                for (uint32_t i = 0; i < sysexCount; i++) {
-                    uint32_t sampleOffset = 0;
-                    uint8_t port = 0;
-                    const uint8_t* bytes = nullptr;
-                    uint32_t len = 0;
-                    g_cb->get_output_sysex_event(ctx, i, &sampleOffset, &port, &bytes, &len);
-                    if (!bytes || len == 0) continue;
-                    struct alignas(8) Vst3OutDataEvent {
-                        int32 busIndex;
-                        int32 sampleOffset;
-                        double ppqPosition;
-                        uint16_t flags;
-                        uint16_t type;
-                        char pad[4];
-                        // SDK union member that matches `DataEvent`.
-                        struct { uint32_t size; uint32_t dataType; const uint8_t* bytes; } data;
-                        /* Pad to the SDK Event size addEvent copies;
-                         * see Vst3OutNoteExprEvent. {} init zeroes it. */
-                        char sdkTailPad[8];
-                    };
-                    static_assert(sizeof(Vst3OutDataEvent) == 48,
-                                  "must match the SDK Event size addEvent copies");
-                    Vst3OutDataEvent ev = {};
-                    ev.sampleOffset = sampleOffset;
-                    ev.busIndex = (port < g_desc->midi_output_ports) ? port : 0;
-                    ev.type = 2; // kDataEvent (SDK ivstevents.h)
-                    ev.data.size = len;
-                    ev.data.dataType = 0; // kMidiSysEx
-                    ev.data.bytes = bytes;
-                    eventList->vtbl->addEvent(data->outputEvents, &ev);
-                }
-            }
+            (void)drainResult;
         }
 
         // Forward process-emitted parameter changes to the host's

@@ -1,6 +1,7 @@
 //! C ABI types for the Rust / C++ VST3 shim boundary.
 
 use std::ffi::c_void;
+use std::mem::{align_of, offset_of, size_of};
 use std::os::raw::c_char;
 
 /// Plugin descriptor passed from Rust to the C++ shim.
@@ -75,29 +76,53 @@ pub struct Vst3ParamDescriptor {
     pub group: *const c_char,
 }
 
-/// MIDI event passed across the Rust ↔ C++ boundary in both
-/// directions (host → plugin via `events` / `num_events` and plugin →
-/// host via `cb_get_output_event`).
+/// Flat, pointer-free except for borrowed `SysEx` bytes, representation of one
+/// VST3 native event. The shim traverses the host's `IEventList` in place and
+/// hands events to Rust one at a time, avoiding a fixed-size staging array.
 #[repr(C)]
-#[derive(Copy, Clone)]
-pub struct Vst3MidiEvent {
-    pub sample_offset: u32,
-    pub status: u8,
+#[derive(Copy, Clone, Default)]
+pub struct Vst3NativeEvent {
+    pub kind: u32,
+    pub sample_offset: i32,
+    pub bus_index: i32,
+    pub flags: u32,
+    pub channel: i16,
+    pub pitch: i16,
+    pub note_id: i32,
+    /// Note-expression type ID, `SysEx` data type, or legacy controller ID.
+    pub type_id: u32,
+    pub length: i32,
+    pub velocity: f32,
+    pub tuning: f32,
+    pub value: f64,
+    pub ppq_position: f64,
+    pub bytes: *const u8,
+    pub len: u32,
     pub data1: u8,
     pub data2: u8,
-    /// Event bus index the event arrived on / goes out on, mapped to
-    /// [`truce_core::Event::port`]. `0` for single-port plugins.
-    pub port: u8,
-    /// The host's VST3 `noteId` on note on/off and note-expression
-    /// events; `-1` when the host assigned none (and on every other
-    /// event kind). Full `i32` because hosts hand out arbitrary
-    /// per-voice counters, not pitches.
-    pub note_id: i32,
-    /// Full-precision note-expression value (`0..=1`) for
-    /// status-`0xF0` events; `0.0` otherwise. Carried separately from
-    /// `data2` so the host's `f64` survives the crossing unquantized.
-    pub ne_value: f64,
 }
+
+const _: () = {
+    assert!(size_of::<Vst3NativeEvent>() == 72);
+    assert!(align_of::<Vst3NativeEvent>() == 8);
+    assert!(offset_of!(Vst3NativeEvent, kind) == 0);
+    assert!(offset_of!(Vst3NativeEvent, sample_offset) == 4);
+    assert!(offset_of!(Vst3NativeEvent, bus_index) == 8);
+    assert!(offset_of!(Vst3NativeEvent, flags) == 12);
+    assert!(offset_of!(Vst3NativeEvent, channel) == 16);
+    assert!(offset_of!(Vst3NativeEvent, pitch) == 18);
+    assert!(offset_of!(Vst3NativeEvent, note_id) == 20);
+    assert!(offset_of!(Vst3NativeEvent, type_id) == 24);
+    assert!(offset_of!(Vst3NativeEvent, length) == 28);
+    assert!(offset_of!(Vst3NativeEvent, velocity) == 32);
+    assert!(offset_of!(Vst3NativeEvent, tuning) == 36);
+    assert!(offset_of!(Vst3NativeEvent, value) == 40);
+    assert!(offset_of!(Vst3NativeEvent, ppq_position) == 48);
+    assert!(offset_of!(Vst3NativeEvent, bytes) == 56);
+    assert!(offset_of!(Vst3NativeEvent, len) == 64);
+    assert!(offset_of!(Vst3NativeEvent, data1) == 68);
+    assert!(offset_of!(Vst3NativeEvent, data2) == 69);
+};
 
 /// Transport info passed from the C++ shim to Rust.
 #[repr(C)]
@@ -143,8 +168,6 @@ pub struct Vst3Callbacks {
         num_input_channels: u32,
         num_output_channels: u32,
         num_frames: u32,
-        events: *const Vst3MidiEvent,
-        num_events: u32,
         transport: *const Vst3Transport,
         param_changes: *const Vst3ParamChange,
         num_param_changes: u32,
@@ -162,8 +185,6 @@ pub struct Vst3Callbacks {
         num_input_channels: u32,
         num_output_channels: u32,
         num_frames: u32,
-        events: *const Vst3MidiEvent,
-        num_events: u32,
         transport: *const Vst3Transport,
         param_changes: *const Vst3ParamChange,
         num_param_changes: u32,
@@ -200,61 +221,20 @@ pub struct Vst3Callbacks {
     // Latency + tail
     pub get_latency: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
     pub get_tail: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
-    // Output events
-    pub get_output_event_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
-    pub get_output_event:
-        unsafe extern "C" fn(ctx: *mut c_void, index: u32, out: *mut Vst3MidiEvent),
-    // `SysEx` input. The shim calls this once per `kDataEvent` /
-    // `kMidiSysEx` event seen in the host's input event list,
-    // before invoking `process`. Bytes are the inner `SysEx`
-    // payload - VST3 hosts deliver `DataEvent::bytes` without the
-    // `0xF0` / `0xF7` framing per the SDK convention - and are
-    // valid only for the duration of this call. The Rust side
-    // copies into [`truce_core::EventList::sysex_pool`] so the
-    // plug-in's `process()` sees a stable view.
-    pub push_sysex_input: unsafe extern "C" fn(
-        ctx: *mut c_void,
-        sample_offset: u32,
-        port: u8,
-        bytes: *const u8,
-        len: u32,
-    ),
-    /// Count of `SysEx`-shaped events the plug-in pushed during
-    /// `process()`. The shim queries this once after the call to
-    /// drain into the host's output event list.
-    pub get_output_sysex_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
-    /// Fill `out_sample_offset`, `out_bytes`, `out_len` with the
-    /// index-th `SysEx` output event. Bytes point into the
-    /// plug-in's `EventList` pool; valid until the next `process()`
-    /// call clears it. The shim copies (via the host's
-    /// `IEventList::addEvent`) before that happens.
-    pub get_output_sysex_event: unsafe extern "C" fn(
-        ctx: *mut c_void,
-        index: u32,
-        out_sample_offset: *mut u32,
-        out_port: *mut u8,
-        out_bytes: *mut *const u8,
-        out_len: *mut u32,
-    ),
-    /// Count of per-note MIDI 2.0 events the plug-in pushed that map to
-    /// VST3 note expression. The shim drains them into
-    /// `kNoteExpressionValueEvent` on the event output bus.
-    pub get_output_note_expression_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
-    /// Fill the index-th note-expression event: `type_id` is the VST3
-    /// `NoteExpressionTypeID`, `note_id` correlates to the emitted
-    /// `NoteOn`, `value` is normalized `0..=1`, `port` is the event
-    /// output bus the correlated note rode - hosts scope `noteId`s per
-    /// bus, so an expression on a different bus than its note would
-    /// never correlate.
-    pub get_output_note_expression: unsafe extern "C" fn(
-        ctx: *mut c_void,
-        index: u32,
-        out_type_id: *mut u32,
-        out_note_id: *mut i32,
-        out_sample_offset: *mut u32,
-        out_value: *mut f64,
-        out_port: *mut u8,
-    ),
+    /// Reset the bounded input queue for one block. Native events then arrive
+    /// through `push_input_event` in the host's original `IEventList` order.
+    pub begin_input_events: unsafe extern "C" fn(ctx: *mut c_void, num_frames: u32),
+    /// Returns 1=emitted, 2=unsupported, 3=invalid, 4=queue full. Queue-full
+    /// tells the shim to stop traversing so the retained prefix stays ordered.
+    pub push_input_event:
+        unsafe extern "C" fn(ctx: *mut c_void, event: *const Vst3NativeEvent) -> u32,
+    /// Begin one globally ordered output traversal over the lossless event
+    /// view. `next_output_event` uses the same result codes plus 0=end.
+    pub begin_output_events: unsafe extern "C" fn(ctx: *mut c_void),
+    pub next_output_event: unsafe extern "C" fn(ctx: *mut c_void, out: *mut Vst3NativeEvent) -> u32,
+    /// Commit the pending note-ID lifecycle mutation only after the host
+    /// accepted the event through `IEventList::addEvent`.
+    pub commit_output_event: unsafe extern "C" fn(ctx: *mut c_void),
     // GUI
     pub gui_has_editor: unsafe extern "C" fn(ctx: *mut c_void) -> i32,
     pub gui_get_size: unsafe extern "C" fn(ctx: *mut c_void, w: *mut u32, h: *mut u32),

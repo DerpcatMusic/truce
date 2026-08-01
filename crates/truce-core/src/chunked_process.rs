@@ -385,7 +385,8 @@ fn rebase_events_into(
             },
             LosslessEventRef::Exact(exact) => {
                 let rebased_exact = ExactEvent::new(rebased_offset, *exact.body())
-                    .with_qualifiers(exact.qualifiers());
+                    .with_qualifiers(exact.qualifiers())
+                    .with_metadata(exact.metadata());
                 let token = if let Some(fallback) = exact.fallback() {
                     match fallback.body {
                         EventBody::SysEx { .. } => scratch.try_push_sysex_with_exact_on_port_token(

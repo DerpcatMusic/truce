@@ -22,14 +22,19 @@ use truce_core::editor::{
     ClosureBridge, Editor, PluginContext, RawWindowHandle, SendPtr, clamp_logical_size,
     fit_logical_size,
 };
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, TransportInfo};
+use truce_core::events::{
+    EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody,
+    ExactEventMetadata, ExactEventQualifiers, ExactNoteAddress, ExactNoteKind, LosslessEventCursor,
+    LosslessEventRef, PushError, TransportInfo, Vst3EventMetadata,
+};
 use truce_core::export::PluginExport;
 use truce_core::info::{PluginCategory, PluginInfo, resolve_name_override};
 use truce_core::meters::MeterStore;
 use truce_core::midi::{
-    decode_short_message, denorm_7bit, denorm_pitch_bend, downconvert_to_midi1,
-    per_note_bend_from_semitones, per_note_bend_semitones, pitch_bend_to_bytes,
+    denorm_7bit, denorm_pitch_bend, per_note_bend_semitones, pitch_bend_to_bytes,
 };
+#[cfg(test)]
+use truce_core::midi::{downconvert_to_midi1, per_note_bend_from_semitones};
 use truce_core::plugin::PluginRuntime;
 use truce_core::rt::{RtSection, audit};
 use truce_core::snapshot::SnapshotSlot;
@@ -44,7 +49,7 @@ use truce_params::MidiSource;
 use truce_params::sample::{Float, Sample};
 use truce_params::{ParamFlags, ParamInfo, ParamRange, Params};
 
-use ffi::{Vst3Callbacks, Vst3MidiEvent, Vst3ParamDescriptor, Vst3PluginDescriptor};
+use ffi::{Vst3Callbacks, Vst3NativeEvent, Vst3ParamDescriptor, Vst3PluginDescriptor};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -197,7 +202,7 @@ impl<P: PluginExport> Vst3Instance<P> {
 /// Audio + lifecycle-owned per-block scratch (see [`Vst3Instance::audio`]).
 struct Vst3Scratch<P: PluginExport> {
     event_list: EventList,
-    sysex_inputs_pending: bool,
+    input_num_frames: u32,
     output_events: EventList,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     sub_event_scratch: EventList,
@@ -211,9 +216,9 @@ struct Vst3Scratch<P: PluginExport> {
     /// Reused per-block scratch for `RawBufferScratch::build`, parameterized
     /// by `P::Sample` (widening path for `prelude64` plugins).
     scratch: RawBufferScratch<<P as PluginRuntime>::Sample>,
-    /// `(port, noteId) -> (channel, note)` correlation for note expression;
-    /// written/read on the audio thread, cleared by `cb_reset`.
-    note_id_map: NoteIdMap,
+    output_cursor: LosslessEventCursor,
+    output_note_ids: OutputNoteIds,
+    pending_output_mutation: PendingOutputMutation,
 }
 
 /// Main/UI-thread-owned editor state (see [`Vst3Instance::gui`]).
@@ -221,70 +226,287 @@ struct Vst3Gui {
     editor: Option<Box<dyn Editor>>,
 }
 
-/// Fixed-capacity `(port, noteId) -> (channel, note)` correlation for
-/// incoming VST3 note expression. A `noteId` is an arbitrary per-voice
-/// counter the host assigns on note-on - and scopes per event bus, so
-/// two buses can carry the same id for different voices - meaning
-/// expression events can't be decoded without remembering which note
-/// each id addresses on which bus. Inline array + linear scan keeps
-/// the audio thread alloc-free; 128 slots covers every
-/// simultaneously-sounding voice a host realistically drives.
+const VST3_NOTE_ID_LOWER: i32 = -10_000;
+const VST3_NOTE_ID_UPPER: i32 = -1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputSourceIdentity {
+    Exact { bus: u16, note_id: i32 },
+    Anonymous,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputVoiceLifecycle {
+    Active,
+    Released,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputNoteSlot {
+    used: bool,
+    source: OutputSourceIdentity,
+    vst3_note_id: i32,
+    bus: u8,
+    channel: u8,
+    pitch: u8,
+    lifecycle: OutputVoiceLifecycle,
+    age: u64,
+}
+
+impl OutputNoteSlot {
+    const FREE: Self = Self {
+        used: false,
+        source: OutputSourceIdentity::Anonymous,
+        vst3_note_id: VST3_NOTE_ID_LOWER,
+        bus: 0,
+        channel: 0,
+        pitch: 0,
+        lifecycle: OutputVoiceLifecycle::Released,
+        age: 0,
+    };
+}
+
+struct OutputNoteIds {
+    slots: [OutputNoteSlot; EVENT_LIST_PREALLOC],
+    next_id: i32,
+    next_age: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingOutputMutation {
+    None,
+    Insert {
+        index: usize,
+        slot: OutputNoteSlot,
+        next_id: i32,
+    },
+    Release {
+        index: usize,
+    },
+}
+
+impl OutputNoteIds {
+    fn new() -> Self {
+        Self {
+            slots: [OutputNoteSlot::FREE; EVENT_LIST_PREALLOC],
+            next_id: VST3_NOTE_ID_LOWER,
+            next_age: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.slots = [OutputNoteSlot::FREE; EVENT_LIST_PREALLOC];
+        self.next_id = VST3_NOTE_ID_LOWER;
+        self.next_age = 0;
+    }
+
+    fn propose_note_on(
+        &self,
+        source: OutputSourceIdentity,
+        bus: u8,
+        channel: u8,
+        pitch: u8,
+    ) -> Option<(i32, PendingOutputMutation)> {
+        if source != OutputSourceIdentity::Anonymous
+            && self.slots.iter().any(|slot| {
+                slot.used && slot.source == source && slot.lifecycle == OutputVoiceLifecycle::Active
+            })
+        {
+            return None;
+        }
+
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| {
+                source != OutputSourceIdentity::Anonymous
+                    && slot.used
+                    && slot.source == source
+                    && slot.lifecycle == OutputVoiceLifecycle::Released
+            })
+            .or_else(|| self.slots.iter().position(|slot| !slot.used))
+            .or_else(|| {
+                self.slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| slot.lifecycle == OutputVoiceLifecycle::Released)
+                    .min_by_key(|(_, slot)| slot.age)
+                    .map(|(index, _)| index)
+            })?;
+        let (vst3_note_id, next_id) = self.available_id(index)?;
+        let slot = OutputNoteSlot {
+            used: true,
+            source,
+            vst3_note_id,
+            bus,
+            channel,
+            pitch,
+            lifecycle: OutputVoiceLifecycle::Active,
+            age: self.next_age,
+        };
+        Some((
+            vst3_note_id,
+            PendingOutputMutation::Insert {
+                index,
+                slot,
+                next_id,
+            },
+        ))
+    }
+
+    fn propose_note_off(
+        &self,
+        source: OutputSourceIdentity,
+        bus: u8,
+        channel: u8,
+        pitch: u8,
+    ) -> Option<(i32, PendingOutputMutation)> {
+        let index = if source == OutputSourceIdentity::Anonymous {
+            self.unique_pck(bus, channel, pitch, true)?
+        } else {
+            self.slots.iter().position(|slot| {
+                slot.used && slot.source == source && slot.lifecycle == OutputVoiceLifecycle::Active
+            })?
+        };
+        Some((
+            self.slots[index].vst3_note_id,
+            PendingOutputMutation::Release { index },
+        ))
+    }
+
+    fn note_id_for_expression(
+        &self,
+        source: OutputSourceIdentity,
+        bus: u8,
+        channel: u8,
+        pitch: u8,
+    ) -> Option<i32> {
+        let index = if source == OutputSourceIdentity::Anonymous {
+            self.unique_pck(bus, channel, pitch, false)?
+        } else {
+            self.slots
+                .iter()
+                .position(|slot| slot.used && slot.source == source)?
+        };
+        Some(self.slots[index].vst3_note_id)
+    }
+
+    fn unique_pck(&self, bus: u8, channel: u8, pitch: u8, active_only: bool) -> Option<usize> {
+        let mut matches = self.slots.iter().enumerate().filter(|(_, slot)| {
+            slot.used
+                && slot.bus == bus
+                && slot.channel == channel
+                && slot.pitch == pitch
+                && (!active_only || slot.lifecycle == OutputVoiceLifecycle::Active)
+        });
+        let (index, _) = matches.next()?;
+        matches.next().is_none().then_some(index)
+    }
+
+    fn available_id(&self, replacing: usize) -> Option<(i32, i32)> {
+        let span = i64::from(VST3_NOTE_ID_UPPER) - i64::from(VST3_NOTE_ID_LOWER) + 1;
+        for offset in 0..span {
+            let candidate = i64::from(self.next_id) + offset;
+            let candidate = if candidate > i64::from(VST3_NOTE_ID_UPPER) {
+                candidate - span
+            } else {
+                candidate
+            };
+            let candidate = i32::try_from(candidate).ok()?;
+            if !self.slots.iter().enumerate().any(|(index, slot)| {
+                index != replacing && slot.used && slot.vst3_note_id == candidate
+            }) {
+                let next_id = if candidate == VST3_NOTE_ID_UPPER {
+                    VST3_NOTE_ID_LOWER
+                } else {
+                    candidate + 1
+                };
+                return Some((candidate, next_id));
+            }
+        }
+        None
+    }
+
+    fn commit(&mut self, mutation: PendingOutputMutation) {
+        match mutation {
+            PendingOutputMutation::None => {}
+            PendingOutputMutation::Insert {
+                index,
+                slot,
+                next_id,
+            } => {
+                self.slots[index] = slot;
+                self.next_id = next_id;
+                self.next_age = self.next_age.wrapping_add(1);
+            }
+            PendingOutputMutation::Release { index } => {
+                if let Some(slot) = self.slots.get_mut(index) {
+                    slot.lifecycle = OutputVoiceLifecycle::Released;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[repr(C)]
+struct Vst3MidiEvent {
+    sample_offset: u32,
+    status: u8,
+    data1: u8,
+    data2: u8,
+    port: u8,
+    note_id: i32,
+    ne_value: f64,
+}
+
+#[cfg(test)]
 struct NoteIdMap {
-    slots: [NoteIdSlot; Self::CAPACITY],
-    /// Round-robin overwrite position for when every slot is live.
+    slots: [TestNoteIdSlot; Self::CAPACITY],
     cursor: usize,
 }
 
-/// One tracked voice. `note_id < 0` marks a free slot (hosts only
-/// assign non-negative ids, `-1` means unassigned).
+#[cfg(test)]
 #[derive(Clone, Copy)]
-struct NoteIdSlot {
+struct TestNoteIdSlot {
     note_id: i32,
     port: u8,
     channel: u8,
     note: u8,
 }
 
-impl NoteIdSlot {
-    const FREE: Self = Self {
+#[cfg(test)]
+impl NoteIdMap {
+    const CAPACITY: usize = 128;
+    const FREE: TestNoteIdSlot = TestNoteIdSlot {
         note_id: -1,
         port: 0,
         channel: 0,
         note: 0,
     };
-}
-
-impl NoteIdMap {
-    const CAPACITY: usize = 128;
 
     fn new() -> Self {
         Self {
-            slots: [NoteIdSlot::FREE; Self::CAPACITY],
+            slots: [Self::FREE; Self::CAPACITY],
             cursor: 0,
         }
     }
 
-    /// Track a sounding note. Re-registering a live `(port, id)` pair
-    /// updates it in place; when the map is full the oldest slot is
-    /// overwritten so a leaked entry can never wedge the map. Entries
-    /// deliberately outlive their note-off - hosts keep sending
-    /// expression through the release phase - so slots are reclaimed
-    /// by overwrite or [`Self::clear`], never by removal.
     fn insert(&mut self, port: u8, note_id: i32, channel: u8, note: u8) {
         if note_id < 0 {
             return;
         }
-        let slot = self
+        let index = self
             .slots
             .iter()
-            .position(|s| s.note_id == note_id && s.port == port)
-            .or_else(|| self.slots.iter().position(|s| s.note_id < 0))
+            .position(|slot| slot.note_id == note_id && slot.port == port)
+            .or_else(|| self.slots.iter().position(|slot| slot.note_id < 0))
             .unwrap_or_else(|| {
-                let c = self.cursor;
-                self.cursor = (c + 1) % Self::CAPACITY;
-                c
+                let index = self.cursor;
+                self.cursor = (index + 1) % Self::CAPACITY;
+                index
             });
-        self.slots[slot] = NoteIdSlot {
+        self.slots[index] = TestNoteIdSlot {
             note_id,
             port,
             channel,
@@ -293,17 +515,14 @@ impl NoteIdMap {
     }
 
     fn lookup(&self, port: u8, note_id: i32) -> Option<(u8, u8)> {
-        if note_id < 0 {
-            return None;
-        }
         self.slots
             .iter()
-            .find(|s| s.note_id == note_id && s.port == port)
-            .map(|s| (s.channel, s.note))
+            .find(|slot| note_id >= 0 && slot.note_id == note_id && slot.port == port)
+            .map(|slot| (slot.channel, slot.note))
     }
 
     fn clear(&mut self) {
-        self.slots = [NoteIdSlot::FREE; Self::CAPACITY];
+        self.slots = [Self::FREE; Self::CAPACITY];
         self.cursor = 0;
     }
 }
@@ -385,7 +604,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 pending_resize: AtomicU64::new(0),
                 audio: PluginCell::new(Vst3Scratch {
                     event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
-                    sysex_inputs_pending: false,
+                    input_num_frames: 0,
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sample_rate: 44100.0,
@@ -396,7 +615,9 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     max_block_size: 8192,
                     prepared: false,
                     scratch: RawBufferScratch::default(),
-                    note_id_map: NoteIdMap::new(),
+                    output_cursor: LosslessEventCursor::default(),
+                    output_note_ids: OutputNoteIds::new(),
+                    pending_output_mutation: PendingOutputMutation::None,
                 }),
                 gui: PluginCell::new(Vst3Gui { editor: None }),
             });
@@ -468,9 +689,8 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
                 .store(plugin.latency(), Ordering::Relaxed);
             inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
         }
-        // Voices don't survive a reset; a stale correlation could
-        // route new expression to a dead (channel, note).
-        audio.note_id_map.clear();
+        audio.output_note_ids.clear();
+        audio.pending_output_mutation = PendingOutputMutation::None;
         audio.prepared = true;
     });
 }
@@ -611,6 +831,268 @@ unsafe fn slice_or_empty<'a>(ptr: *const u32, len: u32) -> &'a [u32] {
     }
 }
 
+const VST3_EVENT_NOTE_ON: u32 = 0;
+const VST3_EVENT_NOTE_OFF: u32 = 1;
+const VST3_EVENT_DATA: u32 = 2;
+const VST3_EVENT_POLY_PRESSURE: u32 = 3;
+const VST3_EVENT_NOTE_EXPRESSION: u32 = 4;
+const VST3_EVENT_LEGACY_MIDI_CC_OUT: u32 = 65_535;
+
+const VST3_EVENT_END: u32 = 0;
+const VST3_EVENT_EMITTED: u32 = 1;
+const VST3_EVENT_UNSUPPORTED: u32 = 2;
+const VST3_EVENT_INVALID: u32 = 3;
+const VST3_EVENT_QUEUE_FULL: u32 = 4;
+const VST3_EVENT_IS_LIVE: u32 = 1;
+
+unsafe extern "C" fn cb_begin_input_events<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    num_frames: u32,
+) {
+    unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let mut audio = inst.audio.enter();
+        audio.event_list.clear();
+        audio.input_num_frames = num_frames;
+    }
+}
+
+unsafe extern "C" fn cb_push_input_event<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    event: *const Vst3NativeEvent,
+) -> u32 {
+    unsafe {
+        if event.is_null() {
+            return VST3_EVENT_INVALID;
+        }
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let mut audio = inst.audio.enter();
+        push_vst3_input_event::<P>(&mut audio, &*event)
+    }
+}
+
+fn push_vst3_input_event<P: PluginExport>(
+    audio: &mut Vst3Scratch<P>,
+    event: &Vst3NativeEvent,
+) -> u32 {
+    let Ok(sample_offset) = u32::try_from(event.sample_offset) else {
+        return VST3_EVENT_INVALID;
+    };
+    let Ok(port) = u8::try_from(event.bus_index) else {
+        return VST3_EVENT_INVALID;
+    };
+    if sample_offset >= audio.input_num_frames || port >= P::info().midi_input_ports {
+        return VST3_EVENT_INVALID;
+    }
+    let Some((qualifiers, metadata)) = vst3_exact_provenance(event) else {
+        return VST3_EVENT_INVALID;
+    };
+
+    let result = match event.kind {
+        VST3_EVENT_NOTE_ON | VST3_EVENT_NOTE_OFF => {
+            let Some((channel, pitch)) = valid_note_axes(event.channel, event.pitch) else {
+                return VST3_EVENT_INVALID;
+            };
+            if !valid_unit_f32(event.velocity) || !event.tuning.is_finite() {
+                return VST3_EVENT_INVALID;
+            }
+            let (kind, length) = if event.kind == VST3_EVENT_NOTE_ON {
+                if event.length < 0 {
+                    return VST3_EVENT_INVALID;
+                }
+                (ExactNoteKind::On, Some(event.length))
+            } else {
+                (ExactNoteKind::Off, None)
+            };
+            let address = ExactNoteAddress::from_vst3_signed(
+                event.bus_index,
+                event.channel,
+                event.pitch,
+                event.note_id,
+            );
+            let exact = ExactEvent::new(
+                sample_offset,
+                ExactEventBody::DetailedNote {
+                    kind,
+                    address,
+                    velocity: event.velocity,
+                    tuning: event.tuning,
+                    length,
+                },
+            )
+            .with_qualifiers(qualifiers)
+            .with_metadata(ExactEventMetadata::Vst3(metadata));
+            let typed = faithful_typed_note(event, channel, pitch, kind)
+                .map(|body| Event::on_port(sample_offset, port, body));
+            match typed {
+                Some(typed) => audio.event_list.try_push_with_exact(typed, exact),
+                None => audio.event_list.try_push_exact(exact),
+            }
+        }
+        VST3_EVENT_POLY_PRESSURE => {
+            let Some((channel, pitch)) = valid_note_axes(event.channel, event.pitch) else {
+                return VST3_EVENT_INVALID;
+            };
+            if !valid_unit_f32(event.velocity) {
+                return VST3_EVENT_INVALID;
+            }
+            let address = ExactNoteAddress::from_vst3_signed(
+                event.bus_index,
+                event.channel,
+                event.pitch,
+                event.note_id,
+            );
+            let exact = ExactEvent::new(
+                sample_offset,
+                ExactEventBody::DetailedPolyPressure {
+                    address,
+                    pressure: event.velocity,
+                },
+            )
+            .with_qualifiers(qualifiers)
+            .with_metadata(ExactEventMetadata::Vst3(metadata));
+            let typed = (event.note_id == -1)
+                .then(|| normalized_u7_exact(event.velocity))
+                .flatten()
+                .map(|pressure| {
+                    Event::on_port(
+                        sample_offset,
+                        port,
+                        EventBody::Aftertouch {
+                            group: 0,
+                            channel,
+                            note: pitch,
+                            pressure,
+                        },
+                    )
+                });
+            match typed {
+                Some(typed) => audio.event_list.try_push_with_exact(typed, exact),
+                None => audio.event_list.try_push_exact(exact),
+            }
+        }
+        VST3_EVENT_NOTE_EXPRESSION => {
+            if !valid_unit_f64(event.value) || event.note_id == -1 {
+                return VST3_EVENT_INVALID;
+            }
+            let exact = ExactEvent::new(
+                sample_offset,
+                ExactEventBody::NormalizedNoteExpression {
+                    expression_id: event.type_id,
+                    address: ExactNoteAddress::from_vst3_signed(
+                        event.bus_index,
+                        -1,
+                        -1,
+                        event.note_id,
+                    ),
+                    value: event.value,
+                },
+            )
+            .with_qualifiers(qualifiers)
+            .with_metadata(ExactEventMetadata::Vst3(metadata));
+            audio.event_list.try_push_exact(exact)
+        }
+        VST3_EVENT_DATA => {
+            if event.type_id != 0 || (event.len > 0 && event.bytes.is_null()) {
+                return VST3_EVENT_INVALID;
+            }
+            let bytes = if event.len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(event.bytes, event.len as usize) }
+            };
+            let exact = ExactEvent::new(
+                sample_offset,
+                ExactEventBody::SysEx {
+                    port: u16::from(port),
+                },
+            )
+            .with_qualifiers(qualifiers)
+            .with_metadata(ExactEventMetadata::Vst3(metadata));
+            audio
+                .event_list
+                .try_push_sysex_with_exact_on_port(sample_offset, port, bytes, exact)
+        }
+        _ => return VST3_EVENT_UNSUPPORTED,
+    };
+
+    match result {
+        Ok(()) => VST3_EVENT_EMITTED,
+        Err(
+            PushError::EventFull
+            | PushError::ExactEventFull
+            | PushError::VoiceTrackerFull
+            | PushError::PoolFull,
+        ) => VST3_EVENT_QUEUE_FULL,
+        Err(PushError::UnknownExactEvent) => VST3_EVENT_INVALID,
+    }
+}
+
+fn vst3_exact_provenance(
+    event: &Vst3NativeEvent,
+) -> Option<(ExactEventQualifiers, Vst3EventMetadata)> {
+    let raw_flags = u16::try_from(event.flags).ok()?;
+    let metadata = Vst3EventMetadata::new(event.ppq_position, raw_flags)?;
+    let qualifiers = ExactEventQualifiers {
+        is_live: event.flags & VST3_EVENT_IS_LIVE != 0,
+        dont_record: false,
+    };
+    Some((qualifiers, metadata))
+}
+
+fn valid_note_axes(channel: i16, pitch: i16) -> Option<(u8, u8)> {
+    let channel = u8::try_from(channel).ok().filter(|value| *value < 16)?;
+    let pitch = u8::try_from(pitch).ok().filter(|value| *value < 128)?;
+    Some((channel, pitch))
+}
+
+fn valid_unit_f32(value: f32) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+fn valid_unit_f64(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+#[allow(clippy::float_cmp)]
+fn normalized_u7_exact(value: f32) -> Option<u8> {
+    let scaled = value * 127.0;
+    let rounded = scaled.round();
+    if rounded != scaled {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let wire = rounded as u8;
+    (f32::from(wire) / 127.0 == value).then_some(wire)
+}
+
+fn faithful_typed_note(
+    event: &Vst3NativeEvent,
+    channel: u8,
+    pitch: u8,
+    kind: ExactNoteKind,
+) -> Option<EventBody> {
+    if event.note_id != -1 || event.tuning != 0.0 || event.length != 0 {
+        return None;
+    }
+    let velocity = normalized_u7_exact(event.velocity)?;
+    match kind {
+        ExactNoteKind::On if velocity > 0 => Some(EventBody::NoteOn {
+            group: 0,
+            channel,
+            note: pitch,
+            velocity,
+        }),
+        ExactNoteKind::Off => Some(EventBody::NoteOff {
+            group: 0,
+            channel,
+            note: pitch,
+            velocity,
+        }),
+        _ => None,
+    }
+}
+
 unsafe extern "C" fn cb_process<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     inputs: *const *const f32,
@@ -618,8 +1100,6 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
     num_input_channels: u32,
     num_output_channels: u32,
     num_frames: u32,
-    events: *const Vst3MidiEvent,
-    num_events: u32,
     transport_ptr: *const ffi::Vst3Transport,
     param_changes: *const ffi::Vst3ParamChange,
     num_param_changes: u32,
@@ -634,8 +1114,6 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             num_input_channels,
             num_output_channels,
             num_frames,
-            events,
-            num_events,
             transport_ptr,
             param_changes,
             num_param_changes,
@@ -655,8 +1133,6 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
     num_input_channels: u32,
     num_output_channels: u32,
     num_frames: u32,
-    events: *const Vst3MidiEvent,
-    num_events: u32,
     transport_ptr: *const ffi::Vst3Transport,
     param_changes: *const ffi::Vst3ParamChange,
     num_param_changes: u32,
@@ -671,8 +1147,6 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
             num_input_channels,
             num_output_channels,
             num_frames,
-            events,
-            num_events,
             transport_ptr,
             param_changes,
             num_param_changes,
@@ -694,8 +1168,6 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
     num_input_channels: u32,
     num_output_channels: u32,
     num_frames: u32,
-    events: *const Vst3MidiEvent,
-    num_events: u32,
     transport_ptr: *const ffi::Vst3Transport,
     param_changes: *const ffi::Vst3ParamChange,
     num_param_changes: u32,
@@ -722,7 +1194,6 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
                 }
             }
             audio.event_list.clear();
-            audio.sysex_inputs_pending = false;
             return;
         }
 
@@ -752,86 +1223,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
         // borrowed simultaneously - guard `Deref` can't split-borrow.
         let scr = &mut *audio;
 
-        // Convert MIDI events. SysEx input arrives through a separate
-        // callback before this process callback, so preserve the
-        // queued SysEx entries when present and append short MIDI.
-        if scr.sysex_inputs_pending {
-            scr.sysex_inputs_pending = false;
-        } else {
-            scr.event_list.clear();
-        }
-        if !events.is_null() && num_events > 0 {
-            let event_slice = slice::from_raw_parts(events, num_events as usize);
-            for ev in event_slice {
-                let body = if ev.status & 0xF0 == 0xF0 {
-                    // VST3-specific: note expression carried in the
-                    // same event struct. `data1=typeId`, `ne_value` is
-                    // the host's full-precision `0..=1` value, and
-                    // `note_id` is the host's per-voice counter -
-                    // resolve it through the map built from note-ons
-                    // below. An id the map doesn't know (never
-                    // note-on'd, overwritten, or a host bug) is
-                    // unattributable; drop the event rather than
-                    // guess a pitch.
-                    let type_id = ev.data1;
-                    // Tuning is semitone-denominated: VST3's ±120 st
-                    // domain re-scales onto the wire's ±48 st
-                    // full-scale. The other types are plain `0..=1`.
-                    let value = if type_id == 2 {
-                        vst3_tuning_to_wire(ev.ne_value)
-                    } else {
-                        unit_to_u32(ev.ne_value)
-                    };
-                    scr.note_id_map
-                        .lookup(ev.port, ev.note_id)
-                        .and_then(|(channel, note)| {
-                            let make_pn_cc = |cc| EventBody::PerNoteCC {
-                                group: 0,
-                                channel,
-                                note,
-                                cc,
-                                value,
-                                registered: true,
-                            };
-                            match type_id {
-                                0 => Some(make_pn_cc(7)),  // volume
-                                1 => Some(make_pn_cc(10)), // pan
-                                2 => Some(EventBody::PerNotePitchBend {
-                                    group: 0,
-                                    channel,
-                                    note,
-                                    value,
-                                }), // tuning
-                                3 => Some(make_pn_cc(1)),  // vibrato
-                                4 => Some(make_pn_cc(11)), // expression
-                                5 => Some(make_pn_cc(74)), // brightness
-                                _ => None,
-                            }
-                        })
-                } else {
-                    // Correlate the host's per-bus noteId with the
-                    // note it addresses so later note-expression
-                    // events can be resolved. The entry survives the
-                    // note-off: hosts keep sending expression through
-                    // the release phase, and stale slots are reclaimed
-                    // by round-robin overwrite.
-                    if ev.status & 0xF0 == 0x90 && ev.data2 > 0 {
-                        scr.note_id_map
-                            .insert(ev.port, ev.note_id, ev.status & 0x0F, ev.data1);
-                    }
-                    decode_short_message(ev.status, ev.data1, ev.data2)
-                };
-                if let Some(body) = body {
-                    scr.event_list.push(Event {
-                        sample_offset: ev.sample_offset,
-                        port: ev.port,
-                        body,
-                    });
-                }
-            }
-        }
-        // Sort happens once below - after the param-change push
-        // section also runs - instead of twice.
+        debug_assert_eq!(scr.input_num_frames as usize, num_frames);
 
         // Build AudioBuffer from raw pointers. Uses the per-instance
         // `scratch` so the audio thread doesn't heap-allocate.
@@ -968,6 +1360,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             &mut audio_buffer,
             chunk_args,
         );
+        scr.output_events.ensure_sorted_by_offset();
         // End the `audio_buffer` borrow before reaching back into scratch.
         let _ = audio_buffer;
         // For `f64` plugins the scratch holds the rendered output -
@@ -1037,6 +1430,7 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
         let mut count = 0;
         for _ in 0..3 {
             let ((), n) = audit(|| {
+                cb_begin_input_events::<P>(ctx, FRAMES);
                 process_block::<P, f32>(
                     ctx,
                     in_ptrs.as_ptr(),
@@ -1044,8 +1438,6 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
                     CH,
                     CH,
                     FRAMES,
-                    std::ptr::null(),
-                    0,
                     std::ptr::null(),
                     std::ptr::null(),
                     0,
@@ -1368,56 +1760,44 @@ unsafe extern "C" fn cb_get_tail<P: PluginExport>(ctx: *mut std::ffi::c_void) ->
 // Output event callbacks
 // ---------------------------------------------------------------------------
 
-/// Map a truce `Event` body to a 3-byte VST3 MIDI packet. Returns
-/// `None` for event types that don't fit (MIDI 2.0, `ParamChange`,
-/// Transport, etc.). The output count and the index→event lookup
-/// share this filter so unsupported events are skipped cleanly
-/// rather than emitted as a zeroed packet (which earlier hosts
-/// interpreted as a `note 0` Note-Off).
+#[cfg(test)]
 fn try_encode_vst3_midi(event: &Event) -> Option<Vst3MidiEvent> {
-    // MIDI 2.0 channel-voice output has no UMP transport on VST3, so
-    // down-convert to 1.0. Bodies that map to a predefined expression
-    // type ride note expression via `note_expression_of` - converting
-    // them here too would double-emit. Everything else (including
-    // per-note CCs with no predefined type) falls through to the 1.0
-    // down-convert, so an unmapped per-note CC degrades to a channel
-    // CC exactly as it does on CLAP.
     let body = match event.body {
         body if note_expression_of(&body).is_some() => return None,
         other => downconvert_to_midi1(&other).unwrap_or(other),
     };
-    let (status, data1, data2) = match &body {
+    let (status, data1, data2) = match body {
         EventBody::NoteOn {
             channel,
             note,
             velocity,
             ..
-        } => (0x90 | (channel & 0x0F), *note, *velocity),
+        } => (0x90 | (channel & 0x0F), note, velocity),
         EventBody::NoteOff {
             channel,
             note,
             velocity,
             ..
-        } => (0x80 | (channel & 0x0F), *note, *velocity),
+        } => (0x80 | (channel & 0x0F), note, velocity),
         EventBody::ControlChange {
             channel, cc, value, ..
-        } => (0xB0 | (channel & 0x0F), *cc, *value),
+        } => (0xB0 | (channel & 0x0F), cc, value),
         EventBody::Aftertouch {
             channel,
             note,
             pressure,
             ..
-        } => (0xA0 | (channel & 0x0F), *note, *pressure),
+        } => (0xA0 | (channel & 0x0F), note, pressure),
         EventBody::ChannelPressure {
             channel, pressure, ..
-        } => (0xD0 | (channel & 0x0F), *pressure, 0),
+        } => (0xD0 | (channel & 0x0F), pressure, 0),
         EventBody::PitchBend { channel, value, .. } => {
-            let (lsb, msb) = pitch_bend_to_bytes(*value);
+            let (lsb, msb) = pitch_bend_to_bytes(value);
             (0xE0 | (channel & 0x0F), lsb, msb)
         }
         EventBody::ProgramChange {
             channel, program, ..
-        } => (0xC0 | (channel & 0x0F), *program, 0),
+        } => (0xC0 | (channel & 0x0F), program, 0),
         _ => return None,
     };
     Some(Vst3MidiEvent {
@@ -1647,129 +2027,484 @@ fn midi_proxy_len<P: PluginExport>() -> usize {
     }
 }
 
-// The output-event / sysex drain callbacks below (and `cb_push_sysex_input`)
-// enter the `audio` cell but run no author code, so the only way any of them
-// can panic is the debug-only overlap assert in `PluginCell::enter` - and that
-// fires only if a host queries them off the audio thread while `process` still
-// holds the guard (a host-contract violation). They are deliberately left
-// un-firewalled: in release `enter` never panics (no unwind across the C ABI),
-// and in debug the abort on a contract violation is a wanted canary. The shim
-// calls them from within the process cycle on the audio thread, where the
-// cell is free.
-unsafe extern "C" fn cb_get_output_event_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let audio = inst.audio.enter();
-        len_u32(
-            audio
-                .output_events
-                .iter()
-                .filter(|e| try_encode_vst3_midi(e).is_some())
-                .count(),
-        )
-    }
+enum Vst3EncodeResult {
+    Emitted(Vst3NativeEvent, PendingOutputMutation),
+    Unsupported,
+    Invalid,
 }
 
-unsafe extern "C" fn cb_get_output_event<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    index: u32,
-    out: *mut Vst3MidiEvent,
-) {
+unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let audio = inst.audio.enter();
-        // Walk the filtered iterator until we hit the index-th
-        // encodable event. Out-of-range index leaves `*out`
-        // untouched; the C++ shim zero-initialized the buffer before
-        // calling, so callers that forget to bounds-check against
-        // `cb_get_output_event_count` get a zero packet rather than
-        // stale stack data.
-        if let Some(packet) = audio
-            .output_events
-            .iter()
-            .filter_map(try_encode_vst3_midi)
-            .nth(index as usize)
-        {
-            *out = packet;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SysEx callbacks (host → plug-in input, plug-in → host output)
-// ---------------------------------------------------------------------------
-
-unsafe extern "C" fn cb_push_sysex_input<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    sample_offset: u32,
-    port: u8,
-    bytes: *const u8,
-    len: u32,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        if bytes.is_null() || len == 0 {
-            return;
-        }
         let mut audio = inst.audio.enter();
-        let scr = &mut *audio;
-        if !scr.sysex_inputs_pending {
-            scr.event_list.clear();
-            scr.sysex_inputs_pending = true;
-        }
-        let slice = std::slice::from_raw_parts(bytes, len as usize);
-        // Pool-full failure: drop the message. SysEx is atomic by
-        // spec; truncating would corrupt it. The plug-in surfaces
-        // the loss via the `EventList`'s pool usage metrics if it
-        // cares.
-        let _ = scr
-            .event_list
-            .push_sysex_on_port(sample_offset, port, slice);
+        audio.output_cursor = LosslessEventCursor::default();
+        audio.pending_output_mutation = PendingOutputMutation::None;
     }
 }
 
-unsafe extern "C" fn cb_get_output_sysex_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let audio = inst.audio.enter();
-        len_u32(
-            audio
-                .output_events
-                .iter()
-                .filter(|e| matches!(e.body, EventBody::SysEx { .. }))
-                .count(),
-        )
-    }
-}
-
-unsafe extern "C" fn cb_get_output_sysex_event<P: PluginExport>(
+unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
-    index: u32,
-    out_sample_offset: *mut u32,
-    out_port: *mut u8,
-    out_bytes: *mut *const u8,
-    out_len: *mut u32,
-) {
+    out: *mut Vst3NativeEvent,
+) -> u32 {
+    unsafe {
+        if out.is_null() {
+            return VST3_EVENT_INVALID;
+        }
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let mut audio = inst.audio.enter();
+        audio.pending_output_mutation = PendingOutputMutation::None;
+        let scr = &mut *audio;
+        let Some(event) = scr.output_events.lossless_next(&mut scr.output_cursor) else {
+            return VST3_EVENT_END;
+        };
+        match encode_vst3_output_event::<P>(
+            event,
+            &scr.output_events,
+            &scr.output_note_ids,
+            scr.input_num_frames,
+        ) {
+            Vst3EncodeResult::Emitted(native, mutation) => {
+                scr.pending_output_mutation = mutation;
+                out.write(native);
+                VST3_EVENT_EMITTED
+            }
+            Vst3EncodeResult::Unsupported => VST3_EVENT_UNSUPPORTED,
+            Vst3EncodeResult::Invalid => VST3_EVENT_INVALID,
+        }
+    }
+}
+
+unsafe extern "C" fn cb_commit_output_event<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let audio = inst.audio.enter();
-        // Walk the filtered iterator, same shape as
-        // `cb_get_output_event`. Bytes point into the plug-in's
-        // SysEx pool - valid until the shim's next `process()`
-        // clears the `EventList`, which is after the host's
-        // `addEvent` has copied them.
-        if let Some(event) = audio
-            .output_events
-            .iter()
-            .filter(|e| matches!(e.body, EventBody::SysEx { .. }))
-            .nth(index as usize)
-        {
-            let bytes = audio.output_events.sysex_bytes(&event.body);
-            *out_sample_offset = event.sample_offset;
-            *out_port = event.port;
-            *out_bytes = bytes.as_ptr();
-            *out_len = len_u32(bytes.len());
+        let mut audio = inst.audio.enter();
+        let mutation = std::mem::replace(
+            &mut audio.pending_output_mutation,
+            PendingOutputMutation::None,
+        );
+        audio.output_note_ids.commit(mutation);
+    }
+}
+
+fn encode_vst3_output_event<P: PluginExport>(
+    event: LosslessEventRef<'_>,
+    events: &EventList,
+    note_ids: &OutputNoteIds,
+    num_frames: u32,
+) -> Vst3EncodeResult {
+    let sample_offset = match event {
+        LosslessEventRef::Typed(event) => event.sample_offset,
+        LosslessEventRef::Exact(event) => event.sample_offset(),
+    };
+    if sample_offset >= num_frames {
+        return Vst3EncodeResult::Invalid;
+    }
+
+    match event {
+        LosslessEventRef::Typed(event) => encode_typed_vst3_output::<P>(event, events, note_ids),
+        LosslessEventRef::Exact(event) => encode_exact_vst3_output::<P>(event, note_ids),
+    }
+}
+
+#[allow(clippy::float_cmp)]
+fn encode_exact_vst3_output<P: PluginExport>(
+    exact: truce_core::ExactEventRef<'_>,
+    note_ids: &OutputNoteIds,
+) -> Vst3EncodeResult {
+    let (flags, ppq_position) = match exact.metadata() {
+        ExactEventMetadata::None => (
+            u32::from(exact.qualifiers().is_live) * VST3_EVENT_IS_LIVE,
+            0.0,
+        ),
+        ExactEventMetadata::Vst3(metadata) if metadata.ppq_position().is_finite() => {
+            (u32::from(metadata.raw_flags()), metadata.ppq_position())
         }
+        ExactEventMetadata::Vst3(_) => return Vst3EncodeResult::Invalid,
+        _ => return Vst3EncodeResult::Unsupported,
+    };
+    let encoded = match *exact.body() {
+        ExactEventBody::DetailedNote {
+            kind,
+            address,
+            velocity,
+            tuning,
+            length,
+        } => encode_detailed_note::<P>(
+            exact.sample_offset(),
+            flags,
+            kind,
+            address,
+            velocity,
+            tuning,
+            length,
+            note_ids,
+        ),
+        ExactEventBody::Note {
+            kind,
+            address,
+            velocity,
+        } => {
+            #[allow(clippy::cast_possible_truncation)]
+            let native_velocity = velocity as f32;
+            if f64::from(native_velocity) != velocity {
+                return Vst3EncodeResult::Invalid;
+            }
+            encode_detailed_note::<P>(
+                exact.sample_offset(),
+                flags,
+                kind,
+                address,
+                native_velocity,
+                0.0,
+                (kind == ExactNoteKind::On).then_some(0),
+                note_ids,
+            )
+        }
+        ExactEventBody::DetailedPolyPressure { address, pressure } => {
+            let Some((bus, channel, pitch, source)) = concrete_output_address::<P>(address) else {
+                return Vst3EncodeResult::Invalid;
+            };
+            if !valid_unit_f32(pressure) {
+                return Vst3EncodeResult::Invalid;
+            }
+            let note_id = match source {
+                OutputSourceIdentity::Exact { .. } => {
+                    let Some(note_id) =
+                        note_ids.note_id_for_expression(source, bus, channel, pitch)
+                    else {
+                        return Vst3EncodeResult::Unsupported;
+                    };
+                    note_id
+                }
+                OutputSourceIdentity::Anonymous => -1,
+            };
+            Vst3EncodeResult::Emitted(
+                Vst3NativeEvent {
+                    kind: VST3_EVENT_POLY_PRESSURE,
+                    sample_offset: i32::try_from(exact.sample_offset()).unwrap_or(i32::MAX),
+                    bus_index: i32::from(bus),
+                    flags,
+                    channel: i16::from(channel),
+                    pitch: i16::from(pitch),
+                    note_id,
+                    velocity: pressure,
+                    ..Vst3NativeEvent::default()
+                },
+                PendingOutputMutation::None,
+            )
+        }
+        ExactEventBody::NormalizedNoteExpression {
+            expression_id,
+            address,
+            value,
+        } => {
+            if !valid_unit_f64(value) {
+                return Vst3EncodeResult::Invalid;
+            }
+            let Some((bus, source)) = output_expression_address::<P>(address) else {
+                return Vst3EncodeResult::Invalid;
+            };
+            let Some(note_id) = note_ids.note_id_for_expression(source, bus, 0, 0) else {
+                return Vst3EncodeResult::Unsupported;
+            };
+            Vst3EncodeResult::Emitted(
+                Vst3NativeEvent {
+                    kind: VST3_EVENT_NOTE_EXPRESSION,
+                    sample_offset: i32::try_from(exact.sample_offset()).unwrap_or(i32::MAX),
+                    bus_index: i32::from(bus),
+                    flags,
+                    note_id,
+                    type_id: expression_id,
+                    value,
+                    ..Vst3NativeEvent::default()
+                },
+                PendingOutputMutation::None,
+            )
+        }
+        ExactEventBody::SysEx { port } => {
+            let Ok(bus) = u8::try_from(port) else {
+                return Vst3EncodeResult::Invalid;
+            };
+            if bus >= P::info().midi_output_ports {
+                return Vst3EncodeResult::Invalid;
+            }
+            let Some(bytes) = exact.sysex_bytes_checked() else {
+                return Vst3EncodeResult::Invalid;
+            };
+            Vst3EncodeResult::Emitted(
+                sysex_native_event(exact.sample_offset(), bus, flags, bytes),
+                PendingOutputMutation::None,
+            )
+        }
+        // Raw MIDI 1.0 and UMP, legacy note expression, and every exact
+        // variant without a native VST3 representation stay unsupported.
+        _ => Vst3EncodeResult::Unsupported,
+    };
+    match encoded {
+        Vst3EncodeResult::Emitted(mut native, mutation) => {
+            native.flags = flags;
+            native.ppq_position = ppq_position;
+            Vst3EncodeResult::Emitted(native, mutation)
+        }
+        other => other,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_detailed_note<P: PluginExport>(
+    sample_offset: u32,
+    flags: u32,
+    kind: ExactNoteKind,
+    address: ExactNoteAddress,
+    velocity: f32,
+    tuning: f32,
+    length: Option<i32>,
+    note_ids: &OutputNoteIds,
+) -> Vst3EncodeResult {
+    let Some((bus, channel, pitch, source)) = concrete_output_address::<P>(address) else {
+        return Vst3EncodeResult::Invalid;
+    };
+    if !valid_unit_f32(velocity) || !tuning.is_finite() {
+        return Vst3EncodeResult::Invalid;
+    }
+    let (kind, length, note_id, mutation) = match kind {
+        ExactNoteKind::On => {
+            let Some(length) = length.filter(|length| *length >= 0) else {
+                return Vst3EncodeResult::Invalid;
+            };
+            let Some((note_id, mutation)) = note_ids.propose_note_on(source, bus, channel, pitch)
+            else {
+                return Vst3EncodeResult::Unsupported;
+            };
+            (VST3_EVENT_NOTE_ON, length, note_id, mutation)
+        }
+        ExactNoteKind::Off => {
+            if length.is_some() {
+                return Vst3EncodeResult::Invalid;
+            }
+            let Some((note_id, mutation)) = note_ids.propose_note_off(source, bus, channel, pitch)
+            else {
+                return Vst3EncodeResult::Unsupported;
+            };
+            (VST3_EVENT_NOTE_OFF, 0, note_id, mutation)
+        }
+        // Choke, End, and future note kinds have no native VST3 event.
+        _ => return Vst3EncodeResult::Unsupported,
+    };
+    Vst3EncodeResult::Emitted(
+        Vst3NativeEvent {
+            kind,
+            sample_offset: i32::try_from(sample_offset).unwrap_or(i32::MAX),
+            bus_index: i32::from(bus),
+            flags,
+            channel: i16::from(channel),
+            pitch: i16::from(pitch),
+            note_id,
+            length,
+            velocity,
+            tuning,
+            ..Vst3NativeEvent::default()
+        },
+        mutation,
+    )
+}
+
+fn concrete_output_address<P: PluginExport>(
+    address: ExactNoteAddress,
+) -> Option<(u8, u8, u8, OutputSourceIdentity)> {
+    let bus = u8::try_from(address.port.value()?).ok()?;
+    if bus >= P::info().midi_output_ports {
+        return None;
+    }
+    let channel = address.channel.value()?;
+    let pitch = address.key.value()?;
+    if channel >= 16 || pitch >= 128 {
+        return None;
+    }
+    let source = match address.note_id {
+        ExactAddress::Wildcard => OutputSourceIdentity::Anonymous,
+        ExactAddress::Value(note_id) => OutputSourceIdentity::Exact {
+            bus: u16::from(bus),
+            note_id,
+        },
+        ExactAddress::InvalidRaw(_) => return None,
+    };
+    Some((bus, channel, pitch, source))
+}
+
+fn output_expression_address<P: PluginExport>(
+    address: ExactNoteAddress,
+) -> Option<(u8, OutputSourceIdentity)> {
+    let bus = u8::try_from(address.port.value()?).ok()?;
+    if bus >= P::info().midi_output_ports {
+        return None;
+    }
+    let note_id = address.note_id.value()?;
+    Some((
+        bus,
+        OutputSourceIdentity::Exact {
+            bus: u16::from(bus),
+            note_id,
+        },
+    ))
+}
+
+fn encode_typed_vst3_output<P: PluginExport>(
+    event: &Event,
+    events: &EventList,
+    note_ids: &OutputNoteIds,
+) -> Vst3EncodeResult {
+    if event.port >= P::info().midi_output_ports {
+        return Vst3EncodeResult::Invalid;
+    }
+    let bus = event.port;
+    let mut native = Vst3NativeEvent {
+        sample_offset: i32::try_from(event.sample_offset).unwrap_or(i32::MAX),
+        bus_index: i32::from(bus),
+        ..Vst3NativeEvent::default()
+    };
+    let mutation = match event.body {
+        EventBody::NoteOn {
+            group: 0,
+            channel,
+            note,
+            velocity,
+        } if channel < 16 && note < 128 => {
+            let Some((note_id, mutation)) =
+                note_ids.propose_note_on(OutputSourceIdentity::Anonymous, bus, channel, note)
+            else {
+                return Vst3EncodeResult::Unsupported;
+            };
+            native.kind = VST3_EVENT_NOTE_ON;
+            native.channel = i16::from(channel);
+            native.pitch = i16::from(note);
+            native.note_id = note_id;
+            native.velocity = f32::from(velocity) / 127.0;
+            mutation
+        }
+        EventBody::NoteOff {
+            group: 0,
+            channel,
+            note,
+            velocity,
+        } if channel < 16 && note < 128 => {
+            let Some((note_id, mutation)) =
+                note_ids.propose_note_off(OutputSourceIdentity::Anonymous, bus, channel, note)
+            else {
+                return Vst3EncodeResult::Unsupported;
+            };
+            native.kind = VST3_EVENT_NOTE_OFF;
+            native.channel = i16::from(channel);
+            native.pitch = i16::from(note);
+            native.note_id = note_id;
+            native.velocity = f32::from(velocity) / 127.0;
+            mutation
+        }
+        EventBody::Aftertouch {
+            group: 0,
+            channel,
+            note,
+            pressure,
+        } if channel < 16 && note < 128 && pressure < 128 => {
+            native.kind = VST3_EVENT_POLY_PRESSURE;
+            native.channel = i16::from(channel);
+            native.pitch = i16::from(note);
+            native.note_id = note_ids
+                .note_id_for_expression(OutputSourceIdentity::Anonymous, bus, channel, note)
+                .unwrap_or(-1);
+            native.velocity = f32::from(pressure) / 127.0;
+            PendingOutputMutation::None
+        }
+        EventBody::PerNotePitchBend {
+            group: 0,
+            channel,
+            note,
+            value,
+        } if channel < 16 && note < 128 => {
+            let Some(note_id) = note_ids.note_id_for_expression(
+                OutputSourceIdentity::Anonymous,
+                bus,
+                channel,
+                note,
+            ) else {
+                return Vst3EncodeResult::Unsupported;
+            };
+            native.kind = VST3_EVENT_NOTE_EXPRESSION;
+            native.note_id = note_id;
+            native.type_id = 2;
+            native.value = wire_to_vst3_tuning(value);
+            PendingOutputMutation::None
+        }
+        EventBody::ControlChange {
+            group: 0,
+            channel,
+            cc,
+            value,
+        } if channel < 16 && cc < 128 && value < 128 => {
+            native.kind = VST3_EVENT_LEGACY_MIDI_CC_OUT;
+            native.channel = i16::from(channel);
+            native.type_id = u32::from(cc);
+            native.data1 = value;
+            PendingOutputMutation::None
+        }
+        EventBody::ChannelPressure {
+            group: 0,
+            channel,
+            pressure,
+        } if channel < 16 && pressure < 128 => {
+            native.kind = VST3_EVENT_LEGACY_MIDI_CC_OUT;
+            native.channel = i16::from(channel);
+            native.type_id = 128;
+            native.data1 = pressure;
+            PendingOutputMutation::None
+        }
+        EventBody::PitchBend {
+            group: 0,
+            channel,
+            value,
+        } if channel < 16 => {
+            let (lsb, msb) = pitch_bend_to_bytes(value);
+            native.kind = VST3_EVENT_LEGACY_MIDI_CC_OUT;
+            native.channel = i16::from(channel);
+            native.type_id = 129;
+            native.data1 = lsb;
+            native.data2 = msb;
+            PendingOutputMutation::None
+        }
+        EventBody::ProgramChange {
+            group: 0,
+            channel,
+            program,
+        } if channel < 16 && program < 128 => {
+            native.kind = VST3_EVENT_LEGACY_MIDI_CC_OUT;
+            native.channel = i16::from(channel);
+            native.type_id = 130;
+            native.data1 = program;
+            PendingOutputMutation::None
+        }
+        EventBody::SysEx { .. } => {
+            let Some(bytes) = events.sysex_bytes_checked(&event.body) else {
+                return Vst3EncodeResult::Invalid;
+            };
+            return Vst3EncodeResult::Emitted(
+                sysex_native_event(event.sample_offset, bus, 0, bytes),
+                PendingOutputMutation::None,
+            );
+        }
+        _ => return Vst3EncodeResult::Unsupported,
+    };
+    Vst3EncodeResult::Emitted(native, mutation)
+}
+
+fn sysex_native_event(sample_offset: u32, bus: u8, flags: u32, bytes: &[u8]) -> Vst3NativeEvent {
+    Vst3NativeEvent {
+        kind: VST3_EVENT_DATA,
+        sample_offset: i32::try_from(sample_offset).unwrap_or(i32::MAX),
+        bus_index: i32::from(bus),
+        flags,
+        bytes: bytes.as_ptr(),
+        len: len_u32(bytes.len()),
+        ..Vst3NativeEvent::default()
     }
 }
 
@@ -1781,6 +2516,7 @@ unsafe extern "C" fn cb_get_output_sysex_event<P: PluginExport>(
 /// expression correlate without any per-instance tracking state. Returns
 /// `None` for per-note controllers VST3 has no predefined type for; the
 /// value is normalized `0..=1` (VST3's `NoteExpressionValue` domain).
+#[cfg(test)]
 fn note_expression_of(body: &EventBody) -> Option<(u32, i32, f64)> {
     // Predefined VST3 NoteExpressionTypeIDs (reverse of the input map):
     // Volume=0, Pan=1, Tuning=2, Vibrato=3, Expression=4, Brightness=5.
@@ -1822,12 +2558,14 @@ fn note_expression_of(body: &EventBody) -> Option<(u32, i32, f64)> {
 /// The C++ shim stamps every emitted note-on/off with the same formula,
 /// so a plug-in's note-expression events address the live note without
 /// any shared correlation state.
+#[cfg(test)]
 fn vst3_note_id(channel: u8, note: u8) -> i32 {
     (i32::from(channel & 0x0F) << 7) | i32::from(note & 0x7F)
 }
 
 /// Normalize a wire-native 32-bit per-note value into VST3's `0..=1`
 /// `NoteExpressionValue` domain.
+#[cfg(test)]
 fn u32_to_unit(v: u32) -> f64 {
     f64::from(v) / f64::from(u32::MAX)
 }
@@ -1838,6 +2576,7 @@ const VST3_TUNING_SPAN_SEMITONES: f64 = 240.0;
 
 /// VST3 tuning norm (`0..=1`, ±120 st) -> wire per-note bend. The wire
 /// full-scale is ±48 st, so a wider host bend saturates.
+#[cfg(test)]
 fn vst3_tuning_to_wire(norm: f64) -> u32 {
     per_note_bend_from_semitones((norm - 0.5) * VST3_TUNING_SPAN_SEMITONES)
 }
@@ -1852,58 +2591,13 @@ fn wire_to_vst3_tuning(v: u32) -> f64 {
 /// Inverse of [`u32_to_unit`]: widen a VST3 `NoteExpressionValue` into
 /// the wire-native 32-bit per-note domain. Hosts are supposed to stay
 /// in `0..=1`, but the value crosses an FFI boundary - clamp first.
+#[cfg(test)]
 fn unit_to_u32(v: f64) -> u32 {
     // Clamped to `0..=u32::MAX` before the cast, so no truncation or
     // sign loss is possible.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let scaled = (v.clamp(0.0, 1.0) * f64::from(u32::MAX)).round() as u32;
     scaled
-}
-
-unsafe extern "C" fn cb_get_output_note_expression_count<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-) -> u32 {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let audio = inst.audio.enter();
-        len_u32(
-            audio
-                .output_events
-                .iter()
-                .filter(|e| note_expression_of(&e.body).is_some())
-                .count(),
-        )
-    }
-}
-
-unsafe extern "C" fn cb_get_output_note_expression<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    index: u32,
-    out_type_id: *mut u32,
-    out_note_id: *mut i32,
-    out_sample_offset: *mut u32,
-    out_value: *mut f64,
-    out_port: *mut u8,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let audio = inst.audio.enter();
-        if let Some(event) = audio
-            .output_events
-            .iter()
-            .filter(|e| note_expression_of(&e.body).is_some())
-            .nth(index as usize)
-            && let Some((type_id, note_id, value)) = note_expression_of(&event.body)
-        {
-            *out_type_id = type_id;
-            *out_note_id = note_id;
-            *out_sample_offset = event.sample_offset;
-            *out_value = value;
-            // The correlated note-on rode this bus; the shim clamps
-            // like the note path so both land on the same one.
-            *out_port = event.port;
-        }
-    }
 }
 
 unsafe extern "C" fn cb_get_output_param_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
@@ -2239,11 +2933,10 @@ unsafe extern "C" fn cb_midi_mapping_get_param_id<P: PluginExport>(
         && channel < 16
         && let Ok(controller) = u32::try_from(controller)
         && controller < MIDI_PROXY_PER_CHANNEL
+        && let Some(id) = allocated_midi_proxy_id(&inst.midi_proxy_ids, port, channel, controller)
     {
-        if let Some(id) = allocated_midi_proxy_id(&inst.midi_proxy_ids, port, channel, controller) {
-            unsafe { out_param_id.write(id) };
-            return 1;
-        }
+        unsafe { out_param_id.write(id) };
+        return 1;
     }
     0
 }
@@ -2714,13 +3407,11 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         state_free: cb_state_free,
         get_latency: cb_get_latency::<P>,
         get_tail: cb_get_tail::<P>,
-        get_output_event_count: cb_get_output_event_count::<P>,
-        get_output_event: cb_get_output_event::<P>,
-        push_sysex_input: cb_push_sysex_input::<P>,
-        get_output_sysex_count: cb_get_output_sysex_count::<P>,
-        get_output_sysex_event: cb_get_output_sysex_event::<P>,
-        get_output_note_expression_count: cb_get_output_note_expression_count::<P>,
-        get_output_note_expression: cb_get_output_note_expression::<P>,
+        begin_input_events: cb_begin_input_events::<P>,
+        push_input_event: cb_push_input_event::<P>,
+        begin_output_events: cb_begin_output_events::<P>,
+        next_output_event: cb_next_output_event::<P>,
+        commit_output_event: cb_commit_output_event::<P>,
         gui_has_editor: cb_gui_has_editor::<P>,
         gui_get_size: cb_gui_get_size::<P>,
         gui_open: cb_gui_open::<P>,

@@ -214,7 +214,7 @@ impl ExactNoteAddress {
     #[must_use]
     pub fn from_raw_signed(port: i16, channel: i16, key: i16, note_id: i32) -> Self {
         Self {
-            port: classify_port(port),
+            port: classify_port(i32::from(port)),
             channel: classify_u8_axis(channel, 15),
             key: classify_u8_axis(key, 127),
             note_id: match note_id {
@@ -224,15 +224,32 @@ impl ExactNoteAddress {
             },
         }
     }
+
+    /// Classify VST3's signed note fields without discarding plug-in-owned
+    /// negative note identifiers. VST3 reserves only `-1` for "unavailable";
+    /// every other `i32` is a concrete identifier.
+    #[must_use]
+    pub fn from_vst3_signed(port: i32, channel: i16, key: i16, note_id: i32) -> Self {
+        Self {
+            port: classify_port(port),
+            channel: classify_u8_axis(channel, 15),
+            key: classify_u8_axis(key, 127),
+            note_id: if note_id == -1 {
+                ExactAddress::Wildcard
+            } else {
+                ExactAddress::Value(note_id)
+            },
+        }
+    }
 }
 
-fn classify_port(raw: i16) -> ExactAddress<u16> {
+fn classify_port(raw: i32) -> ExactAddress<u16> {
     if raw == -1 {
         ExactAddress::Wildcard
     } else if let Ok(value) = u16::try_from(raw) {
         ExactAddress::Value(value)
     } else {
-        ExactAddress::InvalidRaw(i32::from(raw))
+        ExactAddress::InvalidRaw(raw)
     }
 }
 
@@ -286,6 +303,27 @@ pub enum ExactEventBody {
         address: ExactNoteAddress,
         value: f64,
     },
+    /// A host-native note whose continuous fields must survive without MIDI
+    /// velocity quantization. `length` is present only when the source format
+    /// carries one on note-on.
+    DetailedNote {
+        kind: ExactNoteKind,
+        address: ExactNoteAddress,
+        velocity: f32,
+        tuning: f32,
+        length: Option<i32>,
+    },
+    /// Host-native polyphonic pressure with its original voice identifier.
+    DetailedPolyPressure {
+        address: ExactNoteAddress,
+        pressure: f32,
+    },
+    /// Absolute normalized per-note expression with a full-width type ID.
+    NormalizedNoteExpression {
+        expression_id: u32,
+        address: ExactNoteAddress,
+        value: f64,
+    },
 }
 
 /// Format-neutral provenance hints attached to an exact event.
@@ -300,12 +338,62 @@ pub struct ExactEventQualifiers {
     pub dont_record: bool,
 }
 
+/// VST3-only fields which have no format-neutral interpretation.
+///
+/// Construction rejects non-finite musical positions so an exact event can
+/// never carry a value which is invalid at the VST3 boundary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst3EventMetadata {
+    ppq_position: f64,
+    raw_flags: u16,
+}
+
+impl Vst3EventMetadata {
+    #[must_use]
+    pub fn new(ppq_position: f64, raw_flags: u16) -> Option<Self> {
+        ppq_position.is_finite().then_some(Self {
+            ppq_position,
+            raw_flags,
+        })
+    }
+
+    #[must_use]
+    pub fn ppq_position(self) -> f64 {
+        self.ppq_position
+    }
+
+    #[must_use]
+    pub fn raw_flags(self) -> u16 {
+        self.raw_flags
+    }
+}
+
+/// Opaque source-format metadata attached to an exact event.
+///
+/// Wrappers must consume only their own variant. A different source format is
+/// unsupported rather than silently translating or discarding opaque fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub enum ExactEventMetadata {
+    #[default]
+    None,
+    Vst3(Vst3EventMetadata),
+}
+
+impl ExactEventMetadata {
+    #[must_use]
+    pub fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// A timestamped lossless event. Exact-only events have no [`EventBody`]
 /// fallback; linked events expose one through [`ExactEventRef::fallback`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExactEvent {
     sample_offset: u32,
     qualifiers: ExactEventQualifiers,
+    metadata: ExactEventMetadata,
     pub body: ExactEventBody,
 }
 
@@ -315,6 +403,7 @@ impl ExactEvent {
         Self {
             sample_offset,
             qualifiers: ExactEventQualifiers::default(),
+            metadata: ExactEventMetadata::None,
             body,
         }
     }
@@ -326,6 +415,12 @@ impl ExactEvent {
     }
 
     #[must_use]
+    pub fn with_metadata(mut self, metadata: ExactEventMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    #[must_use]
     pub fn sample_offset(&self) -> u32 {
         self.sample_offset
     }
@@ -333,6 +428,11 @@ impl ExactEvent {
     #[must_use]
     pub fn qualifiers(&self) -> ExactEventQualifiers {
         self.qualifiers
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> ExactEventMetadata {
+        self.metadata
     }
 }
 
@@ -356,6 +456,15 @@ pub enum LosslessEventRef<'a> {
     Exact(ExactEventRef<'a>),
 }
 
+/// Allocation-free position in an [`EventList::lossless_iter`] traversal.
+/// Wrappers keep one in their preallocated audio scratch when their native
+/// ABI pulls events one at a time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LosslessEventCursor {
+    event_order_index: usize,
+    exact_order_index: usize,
+}
+
 impl<'a> ExactEventRef<'a> {
     #[must_use]
     pub fn body(self) -> &'a ExactEventBody {
@@ -370,6 +479,11 @@ impl<'a> ExactEventRef<'a> {
     #[must_use]
     pub fn qualifiers(self) -> ExactEventQualifiers {
         self.exact.qualifiers
+    }
+
+    #[must_use]
+    pub fn metadata(self) -> ExactEventMetadata {
+        self.exact.metadata
     }
 
     /// Semantic-only typed companions suppressed by [`EventList::lossless_iter`].
@@ -1269,56 +1383,62 @@ impl EventList {
     /// allocation. Call [`Self::ensure_sorted_by_offset`] first. Ties retain
     /// the original cross-lane insertion order.
     pub fn lossless_iter(&self) -> impl Iterator<Item = LosslessEventRef<'_>> {
-        let mut event_order_index = 0;
-        let mut exact_order_index = 0;
+        let mut cursor = LosslessEventCursor::default();
+        core::iter::from_fn(move || self.lossless_next(&mut cursor))
+    }
 
-        core::iter::from_fn(move || {
-            while self
-                .event_order
-                .get(event_order_index)
-                .is_some_and(|index| {
-                    self.event_exact
-                        .get(*index)
-                        .is_some_and(|link| *link != EventExactLink::None)
-                })
-            {
-                event_order_index += 1;
-            }
+    /// Pull one item from the merged lossless view without rescanning earlier
+    /// entries. The cursor is list-local and should be reset to `Default` when
+    /// the owning list is cleared or resorted.
+    pub fn lossless_next<'a>(
+        &'a self,
+        cursor: &mut LosslessEventCursor,
+    ) -> Option<LosslessEventRef<'a>> {
+        while self
+            .event_order
+            .get(cursor.event_order_index)
+            .is_some_and(|index| {
+                self.event_exact
+                    .get(*index)
+                    .is_some_and(|link| *link != EventExactLink::None)
+            })
+        {
+            cursor.event_order_index += 1;
+        }
 
-            let typed_storage_index = self.event_order.get(event_order_index).copied();
-            let typed_key = typed_storage_index.and_then(|index| {
-                self.events.get(index).and_then(|event| {
-                    self.event_sequence
-                        .get(index)
-                        .map(|sequence| (event.sample_offset, *sequence))
-                })
-            });
-            let exact_storage_index = self.exact_order.get(exact_order_index).copied();
-            let exact_key = exact_storage_index.and_then(|index| {
-                self.exact_events
+        let typed_storage_index = self.event_order.get(cursor.event_order_index).copied();
+        let typed_key = typed_storage_index.and_then(|index| {
+            self.events.get(index).and_then(|event| {
+                self.event_sequence
                     .get(index)
-                    .map(|stored| (self.exact_offset(index), stored.token.sequence))
-            });
+                    .map(|sequence| (event.sample_offset, *sequence))
+            })
+        });
+        let exact_storage_index = self.exact_order.get(cursor.exact_order_index).copied();
+        let exact_key = exact_storage_index.and_then(|index| {
+            self.exact_events
+                .get(index)
+                .map(|stored| (self.exact_offset(index), stored.token.sequence))
+        });
 
-            match (typed_key, exact_key) {
-                (None, None) => None,
-                (Some(_), None) => {
-                    let event = self.events.get(typed_storage_index?)?;
-                    event_order_index += 1;
-                    Some(LosslessEventRef::Typed(event))
-                }
-                (Some(typed), Some(exact)) if typed <= exact => {
-                    let event = self.events.get(typed_storage_index?)?;
-                    event_order_index += 1;
-                    Some(LosslessEventRef::Typed(event))
-                }
-                (_, Some(_)) => {
-                    let event = self.exact_ref(exact_storage_index?)?;
-                    exact_order_index += 1;
-                    Some(LosslessEventRef::Exact(event))
-                }
+        match (typed_key, exact_key) {
+            (None, None) => None,
+            (Some(_), None) => {
+                let event = self.events.get(typed_storage_index?)?;
+                cursor.event_order_index += 1;
+                Some(LosslessEventRef::Typed(event))
             }
-        })
+            (Some(typed), Some(exact)) if typed <= exact => {
+                let event = self.events.get(typed_storage_index?)?;
+                cursor.event_order_index += 1;
+                Some(LosslessEventRef::Typed(event))
+            }
+            (_, Some(_)) => {
+                let event = self.exact_ref(exact_storage_index?)?;
+                cursor.exact_order_index += 1;
+                Some(LosslessEventRef::Exact(event))
+            }
+        }
     }
 
     #[must_use]

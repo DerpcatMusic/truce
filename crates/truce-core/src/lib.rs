@@ -29,9 +29,10 @@ pub use bus::{BusConfig, BusKind, BusLayout, ChannelConfig};
 pub use config::{AudioConfig, ProcessMode};
 pub use editor::{Editor, EditorBuilder, IntoEditor, PluginContext};
 pub use events::{
-    Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody, ExactEventQualifiers,
-    ExactEventRef, ExactEventToken, ExactNoteAddress, ExactNoteKind, LosslessEventRef, PushError,
-    RawMidi1, RawUmp, SYSEX_POOL_PREALLOC, TransportInfo,
+    Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody, ExactEventMetadata,
+    ExactEventQualifiers, ExactEventRef, ExactEventToken, ExactNoteAddress, ExactNoteKind,
+    LosslessEventCursor, LosslessEventRef, PushError, RawMidi1, RawUmp, SYSEX_POOL_PREALLOC,
+    TransportInfo, Vst3EventMetadata,
 };
 pub use export::PluginExport;
 pub use info::{AutomationConfig, MidiDialect, PluginCategory, PluginInfo};
