@@ -478,9 +478,12 @@ pub struct DescriptorHolder {
     _name: CString,
     _vendor: CString,
     _url: CString,
+    _manual_url: Option<CString>,
+    _support_url: Option<CString>,
     _version: CString,
+    _description: Option<CString>,
     _features: Vec<*const c_char>,
-    _features_storage: Vec<&'static CStr>,
+    _features_storage: Vec<CString>,
 }
 
 unsafe impl Send for DescriptorHolder {}
@@ -500,33 +503,47 @@ impl DescriptorHolder {
         let name = CString::new(resolved_name(info)).unwrap_or_default();
         let vendor = CString::new(info.vendor).unwrap_or_default();
         let url = CString::new(info.url).unwrap_or_default();
+        let manual_url = info
+            .clap_manual_url
+            .and_then(|value| CString::new(value).ok());
+        let support_url = info
+            .clap_support_url
+            .and_then(|value| CString::new(value).ok());
         let version = CString::new(info.version).unwrap_or_default();
+        let description = info.description.and_then(|value| CString::new(value).ok());
 
-        let features_storage: Vec<&'static CStr> = match info.category {
-            PluginCategory::Instrument => {
-                vec![
-                    CLAP_PLUGIN_FEATURE_INSTRUMENT,
-                    CLAP_PLUGIN_FEATURE_SYNTHESIZER,
-                ]
-            }
-            PluginCategory::NoteEffect => vec![CLAP_PLUGIN_FEATURE_NOTE_EFFECT],
-            PluginCategory::Effect => vec![CLAP_PLUGIN_FEATURE_AUDIO_EFFECT],
+        let default_features: &[&CStr] = match info.category {
+            PluginCategory::Instrument => &[
+                CLAP_PLUGIN_FEATURE_INSTRUMENT,
+                CLAP_PLUGIN_FEATURE_SYNTHESIZER,
+            ],
+            PluginCategory::NoteEffect => &[CLAP_PLUGIN_FEATURE_NOTE_EFFECT],
+            PluginCategory::Effect => &[CLAP_PLUGIN_FEATURE_AUDIO_EFFECT],
             // Analyzer / Tool still process audio (passthrough), so keep
             // AUDIO_EFFECT for insert menus, but lead with the specific
             // feature so a feature-filtered browser surfaces them.
-            PluginCategory::Analyzer => {
-                vec![
-                    CLAP_PLUGIN_FEATURE_ANALYZER,
-                    CLAP_PLUGIN_FEATURE_AUDIO_EFFECT,
-                ]
-            }
-            PluginCategory::Tool => {
-                vec![
-                    CLAP_PLUGIN_FEATURE_UTILITY,
-                    CLAP_PLUGIN_FEATURE_AUDIO_EFFECT,
-                ]
-            }
+            PluginCategory::Analyzer => &[
+                CLAP_PLUGIN_FEATURE_ANALYZER,
+                CLAP_PLUGIN_FEATURE_AUDIO_EFFECT,
+            ],
+            PluginCategory::Tool => &[
+                CLAP_PLUGIN_FEATURE_UTILITY,
+                CLAP_PLUGIN_FEATURE_AUDIO_EFFECT,
+            ],
         };
+        let configured_features = (!info.clap_features.is_empty()).then(|| {
+            info.clap_features
+                .iter()
+                .map(|feature| CString::new(*feature))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        });
+        let features_storage = configured_features.flatten().unwrap_or_else(|| {
+            default_features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect()
+        });
 
         let mut features: Vec<*const c_char> =
             features_storage.iter().map(|f| f.as_ptr()).collect();
@@ -538,10 +555,16 @@ impl DescriptorHolder {
             name: name.as_ptr(),
             vendor: vendor.as_ptr(),
             url: url.as_ptr(),
-            manual_url: ptr::null(),
-            support_url: url.as_ptr(),
+            manual_url: manual_url
+                .as_ref()
+                .map_or(ptr::null(), |value| value.as_ptr()),
+            support_url: support_url
+                .as_ref()
+                .map_or(url.as_ptr(), |value| value.as_ptr()),
             version: version.as_ptr(),
-            description: ptr::null(),
+            description: description
+                .as_ref()
+                .map_or(ptr::null(), |value| value.as_ptr()),
             features: features.as_ptr(),
         };
 
@@ -551,7 +574,10 @@ impl DescriptorHolder {
             _name: name,
             _vendor: vendor,
             _url: url,
+            _manual_url: manual_url,
+            _support_url: support_url,
             _version: version,
+            _description: description,
             _features: features,
             _features_storage: features_storage,
         }

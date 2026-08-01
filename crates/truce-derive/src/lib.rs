@@ -250,6 +250,9 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
         }
     };
     let preset_user_dir = opt_str(&plugin.presets.as_ref().and_then(|c| c.user_dir.clone()));
+    let description = opt_str(&plugin.description);
+    let clap_manual_url = opt_str(&plugin.clap_manual_url);
+    let clap_support_url = opt_str(&plugin.clap_support_url);
     let vst3_name = opt_str(&plugin.vst3_name);
     let clap_name = opt_str(&plugin.clap_name);
     let vst2_name = opt_str(&plugin.vst2_name);
@@ -265,6 +268,7 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
         quote! { &[#(#items),*] }
     };
     let legacy = plugin.legacy_state.as_ref();
+    let clap_features = str_slice(&plugin.clap_features);
     let legacy_au_keys = str_slice(legacy.map_or(&[][..], |l| &l.au_keys));
     let legacy_lv2_uris = str_slice(legacy.map_or(&[][..], |l| &l.lv2_uris));
     let legacy_aax_chunk_ids = str_slice(legacy.map_or(&[][..], |l| &l.aax_chunk_ids));
@@ -297,6 +301,10 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
                 url: #url,
                 version: #version,
                 category: #category,
+                description: #description,
+                clap_manual_url: #clap_manual_url,
+                clap_support_url: #clap_support_url,
+                clap_features: #clap_features,
                 accepts_midi_in: #accepts_midi_in,
                 emits_midi: #emits_midi,
                 midi_input_dialect: #midi_input_dialect,

@@ -22,6 +22,20 @@ pub struct PluginInfo {
     pub version: &'static str,
     pub category: PluginCategory,
 
+    /// Optional user-facing description published by format descriptors.
+    pub description: Option<&'static str>,
+
+    /// Optional CLAP manual URL. `None` leaves the descriptor field unset.
+    pub clap_manual_url: Option<&'static str>,
+
+    /// Optional CLAP support URL. `None` keeps the wrapper's vendor URL
+    /// fallback for backwards compatibility.
+    pub clap_support_url: Option<&'static str>,
+
+    /// Exact CLAP discovery feature strings, in host-facing order. An empty
+    /// slice keeps the category-derived defaults.
+    pub clap_features: &'static [&'static str],
+
     /// Whether the host should route MIDI / note events *into* this
     /// plugin. Defaults to `true` for instruments and note effects;
     /// `truce.toml`'s `midi_input` overrides the derived value (e.g.

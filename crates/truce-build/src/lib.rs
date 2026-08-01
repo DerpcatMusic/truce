@@ -282,6 +282,18 @@ pub struct PluginDef {
     /// truce instrument", …).
     #[serde(default)]
     pub description: Option<String>,
+    /// CLAP descriptor URL for the plugin's manual. When omitted the
+    /// descriptor leaves `manual_url` unset.
+    #[serde(default)]
+    pub clap_manual_url: Option<String>,
+    /// CLAP descriptor URL for product support. When omitted the CLAP
+    /// wrapper preserves its historical fallback to [`VendorConfig::url`].
+    #[serde(default)]
+    pub clap_support_url: Option<String>,
+    /// Exact CLAP discovery feature strings, in host-facing order.
+    /// An empty list keeps the category-derived defaults.
+    #[serde(default)]
+    pub clap_features: Vec<String>,
     #[serde(default)]
     pub fourcc: Option<String>,
     pub category: String,
