@@ -89,7 +89,11 @@ macro_rules! __plugin_impl {
 
         // Always export the PluginLogic for dylib use (shell-mode or
         // testing). Static-mode shells ignore these exports.
-        $crate::__reexport::export_plugin!($logic, $params);
+        $crate::__reexport::export_plugin!(
+            $logic,
+            $params
+            $(, tasks: [$($task),+])?
+        );
 
         // The static / dynamic-shell `__HotShellWrapper` definition
         // lives inside this synthetic module so a single
@@ -126,7 +130,11 @@ macro_rules! __plugin_impl {
             // --- Shell mode (hot-reload) ---
             // Load the logic from a dylib. Same crate, debug build.
             #[cfg(all(feature = "shell", not(test)))]
-            $crate::__plugin_hot_reload!($logic, $params);
+            $crate::__plugin_hot_reload!(
+                $logic,
+                $params
+                $(, tasks: [$($task),+])?
+            );
         }
 
         // Re-export the wrapper so `pub type Plugin`, the screenshot
@@ -269,7 +277,7 @@ macro_rules! __plugin_impl {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __plugin_hot_reload {
-    ($logic:ty, $params:ty) => {
+    ($logic:ty, $params:ty $(, tasks: [$($task:ty),+])?) => {
         pub struct __HotShellWrapper {
             // `Sample` is the prelude's type alias (`f32` for
             // `prelude` / `prelude32` / `prelude64m`, `f64` for
@@ -425,8 +433,17 @@ macro_rules! __plugin_hot_reload {
             fn create() -> Self {
                 let params = <$params>::new();
                 let path = Self::dylib_path();
+                let tasks: ::core::option::Option<
+                    $crate::core::tasks::AnyTaskSpawner,
+                > = ::core::option::Option::None;
+                $(let tasks = {
+                    $(let _ = ::core::marker::PhantomData::<$task>;)+
+                    ::core::option::Option::Some(
+                        $crate::core::tasks::AnyTaskSpawner::routed(),
+                    )
+                };)?
                 Self {
-                    inner: $crate::__reexport::HotShell::new(params, path),
+                    inner: $crate::__reexport::HotShell::new_with_tasks(params, path, tasks),
                 }
             }
 
@@ -444,6 +461,12 @@ macro_rules! __plugin_hot_reload {
 
             fn snapshot_slot(&self) -> std::sync::Arc<$crate::core::snapshot::SnapshotSlot> {
                 self.inner.snapshot_slot()
+            }
+
+            fn task_spawner(
+                &self,
+            ) -> ::core::option::Option<$crate::core::tasks::AnyTaskSpawner> {
+                self.inner.task_spawner()
             }
 
             fn editor_builder(&self) -> $crate::core::editor::EditorBuilder<$params> {

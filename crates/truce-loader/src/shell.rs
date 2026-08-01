@@ -28,6 +28,7 @@ use truce_core::events::{EventBody, EventList};
 use truce_core::info::PluginInfo;
 use truce_core::plugin::PluginRuntime;
 use truce_core::process::{ProcessContext, ProcessStatus};
+use truce_core::tasks::{AnyTaskSpawner, warm_pool};
 use truce_params::Params;
 use truce_params::sample::Sample;
 
@@ -62,6 +63,9 @@ const GUI_LOCK_WAIT: Duration = Duration::from_millis(50);
 pub struct HotShell<P: Params, S: Sample = f32> {
     pub params: Arc<P>,
     loader: Arc<Mutex<NativeLoader<S>>>,
+    /// Stable wrapper/editor route. The loader swaps its active fixed lane
+    /// set off-thread; the DSP path reads the fixed set directly.
+    tasks: Option<AnyTaskSpawner>,
     /// The plugin's DSP state, owned by the shell as an erased
     /// `Box<State>` so it can outlive a hot-reload. Null before the
     /// first successful load. Only ever touched while the loader lock is
@@ -127,9 +131,18 @@ unsafe impl<P: Params, S: Sample> Send for HotShell<P, S> {}
 
 impl<P: Params + 'static, S: Sample> HotShell<P, S> {
     pub fn new(params: P, dylib_path: PathBuf) -> Self {
+        Self::new_with_tasks(params, dylib_path, None)
+    }
+
+    pub fn new_with_tasks(params: P, dylib_path: PathBuf, tasks: Option<AnyTaskSpawner>) -> Self {
+        if tasks.is_some() {
+            // Host/main thread: ensure first process scheduling stays the
+            // same wait-free queue push as the static shell.
+            warm_pool();
+        }
         let params = Arc::new(params);
         let params_ptr = Arc::as_ptr(&params).cast::<()>();
-        let loader = NativeLoader::new(dylib_path, params_ptr);
+        let loader = NativeLoader::new_with_tasks(dylib_path, params_ptr, tasks.clone());
         let initial_swap = loader.swap_generation();
         // Allocate the initial DSP state from the freshly loaded dylib
         // (before wrapping the loader in the mutex - no contention yet).
@@ -145,6 +158,7 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
         Self {
             params,
             loader,
+            tasks,
             state,
             state_origin,
             meters: truce_core::meters::MeterStore::new(),
@@ -245,6 +259,11 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
     #[must_use]
     pub fn snapshot_slot(&self) -> Arc<truce_core::snapshot::SnapshotSlot> {
         Arc::clone(&self.snapshots)
+    }
+
+    #[must_use]
+    pub fn task_spawner(&self) -> Option<AnyTaskSpawner> {
+        self.tasks.clone()
     }
 
     /// A lock-free editor builder that constructs from the *currently
@@ -394,6 +413,9 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         .with_process_mode(context.process_mode)
         .with_params(&param_fn)
         .with_meters(&meter_fn);
+        if let Some(tasks) = loader.task_spawner() {
+            ctx = ctx.with_tasks(tasks);
+        }
 
         let status = loader.process(self.state, buffer, events, &mut ctx);
 
@@ -546,9 +568,8 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
 impl<P: Params, S: Sample> Drop for HotShell<P, S> {
     fn drop(&mut self) {
         // Free the DSP state through the dylib that produced it (its
-        // `Drop` glue lives there). The library is leaked, never closed,
-        // so the drop function is still mapped. The loader's own `Drop`
-        // then tears down the symbol table + leaked handles.
+        // `Drop` glue lives there). The loader retains every origin
+        // generation until this state is gone, then releases quiescent code.
         self.drop_state();
     }
 }

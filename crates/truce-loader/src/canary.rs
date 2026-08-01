@@ -54,7 +54,11 @@ use truce_gui_types::theme::{Color, Theme};
 /// token that lets the shell skip re-serializing an unchanged snapshot).
 /// A stale epoch-5 dylib lacks the symbol; this bump rejects it at the
 /// canary before symbol resolution fails.
-pub const ABI_EPOCH: u32 = 6;
+/// Epoch 7: `truce_init_state` receives the current managed-task bundle and
+/// logic dylibs export `truce_build_tasks`. A stale epoch-6 dylib has the old
+/// init signature and no task constructor, so it must be rejected before
+/// either symbol is called.
+pub const ABI_EPOCH: u32 = 7;
 
 /// ABI fingerprint. Compared between shell and dylib before loading.
 ///

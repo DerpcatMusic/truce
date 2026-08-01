@@ -454,7 +454,7 @@ impl<P: ?Sized> PluginContext<P> {
     /// building the editor context.
     #[must_use]
     pub fn with_tasks(mut self, tasks: Option<AnyTaskSpawner>) -> Self {
-        self.tasks = tasks;
+        self.tasks = tasks.map(|tasks| tasks.snapshot());
         self
     }
 

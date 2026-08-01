@@ -41,9 +41,9 @@ use std::ffi::c_void;
 #[cfg(all(unix, not(miri)))]
 use std::ffi::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::thread::{self, Thread};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 
@@ -93,6 +93,15 @@ struct Sink<T: Send + 'static> {
     /// picks up whatever the bower-out was injected for, so nothing is
     /// stranded. Unused in the concurrent (default) mode.
     draining: AtomicBool,
+    /// Cleared when a hot-reload retires this lane. Scheduling stays a
+    /// single atomic read on the calling thread; already-running work may
+    /// finish under its origin dylib, while queued work is discarded.
+    accepting: AtomicBool,
+    /// Producers between the accepting check and queue push. Retirement
+    /// waits for this bounded critical section before clearing the queues.
+    schedulers: AtomicUsize,
+    /// Pool workers currently inside this sink's drain entry point.
+    active_drains: AtomicUsize,
     /// `run(task)` is `move |task| task.run(&params)`, built
     /// once when the instance registers - never per task.
     run: Box<dyn Fn(T) + Send + Sync>,
@@ -136,6 +145,7 @@ impl<T: Send + 'static> Sink<T> {
 
 impl<T: Send + 'static> Drain for Sink<T> {
     fn drain(&self) {
+        let _drain = AtomicCountGuard::new(&self.active_drains);
         // Concurrent (default) mode: a second worker may drain this sink at
         // the same time. Handlers must be reentrancy-safe (see
         // `BackgroundTask::SERIALIZED`).
@@ -399,6 +409,9 @@ impl<T: Send + 'static> TaskSpawner<T> {
                 scheduled: AtomicBool::new(false),
                 serialized,
                 draining: AtomicBool::new(false),
+                accepting: AtomicBool::new(true),
+                schedulers: AtomicUsize::new(0),
+                active_drains: AtomicUsize::new(0),
                 run: Box::new(run),
             }),
         }
@@ -413,6 +426,9 @@ impl<T: Send + 'static> TaskSpawner<T> {
     ///
     /// Returns the task back when the preallocated inbound queue is full.
     pub fn try_spawn(&self, task: T) -> Result<(), T> {
+        let Some(_scheduling) = self.sink.begin_schedule() else {
+            return Err(task);
+        };
         self.sink.queue.push(task)?;
         self.arm();
         Ok(())
@@ -427,6 +443,9 @@ impl<T: Send + 'static> TaskSpawner<T> {
     /// type should be cheap to drop - a small `Copy` request, not an
     /// owned buffer.
     pub fn spawn_coalescing(&self, task: T) {
+        let Some(_scheduling) = self.sink.begin_schedule() else {
+            return;
+        };
         let _ = self.sink.coalesced.force_push(task);
         self.arm();
     }
@@ -452,9 +471,89 @@ impl<T: Send + 'static> TaskSpawner<T> {
     }
 }
 
-/// One type-erased lane. Each element of [`AnyTaskSpawner`] holds one
-/// `TaskSpawner<T>` for a distinct task type.
-type ErasedLane = Arc<dyn std::any::Any + Send + Sync>;
+struct AtomicCountGuard<'a>(&'a AtomicUsize);
+
+impl<'a> AtomicCountGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for AtomicCountGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl<T: Send + 'static> Sink<T> {
+    fn begin_schedule(&self) -> Option<AtomicCountGuard<'_>> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = AtomicCountGuard::new(&self.schedulers);
+        self.accepting.load(Ordering::Acquire).then_some(guard)
+    }
+}
+
+trait RetireLane: Send + Sync {
+    fn retire(&self, deadline: Instant) -> bool;
+}
+
+impl<T: Send + 'static> RetireLane for Sink<T> {
+    fn retire(&self, deadline: Instant) -> bool {
+        self.accepting.store(false, Ordering::Release);
+        while self.schedulers.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        while self.coalesced.pop().is_some() {}
+        while self.queue.pop().is_some() {}
+        while self.active_drains.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        self.schedulers.load(Ordering::Acquire) == 0
+            && self.active_drains.load(Ordering::Acquire) == 0
+    }
+}
+
+/// One type-erased lane. The typed handle serves `downcast`; `control`
+/// lets the reload watcher close a previous generation without knowing T.
+struct ErasedLane {
+    typed: Arc<dyn std::any::Any + Send + Sync>,
+    control: Arc<dyn RetireLane>,
+}
+
+struct LaneSet(Box<[ErasedLane]>);
+
+impl LaneSet {
+    fn retire(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut drained = true;
+        for lane in &self.0 {
+            drained &= lane.control.retire(deadline);
+        }
+        drained
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.0.iter().all(|lane| {
+            // The lane set itself owns two strong references to each sink:
+            // one through the typed TaskSpawner and one control handle.
+            // Any additional owner is a worker/injector or a typed handle
+            // retained by plugin/editor code.
+            Arc::strong_count(&lane.control) == 2
+        })
+    }
+}
+
+enum TaskLanes {
+    /// Static builds and the hot logic's init/process path. Downcast is only
+    /// an Arc clone and remains suitable for the audio thread.
+    Fixed(Arc<LaneSet>),
+    /// Stable wrapper/editor handle. Reload replaces this off-thread; hot
+    /// process never downcasts through it.
+    Routed(Arc<RwLock<Arc<LaneSet>>>),
+}
 
 /// A bundle of type-erased [`TaskSpawner`]s - one lane per declared task
 /// type - so the concrete `ProcessContext` / `InitContext` (whose
@@ -462,20 +561,107 @@ type ErasedLane = Arc<dyn std::any::Any + Send + Sync>;
 /// types) can carry every lane and hand back the right typed spawner on
 /// demand via [`Self::downcast`]. Cheap to clone (one `Arc`).
 #[derive(Clone)]
-pub struct AnyTaskSpawner(Arc<[ErasedLane]>);
+pub struct AnyTaskSpawner(Arc<TaskLanes>);
 
 impl AnyTaskSpawner {
     /// Erase a single typed spawner into a one-lane bundle.
     #[must_use]
     pub fn new<T: Send + 'static>(spawner: &TaskSpawner<T>) -> Self {
-        Self(Arc::from(vec![Arc::new(spawner.clone()) as ErasedLane]))
+        Self::from_lanes(vec![erased_lane(spawner.clone())])
     }
 
     /// Bundle several already-erased lanes (one per task type). The
     /// `plugin!` macro builds the lanes with [`TaskSpawnerBundle`].
     #[must_use]
-    pub fn from_lanes(lanes: Vec<ErasedLane>) -> Self {
-        Self(Arc::from(lanes))
+    fn from_lanes(lanes: Vec<ErasedLane>) -> Self {
+        Self(Arc::new(TaskLanes::Fixed(Arc::new(LaneSet(
+            lanes.into_boxed_slice(),
+        )))))
+    }
+
+    /// Create the stable GUI/wrapper route used by a hot-reload shell.
+    /// Hot logic receives the current fixed generation directly, keeping
+    /// process-thread lookup lock-free.
+    #[must_use]
+    pub fn routed() -> Self {
+        Self(Arc::new(TaskLanes::Routed(Arc::new(RwLock::new(
+            Arc::new(LaneSet(Box::new([]))),
+        )))))
+    }
+
+    /// Install a verified logic generation and retire the previous lanes.
+    /// Called by the reload watcher while it owns the loader lock, never by
+    /// the audio thread.
+    pub fn replace_with(&self, next: &Self, timeout: Duration) -> bool {
+        let TaskLanes::Routed(route) = self.0.as_ref() else {
+            return false;
+        };
+        let TaskLanes::Fixed(next) = next.0.as_ref() else {
+            return false;
+        };
+        let mut active = route
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let drained = active.retire(timeout);
+        *active = Arc::clone(next);
+        drained
+    }
+
+    /// Disconnect a hot shell's stable wrapper/editor route from its final
+    /// logic generation before the loader considers unloading that dylib.
+    pub fn clear_route(&self, timeout: Duration) -> bool {
+        let TaskLanes::Routed(route) = self.0.as_ref() else {
+            return false;
+        };
+        let mut active = route
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let drained = active.retire(timeout);
+        *active = Arc::new(LaneSet(Box::new([])));
+        drained
+    }
+
+    /// Freeze the route's current generation. Editor contexts call this at
+    /// open time so an editor compiled from an older dylib can never enqueue
+    /// a changed task layout into a newer generation's typed queue.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        match self.0.as_ref() {
+            TaskLanes::Fixed(_) => self.clone(),
+            TaskLanes::Routed(route) => Self(Arc::new(TaskLanes::Fixed(Arc::clone(
+                &route
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )))),
+        }
+    }
+
+    /// Retire the active generation without installing a replacement.
+    /// Existing typed handles reject new work; running handlers finish.
+    pub fn retire(&self, timeout: Duration) -> bool {
+        match self.0.as_ref() {
+            TaskLanes::Fixed(lanes) => lanes.retire(timeout),
+            TaskLanes::Routed(route) => route
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retire(timeout),
+        }
+    }
+
+    /// Whether no worker, queued injector entry, DSP state, or editor holds
+    /// a typed handle into this generation. A hot loader may unload the
+    /// origin dylib only after this becomes true.
+    #[must_use]
+    pub fn is_quiescent(&self) -> bool {
+        match self.0.as_ref() {
+            TaskLanes::Fixed(lanes) => Arc::strong_count(lanes) == 1 && lanes.is_quiescent(),
+            TaskLanes::Routed(route) => {
+                let lanes = route
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Arc::strong_count(&lanes) == 1 && lanes.is_quiescent()
+            }
+        }
     }
 
     /// Recover the typed spawner for task type `T`, or `None` if no lane of
@@ -483,9 +669,28 @@ impl AnyTaskSpawner {
     /// matches.
     #[must_use]
     pub fn downcast<T: Send + 'static>(&self) -> Option<TaskSpawner<T>> {
-        self.0
-            .iter()
-            .find_map(|lane| lane.downcast_ref::<TaskSpawner<T>>().cloned())
+        let find = |lanes: &LaneSet| {
+            lanes
+                .0
+                .iter()
+                .find_map(|lane| lane.typed.downcast_ref::<TaskSpawner<T>>().cloned())
+        };
+        match self.0.as_ref() {
+            TaskLanes::Fixed(lanes) => find(lanes),
+            TaskLanes::Routed(route) => find(
+                &route
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        }
+    }
+}
+
+fn erased_lane<T: Send + 'static>(spawner: TaskSpawner<T>) -> ErasedLane {
+    let control = Arc::clone(&spawner.sink) as Arc<dyn RetireLane>;
+    ErasedLane {
+        typed: Arc::new(spawner),
+        control,
     }
 }
 
@@ -503,7 +708,7 @@ impl TaskSpawnerBundle {
 
     /// Add one task type's spawner to the bundle.
     pub fn push<T: Send + 'static>(&mut self, spawner: TaskSpawner<T>) {
-        self.0.push(Arc::new(spawner) as ErasedLane);
+        self.0.push(erased_lane(spawner));
     }
 
     /// Finish: `Some` bundle, or `None` when no lanes were added (a plugin
@@ -527,9 +732,8 @@ impl TaskSpawnerBundle {
 pub struct InitContext {
     tasks: Option<AnyTaskSpawner>,
     /// Handle for the off-thread snapshot lane (large state save), when
-    /// the shell wired one. `None` in `--shell` hot-reload builds, where
-    /// (like `tasks`) it isn't threaded across the dylib boundary yet -
-    /// so the off-thread snapshot path is a static-build feature.
+    /// the shell wired one. `None` in `--shell` hot-reload builds, where the
+    /// off-thread snapshot path is not threaded across the dylib boundary.
     snapshot: Option<SnapshotPublisher>,
 }
 
