@@ -47,9 +47,11 @@
 // v7: native process returns status and output negotiation carries the host's
 // UMP protocol; current shims require this exact boundary.
 // v8: appended final output-delivery status publication.
+// v9: appended wrapper-time output preflight and transactional parameter
+// feedback publication.
 #define TRUCE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define TRUCE_AU_ABI_MAGIC 0x54417500u
-#define TRUCE_AU_ABI_VERSION 0x54417508u
+#define TRUCE_AU_ABI_VERSION 0x54417509u
 
 typedef struct {
     uint8_t component_type[4];
@@ -411,6 +413,11 @@ typedef struct {
     uint32_t (*push_sysex_input_native)(void *ctx, uint32_t sample_offset,
                                         const uint8_t *bytes, uint32_t len);
     void (*finish_output_events)(void *ctx, uint32_t status);
+    void (*begin_output_events_v9)(void *ctx, uint32_t carrier_mask,
+                                   uint32_t num_frames, uint32_t ump_protocol,
+                                   uint32_t max_absolute_offset,
+                                   uint32_t ump_time_valid);
+    uint32_t (*commit_output_params)(void *ctx);
 } AuCallbacks;
 
 // Globals shared between v2 and v3 shims.

@@ -55,8 +55,8 @@ use truce_core::editor::EditorBuilder;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use truce_core::meters::MeterStore;
 use truce_core::midi::{
-    decode_short_message, downconvert_to_midi1, pitch_bend_to_bytes, route_midi_port,
-    upconvert_to_midi2,
+    decode_short_message, downconvert_to_midi1, event_to_midi1, pitch_bend_to_bytes,
+    route_midi_port, upconvert_to_midi2,
 };
 use truce_core::plugin::PluginRuntime;
 use truce_core::presets::{PresetScope, enumerate_scope, load_preset_file};
@@ -386,6 +386,8 @@ struct AuAudio<P: PluginExport> {
     native_output_carriers: u32,
     native_output_num_frames: u32,
     native_output_ump_protocol: u8,
+    native_output_max_absolute_offset: u32,
+    native_output_ump_time_valid: bool,
     native_output_status: u32,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     sub_event_scratch: EventList,
@@ -499,6 +501,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     native_output_carriers: 0,
                     native_output_num_frames: 0,
                     native_output_ump_protocol: 0,
+                    native_output_max_absolute_offset: u32::MAX,
+                    native_output_ump_time_valid: true,
                     native_output_status: AU_OUTPUT_END,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sysex_assembler: SysExAssembler::with_capacity(SYSEX_POOL_PREALLOC),
@@ -1218,25 +1222,6 @@ unsafe fn cb_process_impl<P: PluginExport>(
         scr.scratch
             .finish_widening(outputs, num_output_channels, len_u32(num_frames));
         scr.output_events.ensure_sorted_by_offset();
-
-        // AU v2 (macOS): hand process-emitted parameter changes to the
-        // notifier thread so the host's UI / automation reflect values
-        // the plugin changed during processing. The host set + listener
-        // broadcast takes locks and dispatches host callbacks, so it
-        // can't run here on the audio thread - we only push to the wait-free
-        // queue. The notifier polls and coalesces off-thread. A full queue
-        // drops the notification rather than block.
-        // AU v3 (iOS) has no host-notify: the Swift shim polls the
-        // parameter tree, matching the editor-side `set_param` split.
-        #[cfg(target_os = "macos")]
-        if let Some(notifier) = &inst.param_notify {
-            for event in scr.output_events.iter() {
-                if let EventBody::ParamChange { id, value } = event.body {
-                    // `value` is plain, as AU wants.
-                    let _ = notifier.queue.push((id, f32::from_f64(value)));
-                }
-            }
-        }
 
         // Refresh latency / tail caches so the host's main-thread
         // queries don't have to touch the plugin. On an actual
@@ -2147,6 +2132,28 @@ fn typed_midi1_bytes(body: &EventBody) -> Option<([u8; 3], u32)> {
     Some((bytes, len))
 }
 
+fn midi1_message_len(status: u8) -> Option<usize> {
+    if (0x80..=0xEF).contains(&status) {
+        return Some(if matches!(status & 0xF0, 0xC0 | 0xD0) {
+            2
+        } else {
+            3
+        });
+    }
+    match status {
+        0xF1 | 0xF3 => Some(2),
+        0xF2 => Some(3),
+        0xF6 | 0xF8 | 0xFA | 0xFB | 0xFC | 0xFE | 0xFF => Some(1),
+        _ => None,
+    }
+}
+
+fn raw_midi1_valid(message: RawMidi1) -> bool {
+    let bytes = message.bytes();
+    midi1_message_len(bytes[0]) == Some(bytes.len())
+        && bytes.iter().skip(1).all(|byte| byte & 0x80 == 0)
+}
+
 fn output_port<P: PluginExport>(port: u16) -> Option<u16> {
     (port < u16::from(P::info().midi_output_ports)).then_some(port)
 }
@@ -2194,6 +2201,7 @@ fn require_ump_carrier(carrier_mask: u32, host_protocol: u8) -> Result<(), Nativ
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn encode_native_output<P: PluginExport>(
     event: LosslessEventRef<'_>,
     list: &EventList,
@@ -2241,11 +2249,19 @@ fn encode_native_output<P: PluginExport>(
                     ..AuNativeEvent::default()
                 });
             }
+            if event_to_midi1(&event.body).is_some() {
+                return NativeEncodeResult::Invalid;
+            }
             if let EventBody::SysEx { .. } = event.body {
+                let Some(bytes) = list.sysex_bytes_checked(&event.body) else {
+                    return NativeEncodeResult::Invalid;
+                };
+                if bytes.iter().any(|byte| byte & 0x80 != 0) {
+                    return NativeEncodeResult::Invalid;
+                }
                 if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
                     return NativeEncodeResult::Unsupported;
                 }
-                let bytes = list.sysex_bytes(&event.body);
                 return NativeEncodeResult::Emitted(AuNativeEvent {
                     sample_offset,
                     port,
@@ -2286,6 +2302,9 @@ fn encode_native_output<P: PluginExport>(
                     let Some(port) = output_port::<P>(port) else {
                         return NativeEncodeResult::Invalid;
                     };
+                    if !raw_midi1_valid(message) {
+                        return NativeEncodeResult::Invalid;
+                    }
                     if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
                         return NativeEncodeResult::Unsupported;
                     }
@@ -2308,6 +2327,9 @@ fn encode_native_output<P: PluginExport>(
                     let Some(bytes) = exact.sysex_bytes_checked() else {
                         return NativeEncodeResult::Invalid;
                     };
+                    if bytes.iter().any(|byte| byte & 0x80 != 0) {
+                        return NativeEncodeResult::Invalid;
+                    }
                     if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
                         return NativeEncodeResult::Unsupported;
                     }
@@ -2347,6 +2369,111 @@ fn encode_native_output<P: PluginExport>(
     }
 }
 
+fn encode_native_output_checked<P: PluginExport>(
+    event: LosslessEventRef<'_>,
+    list: &EventList,
+    carrier_mask: u32,
+    num_frames: u32,
+    host_protocol: u8,
+    max_absolute_offset: u32,
+    ump_time_valid: bool,
+) -> NativeEncodeResult {
+    let sample_offset = match event {
+        LosslessEventRef::Typed(event) => event.sample_offset,
+        LosslessEventRef::Exact(exact) => exact.sample_offset(),
+    };
+    if sample_offset > max_absolute_offset {
+        return NativeEncodeResult::Invalid;
+    }
+    match encode_native_output::<P>(event, list, carrier_mask, num_frames, host_protocol) {
+        NativeEncodeResult::Emitted(event)
+            if event.kind == AU_NATIVE_EVENT_UMP && !ump_time_valid =>
+        {
+            NativeEncodeResult::Invalid
+        }
+        status => status,
+    }
+}
+
+fn begin_output_events<P: PluginExport>(
+    inst: &AuInstance<P>,
+    audio: &mut AuAudio<P>,
+    carrier_mask: u32,
+    num_frames: u32,
+    ump_protocol: u32,
+    max_absolute_offset: u32,
+    ump_time_valid: u32,
+) {
+    audio.native_output_cursor = LosslessEventCursor::default();
+    audio.native_output_carriers = carrier_mask & (AU_NATIVE_CARRIER_BYTES | AU_NATIVE_CARRIER_UMP);
+    audio.native_output_num_frames = num_frames;
+    audio.native_output_ump_protocol = u8::try_from(ump_protocol).unwrap_or(0);
+    audio.native_output_max_absolute_offset = max_absolute_offset;
+    audio.native_output_ump_time_valid = ump_time_valid != 0;
+    if audio.output_events.overflow().is_some() {
+        audio.native_output_status = AU_OUTPUT_QUEUE_FULL;
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut param_count = 0usize;
+    let status = audio.output_events.lossless_iter().find_map(|event| {
+        if let LosslessEventRef::Typed(Event {
+            sample_offset,
+            body: EventBody::ParamChange { id, value },
+            ..
+        }) = event
+        {
+            if *sample_offset >= num_frames
+                || !value.is_finite()
+                || !inst.param_infos.iter().any(|info| info.id == *id)
+            {
+                return Some(AU_OUTPUT_INVALID);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if !f32::from_f64(*value).is_finite() {
+                    return Some(AU_OUTPUT_INVALID);
+                }
+                if inst.param_notify.is_none() {
+                    return Some(AU_OUTPUT_UNSUPPORTED);
+                }
+                param_count += 1;
+                return None;
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Some(AU_OUTPUT_UNSUPPORTED);
+        }
+        match encode_native_output_checked::<P>(
+            event,
+            &audio.output_events,
+            audio.native_output_carriers,
+            num_frames,
+            audio.native_output_ump_protocol,
+            max_absolute_offset,
+            audio.native_output_ump_time_valid,
+        ) {
+            NativeEncodeResult::Emitted(_) => None,
+            NativeEncodeResult::Unsupported => Some(AU_OUTPUT_UNSUPPORTED),
+            NativeEncodeResult::Invalid => Some(AU_OUTPUT_INVALID),
+        }
+    });
+    audio.native_output_status = status.unwrap_or(AU_OUTPUT_END);
+
+    #[cfg(target_os = "macos")]
+    if audio.native_output_status == AU_OUTPUT_END
+        && param_count > 0
+        && let Some(notifier) = &inst.param_notify
+        && notifier
+            .queue
+            .capacity()
+            .saturating_sub(notifier.queue.len())
+            < param_count
+    {
+        audio.native_output_status = AU_OUTPUT_QUEUE_FULL;
+    }
+}
+
 unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     carrier_mask: u32,
@@ -2356,32 +2483,38 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let mut audio = inst.audio.enter();
-        audio.native_output_cursor = LosslessEventCursor::default();
-        audio.native_output_carriers =
-            carrier_mask & (AU_NATIVE_CARRIER_BYTES | AU_NATIVE_CARRIER_UMP);
-        audio.native_output_num_frames = num_frames;
-        audio.native_output_ump_protocol = u8::try_from(ump_protocol).unwrap_or(0);
-        audio.native_output_status = if audio.output_events.overflow().is_some() {
-            AU_OUTPUT_QUEUE_FULL
-        } else {
-            audio
-                .output_events
-                .lossless_iter()
-                .find_map(|event| {
-                    match encode_native_output::<P>(
-                        event,
-                        &audio.output_events,
-                        audio.native_output_carriers,
-                        audio.native_output_num_frames,
-                        audio.native_output_ump_protocol,
-                    ) {
-                        NativeEncodeResult::Emitted(_) => None,
-                        NativeEncodeResult::Unsupported => Some(AU_OUTPUT_UNSUPPORTED),
-                        NativeEncodeResult::Invalid => Some(AU_OUTPUT_INVALID),
-                    }
-                })
-                .unwrap_or(AU_OUTPUT_END)
-        };
+        begin_output_events(
+            inst,
+            &mut audio,
+            carrier_mask,
+            num_frames,
+            ump_protocol,
+            u32::MAX,
+            1,
+        );
+    }
+}
+
+unsafe extern "C" fn cb_begin_output_events_v9<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    carrier_mask: u32,
+    num_frames: u32,
+    ump_protocol: u32,
+    max_absolute_offset: u32,
+    ump_time_valid: u32,
+) {
+    unsafe {
+        let inst = &*ctx.cast::<AuInstance<P>>();
+        let mut audio = inst.audio.enter();
+        begin_output_events(
+            inst,
+            &mut audio,
+            carrier_mask,
+            num_frames,
+            ump_protocol,
+            max_absolute_offset,
+            ump_time_valid,
+        );
     }
 }
 
@@ -2399,18 +2532,31 @@ unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
         if scr.native_output_status != AU_OUTPUT_END {
             return std::mem::replace(&mut scr.native_output_status, AU_OUTPUT_END);
         }
-        let Some(event) = scr
-            .output_events
-            .lossless_next(&mut scr.native_output_cursor)
-        else {
-            return AU_OUTPUT_END;
+        let event = loop {
+            let Some(event) = scr
+                .output_events
+                .lossless_next(&mut scr.native_output_cursor)
+            else {
+                return AU_OUTPUT_END;
+            };
+            if !matches!(
+                event,
+                LosslessEventRef::Typed(Event {
+                    body: EventBody::ParamChange { .. },
+                    ..
+                })
+            ) {
+                break event;
+            }
         };
-        match encode_native_output::<P>(
+        match encode_native_output_checked::<P>(
             event,
             &scr.output_events,
             scr.native_output_carriers,
             scr.native_output_num_frames,
             scr.native_output_ump_protocol,
+            scr.native_output_max_absolute_offset,
+            scr.native_output_ump_time_valid,
         ) {
             NativeEncodeResult::Emitted(event) => {
                 out.write(event);
@@ -2418,6 +2564,58 @@ unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
             }
             NativeEncodeResult::Unsupported => AU_OUTPUT_UNSUPPORTED,
             NativeEncodeResult::Invalid => AU_OUTPUT_INVALID,
+        }
+    }
+}
+
+unsafe extern "C" fn cb_commit_output_params<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
+    unsafe {
+        let inst = &*ctx.cast::<AuInstance<P>>();
+        let audio = inst.audio.enter();
+        if audio.output_events.overflow().is_some() {
+            return AU_OUTPUT_QUEUE_FULL;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut emitted = false;
+            for event in audio.output_events.lossless_iter() {
+                let LosslessEventRef::Typed(Event {
+                    body: EventBody::ParamChange { id, value },
+                    ..
+                }) = event
+                else {
+                    continue;
+                };
+                let Some(notifier) = &inst.param_notify else {
+                    return AU_OUTPUT_UNSUPPORTED;
+                };
+                if notifier.queue.push((*id, f32::from_f64(*value))).is_err() {
+                    return AU_OUTPUT_QUEUE_FULL;
+                }
+                emitted = true;
+            }
+            return if emitted {
+                AU_OUTPUT_EMITTED
+            } else {
+                AU_OUTPUT_END
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if audio.output_events.lossless_iter().any(|event| {
+                matches!(
+                    event,
+                    LosslessEventRef::Typed(Event {
+                        body: EventBody::ParamChange { .. },
+                        ..
+                    })
+                )
+            }) {
+                AU_OUTPUT_UNSUPPORTED
+            } else {
+                AU_OUTPUT_END
+            }
         }
     }
 }
@@ -3074,6 +3272,8 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         next_output_event: cb_next_output_event::<P>,
         push_sysex_input_native: cb_au_push_sysex_input_native::<P>,
         finish_output_events: cb_finish_output_events::<P>,
+        begin_output_events_v9: cb_begin_output_events_v9::<P>,
+        commit_output_params: cb_commit_output_params::<P>,
     }));
 
     let param_descs = param_descs.leak();

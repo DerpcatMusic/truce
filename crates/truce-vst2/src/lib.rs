@@ -141,6 +141,7 @@ struct Vst2Audio<P: PluginExport> {
     sysex_inputs_pending: bool,
     output_events: EventList,
     output_cursor: LosslessEventCursor,
+    output_param_cursor: LosslessEventCursor,
     output_num_frames: u32,
     output_preflight_status: u32,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
@@ -351,6 +352,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     sysex_inputs_pending: false,
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     output_cursor: LosslessEventCursor::default(),
+                    output_param_cursor: LosslessEventCursor::default(),
                     output_num_frames: 0,
                     output_preflight_status: VST2_OUTPUT_END,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
@@ -459,7 +461,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
     events: *const Vst2MidiEvent,
     num_events: u32,
     process_level: i32,
-) {
+) -> u32 {
     // SAFETY: forwarded - the shim's contract is the same.
     unsafe {
         process_block::<P, f32>(
@@ -472,7 +474,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             events,
             num_events,
             process_level,
-        );
+        )
     }
 }
 
@@ -490,7 +492,7 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
     events: *const Vst2MidiEvent,
     num_events: u32,
     process_level: i32,
-) {
+) -> u32 {
     // SAFETY: forwarded - the shim's contract is the same.
     unsafe {
         process_block::<P, f64>(
@@ -503,7 +505,7 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
             events,
             num_events,
             process_level,
-        );
+        )
     }
 }
 
@@ -523,7 +525,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
     events: *const Vst2MidiEvent,
     num_events: u32,
     process_level: i32,
-) {
+) -> u32 {
     let nf = num_frames as usize;
     let ok = run_audio_block::<P>("VST2", || unsafe {
         // Shared `&Vst2Instance` (never a whole-struct `&mut`) - the audio
@@ -545,6 +547,8 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             }
             audio.event_list.clear();
             audio.sysex_inputs_pending = false;
+            audio.output_events.clear();
+            audio.output_events.clear_overflow();
             return;
         }
 
@@ -656,8 +660,6 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
         // No-op for `f32` plugins.
         scr.scratch
             .finish_widening(outputs, num_output_channels, len_u32(num_frames));
-        notify_process_param_changes(inst, &scr.output_events);
-
         // Refresh latency / tail caches so the host's main-thread
         // queries don't have to touch the plugin.
         inst.latency_cache
@@ -674,6 +676,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             }
         }
     }
+    u32::from(ok)
 }
 
 /// Test-only smoke helper for the `rt-paranoid` CI gate: drives a few
@@ -731,30 +734,6 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
         );
         cb_destroy::<P>(ctx);
         count
-    }
-}
-
-fn notify_process_param_changes<P: PluginExport>(
-    inst: &Vst2Instance<P>,
-    output_events: &EventList,
-) {
-    let aeffect_ptr = inst.aeffect_ptr();
-    if aeffect_ptr.is_null() {
-        return;
-    }
-
-    for event in output_events.iter() {
-        let EventBody::ParamChange { id, value } = event.body else {
-            continue;
-        };
-        let Some(info) = inst.param_infos.iter().find(|info| info.id == id) else {
-            continue;
-        };
-
-        let normalized = f32::from_f64(info.range.normalize(value));
-        unsafe {
-            truce_vst2_host_automate(aeffect_ptr, id, normalized);
-        }
     }
 }
 
@@ -913,12 +892,14 @@ fn is_vst2_param_change(event: LosslessEventRef<'_>) -> bool {
 unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     num_frames: u32,
+    host_available: u32,
 ) {
     unsafe {
         let inst = &*ctx.cast::<Vst2Instance<P>>();
         let mut audio = inst.audio.enter();
         audio.output_events.ensure_sorted_by_offset();
         audio.output_cursor = LosslessEventCursor::default();
+        audio.output_param_cursor = LosslessEventCursor::default();
         audio.output_num_frames = num_frames;
         audio.output_preflight_status = if audio.output_events.overflow().is_some() {
             VST2_OUTPUT_QUEUE_FULL
@@ -926,14 +907,35 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
             audio
                 .output_events
                 .lossless_iter()
-                .filter(|event| !is_vst2_param_change(*event))
                 .find_map(|event| {
+                    if let LosslessEventRef::Typed(Event {
+                        sample_offset,
+                        body: EventBody::ParamChange { id, value },
+                        ..
+                    }) = event
+                    {
+                        let Some(info) = inst.param_infos.iter().find(|info| info.id == *id) else {
+                            return Some(VST2_OUTPUT_INVALID);
+                        };
+                        let normalized = info.range.normalize(*value);
+                        if *sample_offset >= num_frames
+                            || !value.is_finite()
+                            || !normalized.is_finite()
+                            || !f32::from_f64(normalized).is_finite()
+                        {
+                            return Some(VST2_OUTPUT_INVALID);
+                        }
+                        return (host_available == 0).then_some(VST2_OUTPUT_UNSUPPORTED);
+                    }
                     match encode_vst2_output(
                         event,
                         &audio.output_events,
                         P::info().midi_output_ports,
                         num_frames,
                     ) {
+                        Vst2EncodeResult::Emitted(_) if host_available == 0 => {
+                            Some(VST2_OUTPUT_UNSUPPORTED)
+                        }
                         Vst2EncodeResult::Emitted(_) => None,
                         Vst2EncodeResult::Unsupported => Some(VST2_OUTPUT_UNSUPPORTED),
                         Vst2EncodeResult::Invalid => Some(VST2_OUTPUT_INVALID),
@@ -941,6 +943,42 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
                 })
                 .unwrap_or(VST2_OUTPUT_END)
         };
+    }
+}
+
+unsafe extern "C" fn cb_next_output_param<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    out_id: *mut u32,
+    out_normalized: *mut f32,
+) -> u32 {
+    unsafe {
+        if out_id.is_null() || out_normalized.is_null() {
+            return VST2_OUTPUT_INVALID;
+        }
+        let inst = &*ctx.cast::<Vst2Instance<P>>();
+        let mut audio = inst.audio.enter();
+        let scr = &mut *audio;
+        loop {
+            let Some(event) = scr
+                .output_events
+                .lossless_next(&mut scr.output_param_cursor)
+            else {
+                return VST2_OUTPUT_END;
+            };
+            let LosslessEventRef::Typed(Event {
+                body: EventBody::ParamChange { id, value },
+                ..
+            }) = event
+            else {
+                continue;
+            };
+            let Some(info) = inst.param_infos.iter().find(|info| info.id == *id) else {
+                return VST2_OUTPUT_INVALID;
+            };
+            out_id.write(*id);
+            out_normalized.write(f32::from_f64(info.range.normalize(*value)));
+            return VST2_OUTPUT_EMITTED;
+        }
     }
 }
 
@@ -1543,6 +1581,7 @@ fn register_vst2_inner<P: PluginExport>(layout: &BusLayout) {
         param_parse: cb_param_parse::<P>,
         begin_output_events: cb_begin_output_events::<P>,
         next_output_event: cb_next_output_event::<P>,
+        next_output_param: cb_next_output_param::<P>,
         finish_output_events: cb_finish_output_events::<P>,
         push_sysex_input: cb_push_sysex_input::<P>,
         state_save: cb_state_save::<P>,

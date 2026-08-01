@@ -93,7 +93,7 @@ pub struct Vst2Callbacks {
         events: *const Vst2MidiEvent,
         num_events: u32,
         process_level: i32,
-    ),
+    ) -> u32,
     /// 64-bit twin of `process`, called from
     /// `AEffect::processDoubleReplacing` (only wired when
     /// `Vst2PluginDescriptor::supports_f64` is set).
@@ -107,7 +107,7 @@ pub struct Vst2Callbacks {
         events: *const Vst2MidiEvent,
         num_events: u32,
         process_level: i32,
-    ),
+    ) -> u32,
     pub param_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
     /// VST2 hosts work in normalized `[0, 1]` space. The Rust side
     /// is responsible for routing through `ParamRange::denormalize`
@@ -126,9 +126,13 @@ pub struct Vst2Callbacks {
     /// plain<->normalized callback for the shim to bridge).
     pub param_parse: unsafe extern "C" fn(ctx: *mut c_void, id: u32, text: *const c_char) -> i32,
     /// Preflight the complete ordered output lane and reset its cursor.
-    pub begin_output_events: unsafe extern "C" fn(ctx: *mut c_void, num_frames: u32),
+    pub begin_output_events:
+        unsafe extern "C" fn(ctx: *mut c_void, num_frames: u32, host_available: u32),
     /// Return the next native MIDI 1.0 or `SysEx` event without filtering holes.
     pub next_output_event: unsafe extern "C" fn(ctx: *mut c_void, out: *mut Vst2OutputEvent) -> u32,
+    /// Return the next preflighted process-emitted parameter change.
+    pub next_output_param:
+        unsafe extern "C" fn(ctx: *mut c_void, out_id: *mut u32, out_normalized: *mut f32) -> u32,
     /// Publish the completed host-delivery result for the next process block.
     pub finish_output_events: unsafe extern "C" fn(ctx: *mut c_void, status: u32),
     /// `SysEx` input - shim calls once per `kVstSysExType` event in

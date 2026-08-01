@@ -525,6 +525,9 @@ class TruceAUAudioUnit: AUAudioUnit {
             return kAudio_ParamError
         }
         let bufStart = Int64(sampleTime)
+        let maxAbsoluteOffset: UInt32 = bufStart < 0
+            ? UInt32.max
+            : UInt32(clamping: Int64.max - bufStart)
         var ev = events
         while let event = ev {
             let head = event.pointee.head
@@ -717,11 +720,12 @@ class TruceAUAudioUnit: AUAudioUnit {
             }
         }
 
-        guard truceAbiTailVersion(cb) >= 8,
+        guard truceAbiTailVersion(cb) >= 9,
               let processNative = cb.pointee.process_native,
-              let beginOutput = cb.pointee.begin_output_events,
+              let beginOutput = cb.pointee.begin_output_events_v9,
               let nextOutput = cb.pointee.next_output_event,
-              let finishOutput = cb.pointee.finish_output_events else {
+              let finishOutput = cb.pointee.finish_output_events,
+              let commitOutputParams = cb.pointee.commit_output_params else {
             return kAudio_ParamError
         }
         if nativeOverflow != 0 || paramOverflow != 0 {
@@ -744,7 +748,8 @@ class TruceAUAudioUnit: AUAudioUnit {
         if #available(macOS 12.0, iOS 15.0, *), midiOutputListBlock != nil {
             carrierMask |= UInt32(AU_NATIVE_CARRIER_UMP)
         }
-        beginOutput(ctx, carrierMask, frameCount, midiOutputProtocol)
+        beginOutput(ctx, carrierMask, frameCount, midiOutputProtocol,
+                    maxAbsoluteOffset, 1)
         while true {
             var out = AuNativeEvent()
             let result = nextOutput(ctx, &out)
@@ -858,6 +863,24 @@ class TruceAUAudioUnit: AUAudioUnit {
                 outputStatus = UInt32(AU_OUTPUT_UNSUPPORTED)
                 return kAudio_ParamError
             }
+        }
+        let paramResult = commitOutputParams(ctx)
+        if paramResult == UInt32(AU_OUTPUT_UNSUPPORTED) {
+            outputStatus = UInt32(AU_OUTPUT_UNSUPPORTED)
+            return kAudioUnitErr_FormatNotSupported
+        }
+        if paramResult == UInt32(AU_OUTPUT_INVALID) {
+            outputStatus = UInt32(AU_OUTPUT_INVALID)
+            return kAudio_ParamError
+        }
+        if paramResult == UInt32(AU_OUTPUT_QUEUE_FULL) {
+            outputStatus = UInt32(AU_OUTPUT_QUEUE_FULL)
+            return kAudioUnitErr_MIDIOutputBufferFull
+        }
+        guard paramResult == UInt32(AU_OUTPUT_END)
+                || paramResult == UInt32(AU_OUTPUT_EMITTED) else {
+            outputStatus = UInt32(AU_OUTPUT_INVALID)
+            return kAudio_ParamError
         }
         return noErr
     }

@@ -173,7 +173,7 @@ pub struct Vst3Callbacks {
         num_param_changes: u32,
         // VST3 `ProcessData::processMode` for this block.
         process_mode: i32,
-    ),
+    ) -> u32,
     /// 64-bit twin of `process`. The shim calls exactly one of the
     /// two per block, chosen by the sample size the host negotiated
     /// in `setupProcessing` (only offered when
@@ -189,7 +189,7 @@ pub struct Vst3Callbacks {
         param_changes: *const Vst3ParamChange,
         num_param_changes: u32,
         process_mode: i32,
-    ),
+    ) -> u32,
     pub param_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
     pub param_get_value: unsafe extern "C" fn(ctx: *mut c_void, id: u32) -> f64,
     pub param_set_value: unsafe extern "C" fn(ctx: *mut c_void, id: u32, value: f64),

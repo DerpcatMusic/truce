@@ -59,7 +59,95 @@ use truce_core::export::PluginExport;
 use truce_core::info::PluginCategory;
 use truce_core::plugin::PluginRuntime;
 use truce_core::state::restore_plugin;
-use truce_params::Params;
+use truce_core::ump::{decode_ump_channel_voice_2, encode_ump_channel_voice_2};
+use truce_params::{ParamInfo, Params};
+
+fn driver_output_body_valid(body: &EventBody, list: &EventList, params: &[ParamInfo]) -> bool {
+    match *body {
+        EventBody::NoteOn {
+            group,
+            channel,
+            note,
+            velocity,
+        }
+        | EventBody::NoteOff {
+            group,
+            channel,
+            note,
+            velocity,
+        } => group < 16 && channel < 16 && note < 128 && velocity < 128,
+        EventBody::Aftertouch {
+            group,
+            channel,
+            note,
+            pressure,
+        } => group < 16 && channel < 16 && note < 128 && pressure < 128,
+        EventBody::ControlChange {
+            group,
+            channel,
+            cc,
+            value,
+        } => group < 16 && channel < 16 && cc < 128 && value < 128,
+        EventBody::ChannelPressure {
+            group,
+            channel,
+            pressure,
+        } => group < 16 && channel < 16 && pressure < 128,
+        EventBody::PitchBend {
+            group,
+            channel,
+            value,
+        } => group < 16 && channel < 16 && value < 16_384,
+        EventBody::ProgramChange {
+            group,
+            channel,
+            program,
+        } => group < 16 && channel < 16 && program < 128,
+        EventBody::ParamChange { id, value } => {
+            value.is_finite() && params.iter().any(|info| info.id == id)
+        }
+        EventBody::ParamMod { id, value, .. } => {
+            value.is_finite() && params.iter().any(|info| info.id == id)
+        }
+        EventBody::Transport(transport) => {
+            transport.tempo.is_finite()
+                && transport.position_seconds.is_finite()
+                && transport.position_beats.is_finite()
+                && transport.bar_start_beats.is_finite()
+                && transport.loop_start_beats.is_finite()
+                && transport.loop_end_beats.is_finite()
+        }
+        EventBody::SysEx { .. } => list
+            .sysex_bytes_checked(body)
+            .is_some_and(|bytes| bytes.iter().all(|byte| byte & 0x80 == 0)),
+        _ => encode_ump_channel_voice_2(body)
+            .is_some_and(|words| decode_ump_channel_voice_2(words).as_ref() == Some(body)),
+    }
+}
+
+fn preflight_driver_output(
+    events: &EventList,
+    params: &[ParamInfo],
+    midi_output_ports: u8,
+    num_frames: u32,
+) -> OutputEventStatus {
+    if events.exact_len() != 0 {
+        return OutputEventStatus::Unsupported;
+    }
+    for event in events.iter() {
+        let needs_midi_port = !matches!(
+            event.body,
+            EventBody::ParamChange { .. } | EventBody::ParamMod { .. } | EventBody::Transport(_)
+        );
+        if event.sample_offset >= num_frames
+            || (needs_midi_port && event.port >= midi_output_ports)
+            || !driver_output_body_valid(&event.body, events, params)
+        {
+            return OutputEventStatus::Invalid;
+        }
+    }
+    OutputEventStatus::Success
+}
 
 /// Sidechain (non-main) input width for the declared layout whose main
 /// input width equals `main_channels`. Reading this from the layout the
@@ -918,7 +1006,9 @@ impl<P: PluginExport> PluginDriver<P> {
         let mut sub_event_scratch = EventList::with_capacity(scripted_event_capacity);
         let param_infos = plugin.params().param_infos();
         let params_arc = plugin.params_arc();
-        let min_subblock_samples = P::info().automation.min_subblock_samples;
+        let plugin_info = P::info();
+        let min_subblock_samples = plugin_info.automation.min_subblock_samples;
+        let midi_output_ports = plugin_info.midi_output_ports;
 
         // Routes the offline-render loop through the same
         // `RawBufferScratch::build` helper every format wrapper uses,
@@ -1077,10 +1167,15 @@ impl<P: PluginExport> PluginDriver<P> {
             // silently mis-attributed to early frames.
             let output_status = output_events_block.overflow().map_or_else(
                 || {
-                    if output_events_block.is_empty()
-                        || (self.capture.output_events && output_events_block.exact_len() == 0)
-                    {
+                    if output_events_block.is_empty() {
                         OutputEventStatus::Success
+                    } else if self.capture.output_events {
+                        preflight_driver_output(
+                            &output_events_block,
+                            &param_infos,
+                            midi_output_ports,
+                            block_u32,
+                        )
                     } else {
                         OutputEventStatus::Unsupported
                     }
@@ -1096,9 +1191,10 @@ impl<P: PluginExport> PluginDriver<P> {
                     // Resolve SysEx payloads now, while the block's pool
                     // is still populated (the captured `Event` only
                     // carries pool indices into a list we don't keep).
-                    if matches!(ev.body, EventBody::SysEx { .. }) {
-                        output_sysex_capture
-                            .push(output_events_block.sysex_bytes(&ev.body).to_vec());
+                    if matches!(ev.body, EventBody::SysEx { .. })
+                        && let Some(bytes) = output_events_block.sysex_bytes_checked(&ev.body)
+                    {
+                        output_sysex_capture.push(bytes.to_vec());
                     }
                 }
             }

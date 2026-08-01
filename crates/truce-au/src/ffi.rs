@@ -107,8 +107,9 @@ pub struct AuParamDescriptor {
 /// appended `set_render_mode`. v5: appended `param_parse_value`. v6:
 /// appended the strict native event process and sequential output lane. v7:
 /// native process returns status and output negotiation carries the host's
-/// UMP protocol. v8 appends final output-delivery status publication.
-pub const TRUCE_AU_ABI_VERSION: u32 = 0x5441_7508;
+/// UMP protocol. v8 appends final output-delivery status publication. v9
+/// appends wrapper-time preflight and transactional parameter feedback.
+pub const TRUCE_AU_ABI_VERSION: u32 = 0x5441_7509;
 
 /// Callbacks from the `ObjC` shim into Rust.
 #[repr(C)]
@@ -332,6 +333,15 @@ pub struct AuCallbacks {
         len: u32,
     ) -> u32,
     pub finish_output_events: unsafe extern "C" fn(ctx: *mut c_void, status: u32),
+    pub begin_output_events_v9: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        carrier_mask: u32,
+        num_frames: u32,
+        ump_protocol: u32,
+        max_absolute_offset: u32,
+        ump_time_valid: u32,
+    ),
+    pub commit_output_params: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
 }
 
 /// A MIDI event passed across the Rust ↔ `ObjC` boundary in both

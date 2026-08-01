@@ -1921,13 +1921,20 @@ static OSStatus au_v2_render(void *self_,
      * Apple AU boundary owns any host-protocol conversion. */
     OSStatus midiOutputStatus = noErr;
     bool hostRefusedOutput = false;
+    const bool umpTimeValid =
+        (inTimeStamp->mFlags & kAudioTimeStampSampleTimeValid) &&
+        isfinite(inTimeStamp->mSampleTime) &&
+        inTimeStamp->mSampleTime >= (double)INT64_MIN &&
+        inTimeStamp->mSampleTime < (double)INT64_MAX &&
+        trunc(inTimeStamp->mSampleTime) == inTimeStamp->mSampleTime;
     if (inst->midiOutputCallback || inst->midiOutputEventListBlock) {
         uint32_t carriers = 0;
         if (inst->midiOutputCallback) carriers |= AU_NATIVE_CARRIER_BYTES;
         if (inst->midiOutputEventListBlock) carriers |= AU_NATIVE_CARRIER_UMP;
-        g_callbacks->begin_output_events(inst->rustCtx,
-                                         carriers, inFrameCount,
-                                         (uint32_t)inst->hostMIDIProtocol);
+        g_callbacks->begin_output_events_v9(
+            inst->rustCtx, carriers, inFrameCount,
+            (uint32_t)inst->hostMIDIProtocol, UINT32_MAX,
+            umpTimeValid ? 1u : 0u);
         for (;;) {
             AuNativeEvent ev = {0};
             uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
@@ -1954,11 +1961,7 @@ static OSStatus au_v2_render(void *self_,
                      inst->hostMIDIProtocol != kMIDIProtocol_2_0) ||
                     ev.data_len != au_ump_word_count(ev.words[0]) ||
                     !au_ump_protocol_accepts((MIDIProtocolID)ev.protocol, messageType) ||
-                    !(inTimeStamp->mFlags & kAudioTimeStampSampleTimeValid) ||
-                    !isfinite(inTimeStamp->mSampleTime) ||
-                    inTimeStamp->mSampleTime < (double)INT64_MIN ||
-                    inTimeStamp->mSampleTime >= (double)INT64_MAX ||
-                    trunc(inTimeStamp->mSampleTime) != inTimeStamp->mSampleTime) {
+                    !umpTimeValid) {
                     midiOutputStatus = kAudioUnitErr_InvalidParameter;
                     break;
                 }
@@ -2024,14 +2027,26 @@ static OSStatus au_v2_render(void *self_,
     } else {
         /* Probe the Rust lane so a plugin that emitted events without a host
          * receiver observes queue unavailability on its next block. */
-        g_callbacks->begin_output_events(inst->rustCtx, 0, inFrameCount,
-                                         (uint32_t)inst->hostMIDIProtocol);
+        g_callbacks->begin_output_events_v9(
+            inst->rustCtx, 0, inFrameCount,
+            (uint32_t)inst->hostMIDIProtocol, UINT32_MAX,
+            umpTimeValid ? 1u : 0u);
         AuNativeEvent ev = {0};
         uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
         if (status == AU_OUTPUT_INVALID)
             midiOutputStatus = kAudioUnitErr_InvalidParameter;
         else if (status != AU_OUTPUT_END)
             midiOutputStatus = kAudioUnitErr_FormatNotSupported;
+    }
+
+    if (midiOutputStatus == noErr) {
+        uint32_t paramStatus = g_callbacks->commit_output_params(inst->rustCtx);
+        if (paramStatus == AU_OUTPUT_QUEUE_FULL)
+            midiOutputStatus = kAudioUnitErr_MIDIOutputBufferFull;
+        else if (paramStatus == AU_OUTPUT_UNSUPPORTED)
+            midiOutputStatus = kAudioUnitErr_FormatNotSupported;
+        else if (paramStatus != AU_OUTPUT_END && paramStatus != AU_OUTPUT_EMITTED)
+            midiOutputStatus = kAudioUnitErr_InvalidParameter;
     }
 
     if (g_callbacks->finish_output_events) {

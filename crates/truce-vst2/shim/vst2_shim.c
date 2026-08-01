@@ -77,6 +77,8 @@ typedef struct {
     VstMidiEvent midi_out[TRUCE_VST2_MAX_OUTPUT_EVENTS];
     VstMidiSysExEvent sysex_out[TRUCE_VST2_MAX_OUTPUT_EVENTS];
     TruceVst2OutputEvents output_events;
+    int32_t output_param_indices[TRUCE_VST2_MAX_OUTPUT_EVENTS];
+    float output_param_values[TRUCE_VST2_MAX_OUTPUT_EVENTS];
     /* Scratch for SysEx output: every `EventBody::SysEx` the plugin
      * emits gets framed (0xF0 + inner + 0xF7) into this buffer
      * before the `VstMidiSysExEvent::sysexDump` pointer is handed
@@ -611,8 +613,9 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
         processLevel = (int32_t)inst->master(
             e, audioMasterGetCurrentProcessLevel, 0, 0, NULL, 0.0f);
 
+    uint32_t process_ok = 0;
     if (use64)
-        g_vst2_callbacks->process_f64(
+        process_ok = g_vst2_callbacks->process_f64(
             inst->rust_ctx,
             (const double**)inputs, (double**)outputs,
             numIn, numOut,
@@ -620,7 +623,7 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
             inst->midi_buf, inst->midi_count,
             processLevel);
     else
-        g_vst2_callbacks->process(
+        process_ok = g_vst2_callbacks->process(
             inst->rust_ctx,
             (const float**)inputs, (float**)outputs,
             numIn, numOut,
@@ -629,6 +632,13 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
             processLevel);
 
     inst->midi_count = 0;
+
+    if (!process_ok) {
+        if (g_vst2_callbacks->finish_output_events)
+            g_vst2_callbacks->finish_output_events(
+                inst->rust_ctx, TRUCE_VST2_OUTPUT_INVALID);
+        return;
+    }
 
     /* Best-effort dynamic latency: the Rust process above refreshed the
      * plugin's latency cache, so re-read it and, on a change, update
@@ -653,10 +663,12 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
         uint32_t emitted = 0;
         uint32_t midi_used = 0;
         uint32_t sysex_used = 0;
+        uint32_t param_used = 0;
         inst->sysex_out_used = 0;
         inst->output_events.reserved = 0;
-        g_vst2_callbacks->begin_output_events(inst->rust_ctx,
-                                               (uint32_t)sampleFrames);
+        g_vst2_callbacks->begin_output_events(
+            inst->rust_ctx, (uint32_t)sampleFrames,
+            inst->master && g_vst2_callbacks->next_output_param ? 1u : 0u);
 
         for (;;) {
             Vst2OutputEvent out = {0};
@@ -724,19 +736,56 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
             break;
         }
 
-        if (status == TRUCE_VST2_OUTPUT_END && emitted > 0) {
-            if (!inst->master) {
-                status = TRUCE_VST2_OUTPUT_UNSUPPORTED;
-            } else {
-                inst->output_events.numEvents = (int32_t)emitted;
-                /* VST2 hosts disagree on the return value: some return zero
-                 * after consuming the complete batch. The callback has no
-                 * reliable queue-rejection signal, so a completed invocation
-                 * is the strongest truthful success boundary available. */
-                inst->master(e, audioMasterProcessEvents, 0, 0,
-                             &inst->output_events, 0.0f);
-                status = TRUCE_VST2_OUTPUT_EMITTED;
+        /* Stage and validate every parameter descriptor before the first host
+         * callback. Rust already validated timestamps, values, and IDs against
+         * the plugin table; this pass proves the C descriptor mapping too. */
+        if (status == TRUCE_VST2_OUTPUT_END
+                && g_vst2_callbacks->next_output_param) {
+            for (;;) {
+                uint32_t param_id = 0;
+                float normalized = 0.0f;
+                uint32_t next = g_vst2_callbacks->next_output_param(
+                    inst->rust_ctx, &param_id, &normalized);
+                if (next == TRUCE_VST2_OUTPUT_END)
+                    break;
+                if (next != TRUCE_VST2_OUTPUT_EMITTED
+                        || param_used >= TRUCE_VST2_MAX_OUTPUT_EVENTS) {
+                    status = next == TRUCE_VST2_OUTPUT_EMITTED
+                        ? TRUCE_VST2_OUTPUT_QUEUE_FULL : next;
+                    break;
+                }
+                uint32_t i = 0;
+                while (i < g_vst2_num_params && g_vst2_params[i].id != param_id)
+                    i++;
+                if (i == g_vst2_num_params) {
+                    status = TRUCE_VST2_OUTPUT_INVALID;
+                    break;
+                }
+                inst->output_param_indices[param_used] = (int32_t)i;
+                inst->output_param_values[param_used] = normalized;
+                param_used++;
             }
+        }
+
+        if (status == TRUCE_VST2_OUTPUT_END && param_used > 0) {
+            for (uint32_t i = 0; i < param_used; i++) {
+                inst->master(e, audioMasterAutomate,
+                             inst->output_param_indices[i], 0, NULL,
+                             inst->output_param_values[i]);
+            }
+            status = TRUCE_VST2_OUTPUT_EMITTED;
+        }
+
+        if ((status == TRUCE_VST2_OUTPUT_END
+                || status == TRUCE_VST2_OUTPUT_EMITTED) && emitted > 0) {
+            inst->output_events.numEvents = (int32_t)emitted;
+            /* VST2 hosts disagree on the return value: some return zero
+             * after consuming the complete batch. The callback has no
+             * reliable queue-rejection signal, so a completed invocation
+             * is the strongest truthful success boundary available. */
+            inst->master(e, audioMasterProcessEvents, 0, 0,
+                         &inst->output_events, 0.0f);
+            status = TRUCE_VST2_OUTPUT_EMITTED;
         }
         g_vst2_callbacks->finish_output_events(inst->rust_ctx, status);
     }

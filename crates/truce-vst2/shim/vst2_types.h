@@ -333,7 +333,7 @@ typedef struct {
     void  (*reset)(void* ctx, double sample_rate, uint32_t max_frames);
     /* `process_level` is the host's audioMasterGetCurrentProcessLevel
      * (kVstProcessLevelRealtime 2 / Prefetch 3 / Offline 4). */
-    void  (*process)(void* ctx,
+    uint32_t (*process)(void* ctx,
                      const float** inputs, float** outputs,
                      uint32_t num_input_channels, uint32_t num_output_channels,
                      uint32_t num_frames,
@@ -341,7 +341,7 @@ typedef struct {
                      int32_t process_level);
     /* 64-bit twin of process, called from processDoubleReplacing
      * (only wired when the descriptor sets supports_f64). */
-    void  (*process_f64)(void* ctx,
+    uint32_t (*process_f64)(void* ctx,
                          const double** inputs, double** outputs,
                          uint32_t num_input_channels, uint32_t num_output_channels,
                          uint32_t num_frames,
@@ -362,8 +362,11 @@ typedef struct {
     int32_t (*param_parse)(void* ctx, uint32_t id, const char* text);
     /* Plugin → host MIDI output. Rust preflights one globally ordered,
      * lossless lane; the shim reports the host's final acceptance result. */
-    void (*begin_output_events)(void* ctx, uint32_t num_frames);
+    void (*begin_output_events)(void* ctx, uint32_t num_frames,
+                                uint32_t host_available);
     uint32_t (*next_output_event)(void* ctx, Vst2OutputEvent* out);
+    uint32_t (*next_output_param)(void* ctx, uint32_t* out_id,
+                                  float* out_normalized);
     void (*finish_output_events)(void* ctx, uint32_t status);
     /* SysEx input - shim calls once per kVstSysExType event in
      * effProcessEvents, AFTER the shim has stripped any leading

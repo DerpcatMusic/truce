@@ -587,7 +587,13 @@ void TruceAAX_Parameters::RenderAudio(
         (uint32_t)bufferSize,
         mNativeEvents.data(), (uint32_t)mNativeEvents.size(), inputStatus,
         transport.valid ? &transport : nullptr);
-    if (processStatus != TRUCE_AAX_EVENT_END) return;
+    if (processStatus != TRUCE_AAX_EVENT_END) {
+        // DSP may still have produced output before the input transaction
+        // failed. Close this block's output lifecycle without publishing it;
+        // Rust preserves a more authoritative staging overflow if present.
+        g_bridge.finish_output_events(mRustCtx, TRUCE_AAX_EVENT_INVALID);
+        return;
+    }
 
     // Drain plugin-emitted MIDI to the host. The component descriptor
     // built in `TruceAAX_Describe.cpp` registered an extra `LocalOutput`

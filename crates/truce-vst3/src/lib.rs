@@ -1107,7 +1107,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
     param_changes: *const ffi::Vst3ParamChange,
     num_param_changes: u32,
     process_mode: i32,
-) {
+) -> u32 {
     // SAFETY: forwarded - the shim's contract is the same.
     unsafe {
         process_block::<P, f32>(
@@ -1121,7 +1121,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             param_changes,
             num_param_changes,
             process_mode,
-        );
+        )
     }
 }
 
@@ -1140,7 +1140,7 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
     param_changes: *const ffi::Vst3ParamChange,
     num_param_changes: u32,
     process_mode: i32,
-) {
+) -> u32 {
     // SAFETY: forwarded - the shim's contract is the same.
     unsafe {
         process_block::<P, f64>(
@@ -1154,7 +1154,7 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
             param_changes,
             num_param_changes,
             process_mode,
-        );
+        )
     }
 }
 
@@ -1175,7 +1175,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
     param_changes: *const ffi::Vst3ParamChange,
     num_param_changes: u32,
     process_mode: i32,
-) {
+) -> u32 {
     let nf = num_frames as usize;
     let ok = run_audio_block::<P>("VST3", || unsafe {
         // Shared `&Vst3Instance` (never a whole-struct `&mut`) - the audio
@@ -1197,6 +1197,8 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
                 }
             }
             audio.event_list.clear();
+            audio.output_events.clear();
+            audio.output_events.clear_overflow();
             return;
         }
 
@@ -1400,6 +1402,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             }
         }
     }
+    u32::from(ok)
 }
 
 /// Test-only smoke helper for the `rt-paranoid` CI gate: drives a few
