@@ -1916,8 +1916,9 @@ static OSStatus au_v2_render(void *self_,
     if (processStatus != AU_PROCESS_OK)
         return kAudioUnitErr_InvalidParameter;
 
-    /* Drain the single sorted native lane. AU v2 accepts byte MIDI and
-     * SysEx only; UMP stays unsupported rather than being converted. */
+    /* Drain the single sorted native lane. The legacy callback carries byte
+     * MIDI/SysEx; the event-list block carries source UMP unchanged and the
+     * Apple AU boundary owns any host-protocol conversion. */
     OSStatus midiOutputStatus = noErr;
     if (inst->midiOutputCallback || inst->midiOutputEventListBlock) {
         uint32_t carriers = 0;
@@ -1948,7 +1949,8 @@ static OSStatus au_v2_render(void *self_,
                 if (!inst->midiOutputEventListBlock ||
                     (ev.protocol != kMIDIProtocol_1_0 &&
                      ev.protocol != kMIDIProtocol_2_0) ||
-                    ev.protocol != inst->hostMIDIProtocol ||
+                    (inst->hostMIDIProtocol != kMIDIProtocol_1_0 &&
+                     inst->hostMIDIProtocol != kMIDIProtocol_2_0) ||
                     ev.data_len != au_ump_word_count(ev.words[0]) ||
                     !au_ump_protocol_accepts((MIDIProtocolID)ev.protocol, messageType) ||
                     !(inTimeStamp->mFlags & kAudioTimeStampSampleTimeValid) ||

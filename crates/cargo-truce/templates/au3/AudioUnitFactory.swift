@@ -785,6 +785,8 @@ class TruceAUAudioUnit: AUAudioUnit {
                       let listBlock = midiOutputListBlock as? AUMIDIEventListBlock else {
                     return kAudioUnitErr_FormatNotSupported
                 }
+                // Preserve the source list protocol. Apple's AU boundary
+                // converts translatable messages to hostMIDIProtocol.
                 let protocolID: MIDIProtocolID
                 if out.protocol == 1 {
                     protocolID = ._1_0
@@ -798,7 +800,7 @@ class TruceAUAudioUnit: AUAudioUnit {
                 }
                 let messageType = UInt8((out.words.0 >> 28) & 0xF)
                 guard Int(out.data_len) == umpPacketLength(messageType: messageType),
-                      UInt32(out.protocol) == midiOutputProtocol,
+                      midiOutputProtocol == 1 || midiOutputProtocol == 2,
                       umpProtocolAccepts(out.protocol, messageType) else {
                     return kAudio_ParamError
                 }

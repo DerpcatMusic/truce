@@ -2151,9 +2151,16 @@ fn output_port<P: PluginExport>(port: u16) -> Option<u16> {
     (port < u16::from(P::info().midi_output_ports)).then_some(port)
 }
 
-fn raw_ump_protocol(
+fn default_protocol<P: PluginExport>() -> u8 {
+    if P::info().midi_output_dialect == MidiDialect::Midi2 {
+        2
+    } else {
+        1
+    }
+}
+
+fn raw_ump_protocol<P: PluginExport>(
     exact: truce_core::ExactEventRef<'_>,
-    negotiated_protocol: u8,
 ) -> Result<u8, NativeEncodeResult> {
     let ExactEventBody::Ump { packet, .. } = exact.body() else {
         return Err(NativeEncodeResult::Invalid);
@@ -2167,14 +2174,24 @@ fn raw_ump_protocol(
         ExactEventMetadata::None => match message_type {
             0x2 => 1,
             0x4 => 2,
-            _ => negotiated_protocol,
+            _ => default_protocol::<P>(),
         },
         _ => return Err(NativeEncodeResult::Unsupported),
     };
-    if !ump_protocol_accepts(protocol, message_type) || protocol != negotiated_protocol {
+    if !ump_protocol_accepts(protocol, message_type) {
         return Err(NativeEncodeResult::Invalid);
     }
     Ok(protocol)
+}
+
+fn require_ump_carrier(carrier_mask: u32, host_protocol: u8) -> Result<(), NativeEncodeResult> {
+    if carrier_mask & AU_NATIVE_CARRIER_UMP == 0 {
+        Err(NativeEncodeResult::Unsupported)
+    } else if matches!(host_protocol, 1 | 2) {
+        Ok(())
+    } else {
+        Err(NativeEncodeResult::Invalid)
+    }
 }
 
 fn encode_native_output<P: PluginExport>(
@@ -2182,7 +2199,7 @@ fn encode_native_output<P: PluginExport>(
     list: &EventList,
     carrier_mask: u32,
     num_frames: u32,
-    ump_protocol: u8,
+    host_protocol: u8,
 ) -> NativeEncodeResult {
     let sample_offset = match event {
         LosslessEventRef::Typed(event) => event.sample_offset,
@@ -2208,21 +2225,21 @@ fn encode_native_output<P: PluginExport>(
                         ..AuNativeEvent::default()
                     });
                 }
-                if carrier_mask & AU_NATIVE_CARRIER_UMP != 0 && ump_protocol == 1 {
-                    let Some(words) = encode_ump_channel_voice_1(&event.body) else {
-                        return NativeEncodeResult::Invalid;
-                    };
-                    return NativeEncodeResult::Emitted(AuNativeEvent {
-                        sample_offset,
-                        port,
-                        kind: AU_NATIVE_EVENT_UMP,
-                        protocol: 1,
-                        data_len: 1,
-                        words,
-                        ..AuNativeEvent::default()
-                    });
+                if let Err(status) = require_ump_carrier(carrier_mask, host_protocol) {
+                    return status;
                 }
-                return NativeEncodeResult::Unsupported;
+                let Some(words) = encode_ump_channel_voice_1(&event.body) else {
+                    return NativeEncodeResult::Invalid;
+                };
+                return NativeEncodeResult::Emitted(AuNativeEvent {
+                    sample_offset,
+                    port,
+                    kind: AU_NATIVE_EVENT_UMP,
+                    protocol: 1,
+                    data_len: 1,
+                    words,
+                    ..AuNativeEvent::default()
+                });
             }
             if let EventBody::SysEx { .. } = event.body {
                 if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
@@ -2242,11 +2259,8 @@ fn encode_native_output<P: PluginExport>(
                 if decode_ump_channel_voice_2(words).as_ref() != Some(&event.body) {
                     return NativeEncodeResult::Invalid;
                 }
-                if carrier_mask & AU_NATIVE_CARRIER_UMP == 0 {
-                    return NativeEncodeResult::Unsupported;
-                }
-                if ump_protocol != 2 {
-                    return NativeEncodeResult::Unsupported;
+                if let Err(status) = require_ump_carrier(carrier_mask, host_protocol) {
+                    return status;
                 }
                 return NativeEncodeResult::Emitted(AuNativeEvent {
                     sample_offset,
@@ -2310,10 +2324,10 @@ fn encode_native_output<P: PluginExport>(
                     let Some(port) = output_port::<P>(port) else {
                         return NativeEncodeResult::Invalid;
                     };
-                    if carrier_mask & AU_NATIVE_CARRIER_UMP == 0 {
-                        return NativeEncodeResult::Unsupported;
+                    if let Err(status) = require_ump_carrier(carrier_mask, host_protocol) {
+                        return status;
                     }
-                    let protocol = match raw_ump_protocol(exact, ump_protocol) {
+                    let protocol = match raw_ump_protocol::<P>(exact) {
                         Ok(protocol) => protocol,
                         Err(status) => return status,
                     };

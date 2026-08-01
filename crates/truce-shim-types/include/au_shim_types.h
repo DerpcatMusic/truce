@@ -91,8 +91,8 @@ typedef struct {
      * protocol - so per-note output (PerNotePitchBend / PerNoteCC) isn't
      * down-converted onto one channel. Independent of `midi2_input` (a
      * 1.0 -> 2.0 promoter is 1.0 in, 2.0 out; AU v3 input and output are
-     * separate self-describing streams). AU v2 and v3 both emit native UMP
-     * only when the host negotiates that exact output protocol. */
+     * separate self-describing streams). AU v2 and v3 preserve the source
+     * protocol and leave host-protocol conversion to Apple's AU boundary. */
     int32_t midi2_output;
     /* Supported (in, out) channel-count configs from `bus_layouts()`.
      * `layout_in_channels[i]` / `layout_out_channels[i]` are the main-bus
