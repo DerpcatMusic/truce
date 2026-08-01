@@ -1920,6 +1920,7 @@ static OSStatus au_v2_render(void *self_,
      * MIDI/SysEx; the event-list block carries source UMP unchanged and the
      * Apple AU boundary owns any host-protocol conversion. */
     OSStatus midiOutputStatus = noErr;
+    bool hostRefusedOutput = false;
     if (inst->midiOutputCallback || inst->midiOutputEventListBlock) {
         uint32_t carriers = 0;
         if (inst->midiOutputCallback) carriers |= AU_NATIVE_CARRIER_BYTES;
@@ -1974,6 +1975,7 @@ static OSStatus au_v2_render(void *self_,
                     (uint8_t)ev.port, list);
                 if (sent != noErr) {
                     midiOutputStatus = sent;
+                    hostRefusedOutput = true;
                     break;
                 }
                 continue;
@@ -2015,6 +2017,7 @@ static OSStatus au_v2_render(void *self_,
                                                      pktList);
             if (sent != noErr) {
                 midiOutputStatus = sent;
+                hostRefusedOutput = true;
                 break;
             }
         }
@@ -2033,7 +2036,7 @@ static OSStatus au_v2_render(void *self_,
 
     if (g_callbacks->finish_output_events) {
         uint32_t status = AU_OUTPUT_EMITTED;
-        if (midiOutputStatus == kAudioUnitErr_MIDIOutputBufferFull)
+        if (hostRefusedOutput || midiOutputStatus == kAudioUnitErr_MIDIOutputBufferFull)
             status = AU_OUTPUT_QUEUE_FULL;
         else if (midiOutputStatus == kAudioUnitErr_FormatNotSupported)
             status = AU_OUTPUT_UNSUPPORTED;

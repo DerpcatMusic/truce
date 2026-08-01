@@ -786,8 +786,7 @@ class TruceAUAudioUnit: AUAudioUnit {
                                 raw.baseAddress!.assumingMemoryBound(to: UInt8.self))
                 }
                 if status != noErr {
-                    outputStatus = status == kAudioUnitErr_MIDIOutputBufferFull
-                        ? UInt32(AU_OUTPUT_QUEUE_FULL) : UInt32(AU_OUTPUT_INVALID)
+                    outputStatus = UInt32(AU_OUTPUT_QUEUE_FULL)
                     return status
                 }
             } else if out.kind == UInt8(AU_NATIVE_EVENT_SYSEX), let outputBlock = midiOutputBlock {
@@ -806,8 +805,7 @@ class TruceAUAudioUnit: AUAudioUnit {
                 let status = outputBlock(
                     eventTime, cable, payloadLen + 2, UnsafePointer(sysexOutScratch))
                 if status != noErr {
-                    outputStatus = status == kAudioUnitErr_MIDIOutputBufferFull
-                        ? UInt32(AU_OUTPUT_QUEUE_FULL) : UInt32(AU_OUTPUT_INVALID)
+                    outputStatus = UInt32(AU_OUTPUT_QUEUE_FULL)
                     return status
                 }
             } else if out.kind == UInt8(AU_NATIVE_EVENT_UMP) {
@@ -853,8 +851,7 @@ class TruceAUAudioUnit: AUAudioUnit {
                 }
                 let status = listBlock(eventTime, cable, &list)
                 if status != noErr {
-                    outputStatus = status == kAudioUnitErr_MIDIOutputBufferFull
-                        ? UInt32(AU_OUTPUT_QUEUE_FULL) : UInt32(AU_OUTPUT_INVALID)
+                    outputStatus = UInt32(AU_OUTPUT_QUEUE_FULL)
                     return status
                 }
             } else {

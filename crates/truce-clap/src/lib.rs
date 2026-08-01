@@ -1784,6 +1784,7 @@ unsafe fn emit_exact_clap(
 fn preflight_clap_output(
     events: &EventList,
     info: &PluginInfo,
+    param_infos: &[ParamInfo],
     frames_count: u32,
 ) -> OutputEventStatus {
     for replay in events.lossless_iter() {
@@ -1816,6 +1817,9 @@ fn preflight_clap_output(
             return OutputEventStatus::Invalid;
         }
         match &event.body {
+            EventBody::ParamChange { id, .. } if !param_infos.iter().any(|info| info.id == *id) => {
+                return OutputEventStatus::Invalid;
+            }
             EventBody::SysEx { .. } => {
                 if events.sysex_bytes_checked(&event.body).is_none() {
                     return OutputEventStatus::Invalid;
@@ -2740,8 +2744,12 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             // CLAP requires globally time-sorted output. Preflight the exact
             // sequence the host will see before allowing the first push.
             scr.output_events.ensure_sorted_by_offset();
-            output_status =
-                preflight_clap_output(&scr.output_events, &data.info, proc.frames_count);
+            output_status = preflight_clap_output(
+                &scr.output_events,
+                &data.info,
+                &data.param_infos,
+                proc.frames_count,
+            );
         }
 
         // Forward plugin output events (MIDI output from instruments/effects)

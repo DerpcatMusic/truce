@@ -1659,11 +1659,16 @@ public:
             kOutputQueueFull = 4,
         };
         OutputEventResult drainResult = kOutputEnd;
+        const uint32_t outputParamCount = g_cb->get_output_param_count
+            ? g_cb->get_output_param_count(ctx) : 0;
+        if (outputParamCount > 0 && !data->outputParameterChanges)
+            drainResult = kOutputUnsupported;
 
         // Drain exactly one globally ordered lossless stream. Rust validates
         // each event and proposes note-ID lifecycle changes; those changes are
         // committed only after the host accepts the corresponding SDK event.
-        if (g_cb->begin_output_events && g_cb->next_output_event
+        if (drainResult == kOutputEnd
+                && g_cb->begin_output_events && g_cb->next_output_event
                 && g_cb->commit_output_event) {
             struct OEVtbl {
                 tresult (*qi)(void*, const TUID, void**);
@@ -1762,54 +1767,47 @@ public:
         // controller so the UI / automation reflect values the plugin
         // changed during processing (e.g. an envelope follower). The
         // Rust side already normalized each value to [0,1].
-        if (g_cb->get_output_param_count
+        if (outputParamCount > 0
                 && (drainResult == kOutputEnd || drainResult == kOutputEmitted)) {
-            uint32_t pcount = g_cb->get_output_param_count(ctx);
-            if (pcount > 0) {
-                if (!data->outputParameterChanges) {
-                    drainResult = kOutputUnsupported;
-                } else {
-                struct IPCVtbl {
-                    tresult (*qi)(void*, const TUID, void**);
-                    uint32 (*addRef)(void*);
-                    uint32 (*release)(void*);
-                    int32 (*getParameterCount)(void*);
-                    void* (*getParameterData)(void*, int32);
-                    void* (*addParameterData)(void*, const uint32*, int32*);
-                };
-                struct IQVtbl {
-                    tresult (*qi)(void*, const TUID, void**);
-                    uint32 (*addRef)(void*);
-                    uint32 (*release)(void*);
-                    uint32 (*getParameterId)(void*);
-                    int32 (*getPointCount)(void*);
-                    tresult (*getPoint)(void*, int32, int32*, double*);
-                    tresult (*addPoint)(void*, int32, double, int32*);
-                };
-                struct { IPCVtbl* vtbl; } *changes =
-                    (decltype(changes))data->outputParameterChanges;
-                for (uint32_t i = 0; i < pcount; i++) {
-                    uint32_t pid = 0;
-                    int32 soff = 0;
-                    double val = 0.0;
-                    g_cb->get_output_param(ctx, i, &pid, &soff, &val);
-                    int32 qidx = 0;
-                    void* queue = changes->vtbl->addParameterData(
-                        data->outputParameterChanges, &pid, &qidx);
-                    if (!queue) {
-                        drainResult = kOutputQueueFull;
-                        break;
-                    }
-                    IQVtbl* qv = *(IQVtbl**)queue;
-                    int32 pidx = 0;
-                    if (qv->addPoint(queue, soff, val, &pidx) != kResultOk) {
-                        drainResult = kOutputQueueFull;
-                        break;
-                    }
-                    if (drainResult == kOutputEnd)
-                        drainResult = kOutputEmitted;
+            struct IPCVtbl {
+                tresult (*qi)(void*, const TUID, void**);
+                uint32 (*addRef)(void*);
+                uint32 (*release)(void*);
+                int32 (*getParameterCount)(void*);
+                void* (*getParameterData)(void*, int32);
+                void* (*addParameterData)(void*, const uint32*, int32*);
+            };
+            struct IQVtbl {
+                tresult (*qi)(void*, const TUID, void**);
+                uint32 (*addRef)(void*);
+                uint32 (*release)(void*);
+                uint32 (*getParameterId)(void*);
+                int32 (*getPointCount)(void*);
+                tresult (*getPoint)(void*, int32, int32*, double*);
+                tresult (*addPoint)(void*, int32, double, int32*);
+            };
+            struct { IPCVtbl* vtbl; } *changes =
+                (decltype(changes))data->outputParameterChanges;
+            for (uint32_t i = 0; i < outputParamCount; i++) {
+                uint32_t pid = 0;
+                int32 soff = 0;
+                double val = 0.0;
+                g_cb->get_output_param(ctx, i, &pid, &soff, &val);
+                int32 qidx = 0;
+                void* queue = changes->vtbl->addParameterData(
+                    data->outputParameterChanges, &pid, &qidx);
+                if (!queue) {
+                    drainResult = kOutputQueueFull;
+                    break;
                 }
+                IQVtbl* qv = *(IQVtbl**)queue;
+                int32 pidx = 0;
+                if (qv->addPoint(queue, soff, val, &pidx) != kResultOk) {
+                    drainResult = kOutputQueueFull;
+                    break;
                 }
+                if (drainResult == kOutputEnd)
+                    drainResult = kOutputEmitted;
             }
         }
         if (g_cb->finish_output_events)
