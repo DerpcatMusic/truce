@@ -6,6 +6,7 @@
 
 pub mod ffi;
 
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::slice;
@@ -142,8 +143,13 @@ struct Vst3Instance<P: PluginExport> {
     /// value is whatever the plugin reports immediately after `init()`.
     latency_cache: AtomicU32,
     tail_cache: AtomicU32,
-    /// Last-seen values of the hidden MIDI proxy params (f64 bits),
-    /// indexed by `id - MIDI_PROXY_ID_BASE`. Empty when the plugin
+    /// Collision-free hidden MIDI proxy IDs in logical
+    /// `(port, channel, controller)` order. Allocated deterministically
+    /// from the top of the host-safe parameter domain while skipping
+    /// every real parameter ID.
+    midi_proxy_ids: Vec<u32>,
+    /// Last-seen values of the hidden MIDI proxy params (f64 bits), in
+    /// the same logical order as `midi_proxy_ids`. Empty when the plugin
     /// doesn't accept MIDI input. Written by `cb_param_set_value` and
     /// read by `cb_param_get_value` - both host-thread; atomic for
     /// interior mutability through the shared `&Inst` those callbacks
@@ -347,6 +353,15 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let editor_builder = plugin.editor_builder();
             let latency_cache = AtomicU32::new(plugin.latency());
             let tail_cache = AtomicU32::new(plugin.tail());
+            let midi_proxy_ids = allocate_midi_proxy_ids(&param_infos, midi_proxy_len::<P>());
+            let midi_proxy_values = (0..midi_proxy_ids.len())
+                .map(|i| {
+                    // Bounded by the proxy count.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let controller = (i as u32) % MIDI_PROXY_PER_CHANNEL;
+                    AtomicU64::new(midi_proxy_default(controller).to_bits())
+                })
+                .collect();
             let instance = Box::new(Vst3Instance::<P> {
                 plugin: shared_plugin(plugin),
                 params_arc,
@@ -364,14 +379,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 pending_state: Arc::new(StateLoadQueue::new(1)),
                 latency_cache,
                 tail_cache,
-                midi_proxy_values: (0..midi_proxy_len::<P>())
-                    .map(|i| {
-                        // Bounded by MIDI_PROXY_COUNT.
-                        #[allow(clippy::cast_possible_truncation)]
-                        let controller = (i as u32) % MIDI_PROXY_PER_CHANNEL;
-                        AtomicU64::new(midi_proxy_default(controller).to_bits())
-                    })
-                    .collect(),
+                midi_proxy_ids,
+                midi_proxy_values,
                 host_scale: AtomicU64::new(1.0f64.to_bits()),
                 pending_resize: AtomicU64::new(0),
                 audio: PluginCell::new(Vst3Scratch {
@@ -860,7 +869,9 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
                 // proxy ids, so `pc.value` is the host's raw `0..=1`.
                 // The id carries the event bus it was mapped for, so
                 // multi-port plugins keep controllers per port.
-                if let Some((port, channel, controller)) = midi_proxy_decode(pc.id) {
+                if let Some((port, channel, controller)) =
+                    allocated_midi_proxy_decode(&inst.midi_proxy_ids, pc.id)
+                {
                     #[allow(clippy::cast_possible_truncation)]
                     let normalized = pc.value.clamp(0.0, 1.0) as f32;
                     scr.event_list.push(Event::on_port(
@@ -1071,8 +1082,8 @@ unsafe extern "C" fn cb_param_get_value<P: PluginExport>(
 ) -> f64 {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        if let Some(rel) = id.checked_sub(MIDI_PROXY_ID_BASE)
-            && let Some(slot) = inst.midi_proxy_values.get(rel as usize)
+        if let Some(index) = allocated_midi_proxy_index(&inst.midi_proxy_ids, id)
+            && let Some(slot) = inst.midi_proxy_values.get(index)
         {
             return f64::from_bits(slot.load(Ordering::Relaxed));
         }
@@ -1087,8 +1098,8 @@ unsafe extern "C" fn cb_param_set_value<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        if let Some(rel) = id.checked_sub(MIDI_PROXY_ID_BASE)
-            && let Some(slot) = inst.midi_proxy_values.get(rel as usize)
+        if let Some(index) = allocated_midi_proxy_index(&inst.midi_proxy_ids, id)
+            && let Some(slot) = inst.midi_proxy_values.get(index)
         {
             slot.store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
             return;
@@ -1509,11 +1520,6 @@ fn midi_event_from_map(map: &MidiMap, plain: f64) -> EventBody {
 // `IMidiMapping` target that turns back into the matching `EventBody`.
 // ---------------------------------------------------------------------------
 
-/// Base id for the proxy range. Real param ids can't collide: derive
-/// hash ids are masked into `0..METER_ID_BASE` (`1 << 24`), meters
-/// count up from there, and explicit ids at or above `METER_ID_BASE`
-/// are rejected at derive time.
-const MIDI_PROXY_ID_BASE: u32 = 1 << 25;
 /// Controllers per channel: CC 0..=127, 128 = channel pressure,
 /// 129 = pitch bend. Program change (VST3 controller 130) is
 /// deliberately not proxied - `kIsProgramChange` parameters interact
@@ -1528,6 +1534,54 @@ const MIDI_PROXY_BANK: u32 = 16 * MIDI_PROXY_PER_CHANNEL;
 const MIDI_PROXY_PRESSURE: u32 = 128;
 const MIDI_PROXY_PITCH_BEND: u32 = 129;
 
+/// Allocate every hidden proxy from the top of the VST3-safe 31-bit
+/// domain, skipping real parameter IDs without changing them. The
+/// descending order is stable for a given real-ID set and doubles as
+/// the logical proxy index for allocation-free binary-search decoding.
+fn allocate_midi_proxy_ids(real_params: &[ParamInfo], count: usize) -> Vec<u32> {
+    let real_ids: HashSet<u32> = real_params.iter().map(|info| info.id).collect();
+    let mut ids = Vec::with_capacity(count);
+    let mut candidate = Some(truce_params::PARAM_ID_MAX);
+    while ids.len() < count {
+        let id = candidate.expect("VST3 parameter ID domain exhausted by MIDI proxies");
+        candidate = id.checked_sub(1);
+        if !real_ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn allocated_midi_proxy_id(ids: &[u32], port: u8, channel: u8, controller: u32) -> Option<u32> {
+    let index = u32::from(port) * MIDI_PROXY_BANK
+        + u32::from(channel.min(15)) * MIDI_PROXY_PER_CHANNEL
+        + controller;
+    ids.get(index as usize).copied()
+}
+
+fn allocated_midi_proxy_index(ids: &[u32], id: u32) -> Option<usize> {
+    ids.binary_search_by(|candidate| candidate.cmp(&id).reverse())
+        .ok()
+}
+
+/// `(port, channel, controller)` for an allocated proxy id, `None`
+/// for every real parameter ID and other host input.
+fn allocated_midi_proxy_decode(ids: &[u32], id: u32) -> Option<(u8, u8, u32)> {
+    let index = u32::try_from(allocated_midi_proxy_index(ids, id)?).ok()?;
+    #[allow(clippy::cast_possible_truncation)]
+    Some((
+        (index / MIDI_PROXY_BANK) as u8,
+        (index % MIDI_PROXY_BANK / MIDI_PROXY_PER_CHANNEL) as u8,
+        index % MIDI_PROXY_PER_CHANNEL,
+    ))
+}
+
+// Keep the historical arithmetic available to the existing unit
+// checks; production proxy IDs use the collision-safe allocator above.
+#[cfg(test)]
+const MIDI_PROXY_ID_BASE: u32 = truce_params::METER_ID_BASE + 0x1_0000;
+
+#[cfg(test)]
 fn midi_proxy_id(port: u8, channel: u8, controller: u32) -> u32 {
     MIDI_PROXY_ID_BASE
         + u32::from(port) * MIDI_PROXY_BANK
@@ -1535,17 +1589,12 @@ fn midi_proxy_id(port: u8, channel: u8, controller: u32) -> u32 {
         + controller
 }
 
-/// `(port, channel, controller)` for a proxy id, `None` for real
-/// param ids. Accepts the full 256-bank shape; ids past the plugin's
-/// declared port count can't occur in practice because registration
-/// and the `IMidiMapping` resolver only hand out ids for real buses.
+#[cfg(test)]
 fn midi_proxy_decode(id: u32) -> Option<(u8, u8, u32)> {
     let rel = id.checked_sub(MIDI_PROXY_ID_BASE)?;
     if rel >= 256 * MIDI_PROXY_BANK {
         return None;
     }
-    // Bank / channel indices are bounded to 0..256 / 0..16 by the
-    // check above and the modulo.
     #[allow(clippy::cast_possible_truncation)]
     Some((
         (rel / MIDI_PROXY_BANK) as u8,
@@ -2144,19 +2193,23 @@ unsafe extern "C" fn cb_gui_set_size<P: PluginExport>(ctx: *mut std::ffi::c_void
 }
 
 /// `IMidiMapping::getMidiControllerAssignment` callback. Resolves the
-/// host's controller query to a bound parameter id from the static
-/// `midi_map` metadata - no plugin instance needed.
+/// host's controller query to a bound parameter or the instance's
+/// collision-free hidden proxy ID.
 //
 // `controller as u8` is guarded by the `0..=127` match arm; `channel`
 // goes through `try_from` so a negative never wraps.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 unsafe extern "C" fn cb_midi_mapping_get_param_id<P: PluginExport>(
-    _ctx: *mut std::ffi::c_void,
+    ctx: *mut std::ffi::c_void,
     bus_index: i32,
     channel: i16,
     controller: i16,
     out_param_id: *mut u32,
 ) -> i32 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
     // VST3 `ControllerNumbers`: 0..=127 are CCs; the extended values
     // mirror the output path's encoding (`ivstmidicontrollers.h`).
     let source = match controller {
@@ -2174,7 +2227,7 @@ unsafe extern "C" fn cb_midi_mapping_get_param_id<P: PluginExport>(
     // through to the hidden proxy bank for the queried bus, keeping
     // controllers attributed per port (program change excepted -
     // not proxied).
-    if let Some(id) = truce_params::map_source_to_param(&P::param_infos_static(), channel, source) {
+    if let Some(id) = truce_params::map_source_to_param(&inst.param_infos, channel, source) {
         unsafe { out_param_id.write(id) };
         return 1;
     }
@@ -2187,8 +2240,10 @@ unsafe extern "C" fn cb_midi_mapping_get_param_id<P: PluginExport>(
         && let Ok(controller) = u32::try_from(controller)
         && controller < MIDI_PROXY_PER_CHANNEL
     {
-        unsafe { out_param_id.write(midi_proxy_id(port, channel, controller)) };
-        return 1;
+        if let Some(id) = allocated_midi_proxy_id(&inst.midi_proxy_ids, port, channel, controller) {
+            unsafe { out_param_id.write(id) };
+            return 1;
+        }
     }
     0
 }
@@ -2474,6 +2529,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
     // the historical runtime path inside `PluginExport`'s default
     // impl.
     let param_infos = P::param_infos_static();
+    let midi_proxy_ids = allocate_midi_proxy_ids(&param_infos, midi_proxy_len::<P>());
 
     let mut param_descs: Vec<Vst3ParamDescriptor> = Vec::with_capacity(param_infos.len());
     for pi in &param_infos {
@@ -2558,7 +2614,8 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
                         ),
                     };
                     param_descs.push(Vst3ParamDescriptor {
-                        id: midi_proxy_id(port, channel, controller),
+                        id: allocated_midi_proxy_id(&midi_proxy_ids, port, channel, controller)
+                            .expect("VST3 MIDI proxy allocation is complete"),
                         name: CString::new(name).unwrap_or_default().into_raw(),
                         short_name: CString::new(short).unwrap_or_default().into_raw(),
                         units: empty_units(),

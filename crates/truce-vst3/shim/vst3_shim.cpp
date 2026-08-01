@@ -753,6 +753,7 @@ public:
     // guards every callback but does nothing. The factory checks this to
     // fail createInstance rather than hand the host a do-nothing plugin.
     bool constructed() const { return ctx != nullptr; }
+    void* rustContext() const { return ctx; }
 
     void* componentHandler;  // IComponentHandler*, stored with addRef
     // Pending IComponentHandler::restartComponent flags (RestartFlags
@@ -2604,12 +2605,11 @@ static tresult hedit_endEditFromHost(void*, uint32) { return kResultOk; }
 static tresult mmap_qi(void* s, const TUID iid, void** obj) { return MMAP(s).queryInterface(com_from_midimapping(s), iid, obj); }
 static uint32 mmap_addRef(void* s) { return MMAP(s).addRef(); }
 static uint32 mmap_release(void* s) { auto* com = com_from_midimapping(s); auto r = com->impl.release(); if (r == 0) { com->impl.~TruceComponent(); free(com); } return r; }
-// The Rust resolver reads static `midi_map` metadata, so it needs no
-// plugin context - pass null. Returns 1 on a hit, which maps to kResultOk.
+// The Rust resolver also owns the per-instance collision-free hidden
+// proxy ID table. Returns 1 on a hit, which maps to kResultOk.
 static tresult mmap_getAssignment(void* s, int32 busIndex, int16_t channel, int16_t cc, uint32* id) {
-    (void)s;
     if (!g_cb || !g_cb->midi_mapping_get_param_id || !id) return kResultFalse;
-    return g_cb->midi_mapping_get_param_id(nullptr, busIndex, channel, cc, id) ? kResultOk : kResultFalse;
+    return g_cb->midi_mapping_get_param_id(MMAP(s).rustContext(), busIndex, channel, cc, id) ? kResultOk : kResultFalse;
 }
 
 // Static vtables

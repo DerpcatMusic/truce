@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use syn::ext::IdentExt;
 use syn::{Data, DeriveInput, Expr, Fields, Lit, Type, TypePath, UnOp};
 use truce_build::{Config, PluginDef};
-use truce_params::METER_ID_BASE;
+use truce_params::{AUTO_PARAM_ID_MASK, METER_ID_BASE};
 
 mod lv2_emit;
 
@@ -889,7 +889,7 @@ fn parse_id_scheme(attrs: &[syn::Attribute]) -> Result<IdScheme, syn::Error> {
 }
 
 /// Deterministic FNV-1a hash of a field name, masked into the
-/// parameter id space (`0..METER_ID_BASE`). Pure integer arithmetic
+/// historical 24-bit auto-ID space. Pure integer arithmetic
 /// over the name bytes, so the value is identical across toolchains,
 /// targets, and runs - the property a persisted parameter id needs.
 /// `pub(crate)` so the LV2 sidecar aggregator (`lv2_emit`) flattens
@@ -902,7 +902,7 @@ pub(crate) fn name_hash_id(name: &str) -> u32 {
         h ^= u32::from(b);
         h = h.wrapping_mul(FNV_PRIME);
     }
-    h & (METER_ID_BASE - 1)
+    h & AUTO_PARAM_ID_MASK
 }
 
 /// Full 32-bit FNV-1a of a field name - the keyed `#[derive(State)]`
@@ -1823,21 +1823,19 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     }
 
     // --- Auto-assign meter IDs ---
-    // Meters live in a dedicated high-range starting at 2^24 so they
-    // can never collide with auto-assigned param IDs (which fill from
-    // 0 upward). Storage indexes as `meter_array[id - METER_ID_BASE]`.
+    // Meters live outside the signed-positive 31-bit host parameter
+    // domain. Storage indexes as `meter_array[id - METER_ID_BASE]`.
     // `METER_ID_BASE` is imported from `truce_params` at proc-macro
     // build time so the value can't drift between crates.
     for (next_meter, m) in (METER_ID_BASE..).zip(meter_fields.iter_mut()) {
         m.id = Some(next_meter);
     }
 
-    // --- Compile-time validation: duplicate IDs + range overlap ---
+    // --- Compile-time validation: duplicate IDs + host-safe range ---
     //
     // Checks:
     //  1. No two params share an ID.
-    //  2. No explicit param ID lands in the meter range (≥ METER_ID_BASE).
-    //     Auto-assigned params can't hit this - you'd need 16M fields.
+    //  2. Every explicit param ID is in the host-safe 31-bit domain.
     //  3. No param ID collides with any meter ID (follows from #2 when
     //     both checks pass, but surfaced separately for a clearer error).
     {
@@ -1846,8 +1844,9 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             if let Some(id) = f.attrs.id {
                 if id >= METER_ID_BASE {
                     let msg = format!(
-                        "Parameter ID {id} is in the meter range (≥ {METER_ID_BASE}). \
-                         Param IDs must be < {METER_ID_BASE}."
+                        "Parameter ID {id} is outside the host-safe 31-bit range. \
+                         Param IDs must be <= {}.",
+                        ::truce_params::PARAM_ID_MAX
                     );
                     return syn::Error::new_spanned(&ast, msg).to_compile_error().into();
                 }
@@ -2054,8 +2053,10 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                         <#ty as ::truce::params::Params>::param_infos_static()
                             .into_iter()
                             .map(|mut __info| {
-                                __info.id =
-                                    (__info.id + __base) & (::truce::params::METER_ID_BASE - 1);
+                                __info.id = ::truce::params::rebase_nested_param_id(
+                                    __info.id,
+                                    __base,
+                                );
                                 __info
                             }),
                     );
@@ -2443,20 +2444,20 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // Fold `id_base` into every parameter id in this subtree: own
     // params directly, nested groups by recursing with the same base
     // (their own local spans were already applied at construction).
-    // The fold is `(id + base) & (METER_ID_BASE - 1)` - additive so the
-    // ordinal scheme's contiguous ranges are preserved exactly (sums
-    // stay well under `METER_ID_BASE`), masked so the hash scheme's
-    // wide ids and salts wrap back into the param range. Meters keep
-    // their dedicated id range and aren't shifted. Always emitted so a
-    // parent can rebase any nested child, leaf or not.
+    // Historical-domain IDs fold as `(id + base) & AUTO_PARAM_ID_MASK`,
+    // preserving every existing ordinal/hash/nested ID. Wider explicit
+    // IDs are absolute and stay unchanged through every parent. Meters
+    // keep their dedicated id range and aren't shifted. Always emitted
+    // so a parent can rebase any nested child, leaf or not.
     let own_param_idents: Vec<_> = param_fields.iter().map(|f| &f.ident).collect();
     let offset_ids_impl = quote! {
         impl #struct_name {
             #[doc(hidden)]
             pub fn offset_ids(&mut self, id_base: u32) {
-                #(self.#own_param_idents.info.id =
-                    (self.#own_param_idents.info.id + id_base)
-                        & (::truce::params::METER_ID_BASE - 1);)*
+                #(self.#own_param_idents.info.id = ::truce::params::rebase_nested_param_id(
+                    self.#own_param_idents.info.id,
+                    id_base,
+                );)*
                 #(self.#nested_idents.offset_ids(id_base);)*
             }
         }
