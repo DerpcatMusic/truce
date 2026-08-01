@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <Block.h>
+#include <math.h>
 
 #include "au_shim_types.h"
 
@@ -20,6 +22,10 @@
 // each render block. One block's worth of automation - generous even
 // under dense per-block automation.
 #define AU_PARAM_EVENT_CAP 512
+
+static uint32_t au_ump_word_count(uint32_t word0);
+static int au_ump_protocol_accepts(MIDIProtocolID protocol,
+                                   uint32_t messageType);
 
 // ---------------------------------------------------------------------------
 // Per-instance state
@@ -109,6 +115,8 @@ typedef struct {
     // of each render block and forward via this callback.
     AUMIDIOutputCallback midiOutputCallback;
     void *midiOutputUserData;
+    AUMIDIEventListBlock midiOutputEventListBlock;
+    SInt32 hostMIDIProtocol;
 
     // Heap-allocated scratch for SysEx output packet lists. Sized
     // to hold one MIDIPacketList of up to 256 SysEx events whose
@@ -410,6 +418,10 @@ static OSStatus au_v2_close(void *self_) {
     inst->sysexPacketBuf = NULL;
     free(inst->sysexFrameScratch);
     inst->sysexFrameScratch = NULL;
+    if (inst->midiOutputEventListBlock) {
+        Block_release(inst->midiOutputEventListBlock);
+        inst->midiOutputEventListBlock = NULL;
+    }
     if (inst->currentPreset.presetName) {
         CFRelease(inst->currentPreset.presetName);
         inst->currentPreset.presetName = NULL;
@@ -433,6 +445,11 @@ static OSStatus au_v2_close(void *self_) {
 
 static OSStatus au_v2_initialize(void *self_) {
     TruceAUv2 *inst = (TruceAUv2 *)self_;
+
+    if (inst->midiOutputEventListBlock &&
+        inst->hostMIDIProtocol != kMIDIProtocol_1_0 &&
+        inst->hostMIDIProtocol != kMIDIProtocol_2_0)
+        return kAudioUnitErr_FormatNotSupported;
 
     // Reject a channel pairing the host assembled from independently-set
     // scopes that isn't one of the declared layouts (audio-less plugins
@@ -557,6 +574,24 @@ static OSStatus au_v2_get_property_info(void *self_, AudioUnitPropertyID prop,
                 return kAudioUnitErr_InvalidProperty;
             if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
             size = sizeof(AUMIDIOutputCallbackStruct); writable = true; break;
+        case kAudioUnitProperty_MIDIOutputEventListCallback:
+            if (!g_descriptor || !g_descriptor->has_midi_output)
+                return kAudioUnitErr_InvalidProperty;
+            if (scope != kAudioUnitScope_Global || elem != 0)
+                return kAudioUnitErr_InvalidScope;
+            size = sizeof(AUMIDIEventListBlock); writable = true; break;
+        case kAudioUnitProperty_AudioUnitMIDIProtocol:
+            if (!g_descriptor || !g_descriptor->accepts_midi_in)
+                return kAudioUnitErr_InvalidProperty;
+            if (scope != kAudioUnitScope_Global || elem != 0)
+                return kAudioUnitErr_InvalidScope;
+            size = sizeof(SInt32); break;
+        case kAudioUnitProperty_HostMIDIProtocol:
+            if (!g_descriptor || !g_descriptor->has_midi_output)
+                return kAudioUnitErr_InvalidProperty;
+            if (scope != kAudioUnitScope_Global || elem != 0)
+                return kAudioUnitErr_InvalidScope;
+            size = sizeof(SInt32); writable = true; break;
         case kAudioUnitProperty_ClassInfo:
             size = sizeof(CFPropertyListRef); writable = true; break;
         case kAudioUnitProperty_PresentPreset:
@@ -987,6 +1022,27 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
             return noErr;
         }
 
+        case kAudioUnitProperty_AudioUnitMIDIProtocol: {
+            if (scope != kAudioUnitScope_Global || elem != 0)
+                return kAudioUnitErr_InvalidScope;
+            if (*ioSize < sizeof(SInt32))
+                return kAudioUnitErr_InvalidPropertyValue;
+            *(SInt32 *)outData = g_descriptor->midi2_input
+                ? kMIDIProtocol_2_0 : kMIDIProtocol_1_0;
+            *ioSize = sizeof(SInt32);
+            return noErr;
+        }
+
+        case kAudioUnitProperty_HostMIDIProtocol: {
+            if (scope != kAudioUnitScope_Global || elem != 0)
+                return kAudioUnitErr_InvalidScope;
+            if (*ioSize < sizeof(SInt32))
+                return kAudioUnitErr_InvalidPropertyValue;
+            *(SInt32 *)outData = inst->hostMIDIProtocol;
+            *ioSize = sizeof(SInt32);
+            return noErr;
+        }
+
         case kAudioUnitProperty_InPlaceProcessing: {
             // Only effects (with inputs) support in-place processing
             *(UInt32 *)outData = (g_descriptor->num_inputs > 0) ? 1 : 0;
@@ -1332,6 +1388,36 @@ static OSStatus au_v2_set_property(void *self_, AudioUnitPropertyID prop,
                 (const AUMIDIOutputCallbackStruct *)inData;
             inst->midiOutputCallback = cb->midiOutputCallback;
             inst->midiOutputUserData = cb->userData;
+            return noErr;
+        }
+
+        case kAudioUnitProperty_MIDIOutputEventListCallback: {
+            if (scope != kAudioUnitScope_Global || elem != 0)
+                return kAudioUnitErr_InvalidScope;
+            if (!g_descriptor || !g_descriptor->has_midi_output)
+                return kAudioUnitErr_InvalidProperty;
+            if (!inData || inSize != sizeof(AUMIDIEventListBlock))
+                return kAudioUnitErr_InvalidPropertyValue;
+            AUMIDIEventListBlock next = *(const AUMIDIEventListBlock *)inData;
+            if (next) next = Block_copy(next);
+            if (inst->midiOutputEventListBlock)
+                Block_release(inst->midiOutputEventListBlock);
+            inst->midiOutputEventListBlock = next;
+            return noErr;
+        }
+
+        case kAudioUnitProperty_HostMIDIProtocol: {
+            if (scope != kAudioUnitScope_Global || elem != 0)
+                return kAudioUnitErr_InvalidScope;
+            if (!g_descriptor || !g_descriptor->has_midi_output)
+                return kAudioUnitErr_InvalidProperty;
+            if (inst->initialized) return kAudioUnitErr_Initialized;
+            if (!inData || inSize != sizeof(SInt32))
+                return kAudioUnitErr_InvalidPropertyValue;
+            SInt32 protocol = *(const SInt32 *)inData;
+            if (protocol != kMIDIProtocol_1_0 && protocol != kMIDIProtocol_2_0)
+                return kAudioUnitErr_InvalidPropertyValue;
+            inst->hostMIDIProtocol = protocol;
             return noErr;
         }
 
@@ -1805,33 +1891,41 @@ static OSStatus au_v2_render(void *self_,
         return kAudioUnitErr_InvalidParameter;
     }
 
-    /* AU v2 hosts deliver MIDI exclusively through the legacy
-     * `MusicDeviceMIDIEvent` path (3-byte MIDI 1.0); they don't have a
-     * MIDIEventList equivalent. Forward NULL / 0 for the MIDI 2.0 UMP
-     * array so the Rust event-decoder skips it. The parameter-event
-     * array carries host automation collected this block (through
-     * ScheduleParameters, or audio-thread SetParameter) so it enters
-     * cb_process as EventBody::ParamChange rows, matching VST3 / AU v3
-     * and driving the editor's automation follow. */
-    g_callbacks->process_native(inst->rustCtx, inPtrs, outPtrs,
-                                numIn + scCh, numOut, inFrameCount,
-                                inst->midiBuffer, inst->midiCount,
-                                inst->midiOverflow,
-                                inst->paramEvents, inst->paramEventCount,
-                                inst->paramOverflow,
-                                &transport);
+    if (inst->midiOverflow || inst->paramOverflow) {
+        inst->midiCount = 0;
+        inst->midiOverflow = 0;
+        inst->paramEventCount = 0;
+        inst->paramOverflow = 0;
+        return kAudioUnitErr_MIDIOutputBufferFull;
+    }
+
+    /* MIDI 1 byte events and native UMP event-list input share the same
+     * bounded lane. Rust returns a boundary status before DSP runs if exact
+     * storage cannot retain the complete block. */
+    uint32_t processStatus = g_callbacks->process_native(
+        inst->rustCtx, inPtrs, outPtrs, numIn + scCh, numOut, inFrameCount,
+        inst->midiBuffer, inst->midiCount, inst->midiOverflow,
+        inst->paramEvents, inst->paramEventCount, inst->paramOverflow,
+        &transport);
     inst->midiCount = 0;
     inst->midiOverflow = 0;
     inst->paramEventCount = 0;
     inst->paramOverflow = 0;
+    if (processStatus == AU_PROCESS_QUEUE_FULL)
+        return kAudioUnitErr_MIDIOutputBufferFull;
+    if (processStatus != AU_PROCESS_OK)
+        return kAudioUnitErr_InvalidParameter;
 
     /* Drain the single sorted native lane. AU v2 accepts byte MIDI and
      * SysEx only; UMP stays unsupported rather than being converted. */
     OSStatus midiOutputStatus = noErr;
-    if (inst->midiOutputCallback) {
+    if (inst->midiOutputCallback || inst->midiOutputEventListBlock) {
+        uint32_t carriers = 0;
+        if (inst->midiOutputCallback) carriers |= AU_NATIVE_CARRIER_BYTES;
+        if (inst->midiOutputEventListBlock) carriers |= AU_NATIVE_CARRIER_UMP;
         g_callbacks->begin_output_events(inst->rustCtx,
-                                         AU_NATIVE_CARRIER_BYTES,
-                                         inFrameCount);
+                                         carriers, inFrameCount,
+                                         (uint32_t)inst->hostMIDIProtocol);
         for (;;) {
             AuNativeEvent ev = {0};
             uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
@@ -1849,9 +1943,46 @@ static OSStatus au_v2_render(void *self_,
                 break;
             }
 
+            if (ev.kind == AU_NATIVE_EVENT_UMP) {
+                uint32_t messageType = (ev.words[0] >> 28) & 0x0Fu;
+                if (!inst->midiOutputEventListBlock ||
+                    (ev.protocol != kMIDIProtocol_1_0 &&
+                     ev.protocol != kMIDIProtocol_2_0) ||
+                    ev.protocol != inst->hostMIDIProtocol ||
+                    ev.data_len != au_ump_word_count(ev.words[0]) ||
+                    !au_ump_protocol_accepts((MIDIProtocolID)ev.protocol, messageType) ||
+                    !(inTimeStamp->mFlags & kAudioTimeStampSampleTimeValid) ||
+                    !isfinite(inTimeStamp->mSampleTime) ||
+                    inTimeStamp->mSampleTime < (double)INT64_MIN ||
+                    inTimeStamp->mSampleTime >= (double)INT64_MAX ||
+                    trunc(inTimeStamp->mSampleTime) != inTimeStamp->mSampleTime) {
+                    midiOutputStatus = kAudioUnitErr_InvalidParameter;
+                    break;
+                }
+                MIDIEventList *list = (MIDIEventList *)inst->sysexPacketBuf;
+                MIDIEventPacket *packet = MIDIEventListInit(
+                    list, (MIDIProtocolID)ev.protocol);
+                if (!MIDIEventListAdd(list, inst->sysexPacketBufSize, packet,
+                                      ev.sample_offset, ev.data_len, ev.words)) {
+                    midiOutputStatus = kAudioUnitErr_MIDIOutputBufferFull;
+                    break;
+                }
+                OSStatus sent = inst->midiOutputEventListBlock(
+                    (AUEventSampleTime)inTimeStamp->mSampleTime,
+                    (uint8_t)ev.port, list);
+                if (sent != noErr) {
+                    midiOutputStatus = sent;
+                    break;
+                }
+                continue;
+            }
+
             const Byte *data = NULL;
             ByteCount len = 0;
-            if (ev.kind == AU_NATIVE_EVENT_MIDI1 &&
+            if (!inst->midiOutputCallback) {
+                midiOutputStatus = kAudioUnitErr_FormatNotSupported;
+                break;
+            } else if (ev.kind == AU_NATIVE_EVENT_MIDI1 &&
                 ev.data_len >= 1 && ev.data_len <= 3) {
                 data = ev.midi;
                 len = ev.data_len;
@@ -1920,7 +2051,7 @@ static OSStatus au_v2_midi_event(void *self_, UInt32 status,
     }
     if (inst->midiCount >= 256) {
         inst->midiOverflow = 1;
-        return kAudioUnitErr_TooManyFramesToProcess;
+        return kAudioUnitErr_MIDIOutputBufferFull;
     }
 
     AuNativeEvent *ev = &inst->midiBuffer[inst->midiCount++];
@@ -1938,6 +2069,86 @@ static OSStatus au_v2_midi_event(void *self_, UInt32 status,
     ev->midi[1] = (uint8_t)data1;
     ev->midi[2] = (uint8_t)data2;
     ev->port = 0; /* AU v2 is single-stream MIDI input */
+    return noErr;
+}
+
+static uint32_t au_ump_word_count(uint32_t word0) {
+    switch ((word0 >> 28) & 0x0Fu) {
+        case 0x0: case 0x1: case 0x2: case 0x6: case 0x7:
+            return 1;
+        case 0x3: case 0x4: case 0x8: case 0x9: case 0xA:
+            return 2;
+        case 0xB: case 0xC:
+            return 3;
+        default:
+            return 4;
+    }
+}
+
+static int au_ump_protocol_accepts(MIDIProtocolID protocol, uint32_t messageType) {
+    if (messageType == 0x2) return protocol == kMIDIProtocol_1_0;
+    if (messageType == 0x4)
+        return protocol == kMIDIProtocol_2_0;
+    return protocol == kMIDIProtocol_1_0 || protocol == kMIDIProtocol_2_0;
+}
+
+/* kMusicDeviceMIDIEventListSelect (263). Preflight the complete variable-size
+ * list before appending anything so malformed widths or queue exhaustion
+ * cannot leave a partial native block staged for the next render. */
+static OSStatus au_v2_midi_event_list(void *self_, UInt32 inOffsetSampleFrame,
+                                      const MIDIEventList *eventList) {
+    TruceAUv2 *inst = (TruceAUv2 *)self_;
+    if (!eventList) return kAudio_ParamError;
+
+    MIDIProtocolID protocol = eventList->protocol;
+    MIDIProtocolID expected = g_descriptor->midi2_input
+        ? kMIDIProtocol_2_0 : kMIDIProtocol_1_0;
+    if (protocol != expected) return kAudioUnitErr_FormatNotSupported;
+
+    uint32_t eventCount = 0;
+    const MIDIEventPacket *packet = &eventList->packet[0];
+    for (uint32_t packetIndex = 0; packetIndex < eventList->numPackets; packetIndex++) {
+        if (packet->wordCount == 0 ||
+            packet->timeStamp > (MIDITimeStamp)(UINT32_MAX - inOffsetSampleFrame))
+            return kAudioUnitErr_InvalidParameter;
+        uint32_t wordIndex = 0;
+        while (wordIndex < packet->wordCount) {
+            uint32_t messageType = (packet->words[wordIndex] >> 28) & 0x0Fu;
+            uint32_t width = au_ump_word_count(packet->words[wordIndex]);
+            if (width > packet->wordCount - wordIndex ||
+                !au_ump_protocol_accepts(protocol, messageType))
+                return kAudioUnitErr_InvalidParameter;
+            if (eventCount == UINT32_MAX) return kAudioUnitErr_InvalidParameter;
+            eventCount++;
+            wordIndex += width;
+        }
+        packet = MIDIEventPacketNext(packet);
+    }
+
+    if (eventCount > 256u - inst->midiCount) {
+        inst->midiOverflow = 1;
+        return kAudioUnitErr_MIDIOutputBufferFull;
+    }
+
+    packet = &eventList->packet[0];
+    for (uint32_t packetIndex = 0; packetIndex < eventList->numPackets; packetIndex++) {
+        uint32_t sampleOffset = inOffsetSampleFrame + (uint32_t)packet->timeStamp;
+        uint32_t wordIndex = 0;
+        while (wordIndex < packet->wordCount) {
+            uint32_t width = au_ump_word_count(packet->words[wordIndex]);
+            AuNativeEvent *ev = &inst->midiBuffer[inst->midiCount++];
+            memset(ev, 0, sizeof(*ev));
+            ev->sample_offset = sampleOffset;
+            ev->port = 0;
+            ev->kind = AU_NATIVE_EVENT_UMP;
+            ev->protocol = (uint8_t)protocol;
+            ev->data_len = width;
+            for (uint32_t i = 0; i < width; i++)
+                ev->words[i] = packet->words[wordIndex + i];
+            wordIndex += width;
+        }
+        packet = MIDIEventPacketNext(packet);
+    }
     return noErr;
 }
 
@@ -2113,6 +2324,8 @@ static AudioComponentMethod au_v2_lookup(SInt16 selector) {
             return accepts_midi_input() ? (AudioComponentMethod)au_v2_midi_event : NULL;
         case 258: // kMusicDeviceSysExSelect
             return accepts_midi_input() ? (AudioComponentMethod)au_v2_sysex : NULL;
+        case kMusicDeviceMIDIEventListSelect:
+            return accepts_midi_input() ? (AudioComponentMethod)au_v2_midi_event_list : NULL;
         // Return NULL for optional selectors (system probes for capabilities)
         case 11: // kAudioUnitRemovePropertyListenerSelect (legacy)
         case 19: case 20: case 21: // misc component selectors
@@ -2121,7 +2334,6 @@ static AudioComponentMethod au_v2_lookup(SInt16 selector) {
         case 260: // kMusicDeviceReleaseInstrumentSelect
         case 261: // kMusicDeviceStartNoteSelect
         case 262: // kMusicDeviceStopNoteSelect
-        case 263: // kMusicDeviceMIDIEventListSelect
             return NULL;
         default:
             return NULL;

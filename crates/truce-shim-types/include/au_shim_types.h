@@ -44,9 +44,11 @@
 // v5: appended `param_parse_value`; a shim must not call it on a pre-v5
 // binary (the pointer would be past its tail).
 // v6: appended the strict native event process and sequential output lane.
+// v7: native process returns status and output negotiation carries the host's
+// UMP protocol; current shims require this exact boundary.
 #define TRUCE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define TRUCE_AU_ABI_MAGIC 0x54417500u
-#define TRUCE_AU_ABI_VERSION 0x54417506u
+#define TRUCE_AU_ABI_VERSION 0x54417507u
 
 typedef struct {
     uint8_t component_type[4];
@@ -71,7 +73,7 @@ typedef struct {
      * the `aumu` component type so an `aumf` MusicEffect (audio effect
      * that opts into MIDI input) is also handed events. */
     int32_t accepts_midi_in;
-    /* Number of MIDI input / output ports. AU v2 is single-stream. AU v3
+    /* Number of MIDI input / output ports. AU v2 is single-cable. AU v3
      * preserves the input cable in its native lane and uses
      * `midi_output_ports` to size `MIDIOutputNames`. */
     uint32_t midi_input_ports;
@@ -79,8 +81,9 @@ typedef struct {
     /* 1 if the plugin's MIDI input port is MIDI 2.0 dialect (`midi2 =
      * true` in truce.toml). The AU v3 appex declares
      * `audioUnitMIDIProtocol` = 2.0 when set so the host delivers native
-     * UMP 2.0 input; otherwise it declares 1.0 and the host down-converts
-     * input. AU v2 ignores it (single-stream MIDI 1.0). */
+     * UMP 2.0 input; otherwise it declares 1.0. AU v2 reports the same
+     * protocol through kAudioUnitProperty_AudioUnitMIDIProtocol and accepts
+     * native UMP through kMusicDeviceMIDIEventListSelect. */
     int32_t midi2_input;
     /* 1 if the plugin's MIDI output port is MIDI 2.0 dialect. The AU v3
      * appex emits the plugin's output as a pure UMP 2.0 stream via
@@ -88,7 +91,8 @@ typedef struct {
      * protocol - so per-note output (PerNotePitchBend / PerNoteCC) isn't
      * down-converted onto one channel. Independent of `midi2_input` (a
      * 1.0 -> 2.0 promoter is 1.0 in, 2.0 out; AU v3 input and output are
-     * separate self-describing streams). AU v2 ignores it. */
+     * separate self-describing streams). AU v2 and v3 both emit native UMP
+     * only when the host negotiates that exact output protocol. */
     int32_t midi2_output;
     /* Supported (in, out) channel-count configs from `bus_layouts()`.
      * `layout_in_channels[i]` / `layout_out_channels[i]` are the main-bus
@@ -181,11 +185,16 @@ typedef struct {
 #define AU_OUTPUT_INVALID 3u
 #define AU_OUTPUT_QUEUE_FULL 4u
 
+#define AU_PROCESS_OK 0u
+#define AU_PROCESS_INVALID 1u
+#define AU_PROCESS_QUEUE_FULL 2u
+
 /* One bounded, format-native event record shared by AU v2 and AU v3.
  * `data_len` is the exact MIDI byte count (1..3), SysEx payload length,
- * or UMP word count (1..4). `protocol` is 1/2 only for UMP. SysEx bytes
- * are borrowed for the duration of `process_native` or until the next
- * process block when returned by `next_output_event`. */
+ * or UMP word count (1..4). `protocol` is 1/2 only for UMP. Input SysEx is
+ * F0/F7-framed; output SysEx points to the inner payload. SysEx bytes are
+ * borrowed for the duration of `process_native` or until the next process
+ * block when returned by `next_output_event`. */
 typedef struct {
     uint32_t sample_offset;
     uint16_t port;
@@ -379,23 +388,24 @@ typedef struct {
      * (>= v5) before calling. */
     int32_t (*param_parse_value)(void *ctx, uint32_t id, const char *text,
                                  double *out_plain);
-    /* v6 strict event boundary. The two old typed MIDI arrays and indexed
+    /* v7 strict event boundary. The two old typed MIDI arrays and indexed
      * output drains remain above only to preserve append-only ABI offsets;
      * current shims use this native lane exclusively. */
-    void (*process_native)(void *ctx,
-                           const float **inputs, float **outputs,
-                           uint32_t num_input_channels,
-                           uint32_t num_output_channels,
-                           uint32_t num_frames,
-                           const AuNativeEvent *events,
-                           uint32_t num_events,
-                           uint32_t input_overflow,
-                           const AuParamEvent *param_events,
-                           uint32_t num_param_events,
-                           uint32_t param_overflow,
-                           const AuTransportSnapshot *transport);
+    uint32_t (*process_native)(void *ctx,
+                               const float **inputs, float **outputs,
+                               uint32_t num_input_channels,
+                               uint32_t num_output_channels,
+                               uint32_t num_frames,
+                               const AuNativeEvent *events,
+                               uint32_t num_events,
+                               uint32_t input_overflow,
+                               const AuParamEvent *param_events,
+                               uint32_t num_param_events,
+                               uint32_t param_overflow,
+                               const AuTransportSnapshot *transport);
     void (*begin_output_events)(void *ctx, uint32_t carrier_mask,
-                                uint32_t num_frames);
+                                uint32_t num_frames,
+                                uint32_t ump_protocol);
     uint32_t (*next_output_event)(void *ctx, AuNativeEvent *out);
     uint32_t (*push_sysex_input_native)(void *ctx, uint32_t sample_offset,
                                         const uint8_t *bytes, uint32_t len);

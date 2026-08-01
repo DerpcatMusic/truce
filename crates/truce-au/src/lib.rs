@@ -72,16 +72,17 @@ use truce_core::ump::{
 };
 use truce_core::wrapper::{
     ParamCStrings, PluginCell, SharedPlugin, copy_c_str, default_io_channels, enter_plugin,
-    log_midi_ports_clamped, log_missing_bus_layout, max_io_channels, run_audio_block,
-    run_extern_callback_with, run_register, save_extra, shared_plugin,
+    log_missing_bus_layout, max_io_channels, run_audio_block, run_extern_callback_with,
+    run_register, save_extra, shared_plugin,
 };
 use truce_params::{MidiSource, ParamFlags, ParamInfo, Params};
 
 use ffi::{
     AU_NATIVE_CARRIER_BYTES, AU_NATIVE_CARRIER_UMP, AU_NATIVE_EVENT_MIDI1, AU_NATIVE_EVENT_SYSEX,
     AU_NATIVE_EVENT_UMP, AU_OUTPUT_EMITTED, AU_OUTPUT_END, AU_OUTPUT_INVALID, AU_OUTPUT_QUEUE_FULL,
-    AU_OUTPUT_UNSUPPORTED, AuCallbacks, AuMidi2Event, AuMidiEvent, AuNativeEvent,
-    AuParamDescriptor, AuParamEvent, AuPluginDescriptor, AuTransportSnapshot, AuUmpEvent,
+    AU_OUTPUT_UNSUPPORTED, AU_PROCESS_INVALID, AU_PROCESS_OK, AU_PROCESS_QUEUE_FULL, AuCallbacks,
+    AuMidi2Event, AuMidiEvent, AuNativeEvent, AuParamDescriptor, AuParamEvent, AuPluginDescriptor,
+    AuTransportSnapshot, AuUmpEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,7 +246,10 @@ impl ParamNotifier {
             .spawn(move || {
                 while !s.load(Ordering::Acquire) {
                     drain();
-                    thread::park();
+                    // Poll off-thread at a short bounded cadence. The audio
+                    // callback only writes the lock-free queue / dirty bit;
+                    // it never invokes the scheduler through `Thread::unpark`.
+                    thread::park_timeout(std::time::Duration::from_millis(4));
                 }
                 // Flush anything queued between the last drain and stop.
                 drain();
@@ -261,13 +265,10 @@ impl ParamNotifier {
         })
     }
 
-    /// Flag a latency change and wake the notifier. Audio-thread cheap:
-    /// one atomic swap, `unpark` only on the edge so a burst coalesces
-    /// into one host notification.
+    /// Flag a latency change for the polling notifier. Audio-thread work is
+    /// one coalescing atomic store; waking and host callbacks stay off-thread.
     fn notify_latency(&self) {
-        if !self.latency_dirty.swap(true, Ordering::Release) {
-            self.thread.unpark();
-        }
+        self.latency_dirty.store(true, Ordering::Release);
     }
 }
 
@@ -384,6 +385,7 @@ struct AuAudio<P: PluginExport> {
     native_output_cursor: LosslessEventCursor,
     native_output_carriers: u32,
     native_output_num_frames: u32,
+    native_output_ump_protocol: u8,
     native_output_overflow_pending: bool,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     sub_event_scratch: EventList,
@@ -496,6 +498,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     native_output_cursor: LosslessEventCursor::default(),
                     native_output_carriers: 0,
                     native_output_num_frames: 0,
+                    native_output_ump_protocol: 0,
                     native_output_overflow_pending: false,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sysex_assembler: SysExAssembler::with_capacity(SYSEX_POOL_PREALLOC),
@@ -634,18 +637,40 @@ enum AuProcessInput {
     },
 }
 
-fn push_exact_with_fallback(list: &mut EventList, exact: ExactEvent, fallback: Event) {
-    match list.try_push_with_exact(fallback, exact) {
-        Err(PushError::EventFull) => {
-            let _ = list.try_push_exact(exact);
-        }
-        Ok(())
-        | Err(
-            PushError::ExactEventFull
-            | PushError::PoolFull
-            | PushError::UnknownExactEvent
-            | PushError::VoiceTrackerFull,
-        ) => {}
+fn push_exact_with_fallback(
+    list: &mut EventList,
+    exact: ExactEvent,
+    fallback: Event,
+) -> Result<(), PushError> {
+    if list.len() >= list.capacity() {
+        list.try_push_exact(exact)
+    } else {
+        list.try_push_with_exact(fallback, exact)
+    }
+}
+
+fn ump_word_count_for_type(word0: u32) -> u8 {
+    match ((word0 >> 28) & 0x0f) as u8 {
+        0x0 | 0x1 | 0x2 | 0x6 | 0x7 => 1,
+        0x3 | 0x4 | 0x8 | 0x9 | 0xA => 2,
+        0xB | 0xC => 3,
+        _ => 4,
+    }
+}
+
+fn ump_protocol_accepts(protocol: u8, message_type: u8) -> bool {
+    match message_type {
+        0x2 => protocol == 1,
+        0x4 => protocol == 2,
+        _ => matches!(protocol, 1 | 2),
+    }
+}
+
+fn declared_input_protocol<P: PluginExport>() -> u8 {
+    if P::info().midi_input_dialect == MidiDialect::Midi2 {
+        2
+    } else {
+        1
     }
 }
 
@@ -668,22 +693,23 @@ fn declared_input_port<P: PluginExport>(port: u16) -> Option<u8> {
         .flatten()
 }
 
+#[allow(clippy::too_many_lines)]
 fn push_native_input<P: PluginExport>(
     list: &mut EventList,
     assembler: &mut SysExAssembler,
     ev: &AuNativeEvent,
     num_frames: u32,
-) {
+) -> u32 {
     if ev.sample_offset >= num_frames {
-        return;
+        return AU_PROCESS_INVALID;
     }
     match ev.kind {
         AU_NATIVE_EVENT_MIDI1 => {
             let Ok(len) = u8::try_from(ev.data_len) else {
-                return;
+                return AU_PROCESS_INVALID;
             };
             let Some(message) = RawMidi1::new(ev.midi, len) else {
-                return;
+                return AU_PROCESS_INVALID;
             };
             let exact = ExactEvent::new(
                 ev.sample_offset,
@@ -702,14 +728,23 @@ fn push_native_input<P: PluginExport>(
                     })
                 });
             if let Some((port, body)) = declared_input_port::<P>(ev.port).zip(fallback) {
-                push_exact_with_fallback(list, exact, Event::on_port(ev.sample_offset, port, body));
-            } else {
-                let _ = list.try_push_exact(exact);
+                if push_exact_with_fallback(
+                    list,
+                    exact,
+                    Event::on_port(ev.sample_offset, port, body),
+                )
+                .is_err()
+                {
+                    return AU_PROCESS_QUEUE_FULL;
+                }
+            } else if list.try_push_exact(exact).is_err() {
+                return AU_PROCESS_QUEUE_FULL;
             }
+            AU_PROCESS_OK
         }
         AU_NATIVE_EVENT_SYSEX => {
             if ev.sysex.is_null() && ev.data_len != 0 {
-                return;
+                return AU_PROCESS_INVALID;
             }
             let bytes = if ev.data_len == 0 {
                 &[][..]
@@ -717,29 +752,41 @@ fn push_native_input<P: PluginExport>(
                 unsafe { slice::from_raw_parts(ev.sysex, ev.data_len as usize) }
             };
             let Some(bytes) = bytes.strip_prefix(&[0xF0]) else {
-                return;
+                return AU_PROCESS_INVALID;
             };
             let Some(bytes) = bytes.strip_suffix(&[0xF7]) else {
-                return;
+                return AU_PROCESS_INVALID;
             };
             let exact = ExactEvent::new(ev.sample_offset, ExactEventBody::SysEx { port: ev.port });
             let Ok(token) = list.try_push_exact_sysex_token(ev.sample_offset, bytes, exact) else {
-                return;
+                return AU_PROCESS_QUEUE_FULL;
             };
-            if let Some(port) = declared_input_port::<P>(ev.port) {
-                let _ = list.try_push_exact_sysex_view_companion(token, ev.sample_offset, port);
+            if let Some(port) = declared_input_port::<P>(ev.port)
+                && list
+                    .try_push_exact_sysex_view_companion(token, ev.sample_offset, port)
+                    .is_err()
+            {
+                return AU_PROCESS_QUEUE_FULL;
             }
+            AU_PROCESS_OK
         }
         AU_NATIVE_EVENT_UMP => {
             let Ok(word_count) = u8::try_from(ev.data_len) else {
-                return;
+                return AU_PROCESS_INVALID;
             };
             let Some(packet) = RawUmp::new(ev.words, word_count) else {
-                return;
+                return AU_PROCESS_INVALID;
             };
             let Some(metadata) = AuEventMetadata::new(ev.protocol) else {
-                return;
+                return AU_PROCESS_INVALID;
             };
+            let mt = ((ev.words[0] >> 28) & 0x0F) as u8;
+            if word_count != ump_word_count_for_type(ev.words[0])
+                || ev.protocol != declared_input_protocol::<P>()
+                || !ump_protocol_accepts(ev.protocol, mt)
+            {
+                return AU_PROCESS_INVALID;
+            }
             let exact = ExactEvent::new(
                 ev.sample_offset,
                 ExactEventBody::Ump {
@@ -748,7 +795,6 @@ fn push_native_input<P: PluginExport>(
                 },
             )
             .with_metadata(ExactEventMetadata::Au(metadata));
-            let mt = ((ev.words[0] >> 28) & 0x0F) as u8;
             let group = ((ev.words[0] >> 24) & 0x0F) as u8;
             let fallback = match mt {
                 0x2 if word_count == 1 => {
@@ -770,31 +816,39 @@ fn push_native_input<P: PluginExport>(
                 _ => None,
             };
             if let Some((port, body)) = declared_input_port::<P>(ev.port).zip(fallback) {
-                push_exact_with_fallback(list, exact, Event::on_port(ev.sample_offset, port, body));
-                return;
+                return if push_exact_with_fallback(
+                    list,
+                    exact,
+                    Event::on_port(ev.sample_offset, port, body),
+                )
+                .is_ok()
+                {
+                    AU_PROCESS_OK
+                } else {
+                    AU_PROCESS_QUEUE_FULL
+                };
             }
             let Ok(token) = list.try_push_exact_token(exact) else {
-                return;
+                return AU_PROCESS_QUEUE_FULL;
             };
             let feed = match (mt, word_count) {
                 (0x3, 2) => {
                     assembler.push_sysex7_packet_on_route(ev.port, [ev.words[0], ev.words[1]])
                 }
                 (0x5, 4) => assembler.push_sysex8_packet_on_route(ev.port, ev.words),
-                _ => return,
+                _ => return AU_PROCESS_OK,
             };
             if let (Some(port), SysExFeed::Complete(payload)) =
                 (declared_input_port::<P>(ev.port), feed)
+                && list
+                    .try_push_sysex_exact_companion(token, ev.sample_offset, port, payload.bytes)
+                    .is_err()
             {
-                let _ = list.try_push_sysex_exact_companion(
-                    token,
-                    ev.sample_offset,
-                    port,
-                    payload.bytes,
-                );
+                return AU_PROCESS_QUEUE_FULL;
             }
+            AU_PROCESS_OK
         }
-        _ => {}
+        _ => AU_PROCESS_INVALID,
     }
 }
 
@@ -814,7 +868,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
     transport_ptr: *const AuTransportSnapshot,
 ) {
     unsafe {
-        cb_process_impl::<P>(
+        let _ = cb_process_impl::<P>(
             ctx,
             inputs,
             outputs,
@@ -849,7 +903,7 @@ unsafe extern "C" fn cb_process_native<P: PluginExport>(
     num_param_events: u32,
     param_overflow: u32,
     transport_ptr: *const AuTransportSnapshot,
-) {
+) -> u32 {
     unsafe {
         cb_process_impl::<P>(
             ctx,
@@ -867,7 +921,7 @@ unsafe extern "C" fn cb_process_native<P: PluginExport>(
             num_param_events,
             param_overflow,
             transport_ptr,
-        );
+        )
     }
 }
 
@@ -884,8 +938,9 @@ unsafe fn cb_process_impl<P: PluginExport>(
     num_param_events: u32,
     param_overflow: u32,
     transport_ptr: *const AuTransportSnapshot,
-) {
+) -> u32 {
     let nf = num_frames as usize;
+    let mut process_status = AU_PROCESS_OK;
     let ok = run_audio_block::<P>("AU", || unsafe {
         // Shared `&AuInstance` (never a whole-struct `&mut`) - the audio
         // scratch is reached through its ownership cell, so a concurrent
@@ -995,16 +1050,25 @@ unsafe fn cb_process_impl<P: PluginExport>(
                 overflow,
             } => {
                 if overflow != 0 {
-                    scr.event_list.record_overflow(PushError::EventFull);
+                    process_status = AU_PROCESS_QUEUE_FULL;
+                    return;
+                }
+                if events.is_null() && len != 0 {
+                    process_status = AU_PROCESS_INVALID;
+                    return;
                 }
                 if !events.is_null() && len > 0 {
                     for event in slice::from_raw_parts(events, len as usize) {
-                        push_native_input::<P>(
+                        let status = push_native_input::<P>(
                             &mut scr.event_list,
                             &mut scr.sysex_assembler,
                             event,
                             len_u32(num_frames),
                         );
+                        if status != AU_PROCESS_OK {
+                            process_status = status;
+                            return;
+                        }
                     }
                 }
             }
@@ -1022,9 +1086,21 @@ unsafe fn cb_process_impl<P: PluginExport>(
         // VST3 parameter queues. The v2 path passes
         // `param_events = NULL, num_param_events = 0` because AU v2
         // has no per-sample automation API at the format boundary.
+        if param_overflow != 0 {
+            process_status = AU_PROCESS_QUEUE_FULL;
+            return;
+        }
+        if param_events.is_null() && num_param_events != 0 {
+            process_status = AU_PROCESS_INVALID;
+            return;
+        }
         if !param_events.is_null() && num_param_events > 0 {
             let pe_slice = slice::from_raw_parts(param_events, num_param_events as usize);
             for pe in pe_slice {
+                if pe.sample_offset >= len_u32(num_frames) {
+                    process_status = AU_PROCESS_INVALID;
+                    return;
+                }
                 scr.event_list.push(Event {
                     sample_offset: pe.sample_offset,
                     port: 0,
@@ -1035,8 +1111,9 @@ unsafe fn cb_process_impl<P: PluginExport>(
                 });
             }
         }
-        if param_overflow != 0 {
-            scr.event_list.record_overflow(PushError::EventFull);
+        if scr.event_list.overflow().is_some() {
+            process_status = AU_PROCESS_QUEUE_FULL;
+            return;
         }
 
         scr.event_list.ensure_sorted_by_offset();
@@ -1146,29 +1223,24 @@ unsafe fn cb_process_impl<P: PluginExport>(
         // notifier thread so the host's UI / automation reflect values
         // the plugin changed during processing. The host set + listener
         // broadcast takes locks and dispatches host callbacks, so it
-        // can't run here on the audio thread - we only push (wait-free)
-        // and unpark. A full queue drops the change rather than block.
+        // can't run here on the audio thread - we only push to the wait-free
+        // queue. The notifier polls and coalesces off-thread. A full queue
+        // drops the notification rather than block.
         // AU v3 (iOS) has no host-notify: the Swift shim polls the
         // parameter tree, matching the editor-side `set_param` split.
         #[cfg(target_os = "macos")]
         if let Some(notifier) = &inst.param_notify {
-            let mut pushed = false;
             for event in scr.output_events.iter() {
                 if let EventBody::ParamChange { id, value } = event.body {
                     // `value` is plain, as AU wants.
-                    if notifier.queue.push((id, f32::from_f64(value))).is_ok() {
-                        pushed = true;
-                    }
+                    let _ = notifier.queue.push((id, f32::from_f64(value)));
                 }
-            }
-            if pushed {
-                notifier.thread.unpark();
             }
         }
 
         // Refresh latency / tail caches so the host's main-thread
         // queries don't have to touch the plugin. On an actual
-        // change, wake the notifier thread to broadcast a
+        // change, flag the polling notifier to broadcast a
         // `kAudioUnitProperty_Latency` change (AU v2 / macOS). AU v3
         // (iOS) has no Rust->appex notify path; its host re-reads the
         // cached value on its own, unchanged.
@@ -1184,6 +1256,9 @@ unsafe fn cb_process_impl<P: PluginExport>(
         inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
     });
     if !ok {
+        process_status = AU_PROCESS_INVALID;
+    }
+    if !ok || process_status != AU_PROCESS_OK {
         unsafe {
             for ch in 0..num_output_channels as usize {
                 let ptr = *outputs.add(ch);
@@ -1193,6 +1268,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
             }
         }
     }
+    process_status
 }
 
 /// Test-only smoke helper for the `rt-paranoid` CI gate: drives a few
@@ -2075,28 +2151,30 @@ fn output_port<P: PluginExport>(port: u16) -> Option<u16> {
     (port < u16::from(P::info().midi_output_ports)).then_some(port)
 }
 
-fn default_protocol<P: PluginExport>() -> u8 {
-    if P::info().midi_output_dialect == MidiDialect::Midi2 {
-        2
-    } else {
-        1
+fn raw_ump_protocol(
+    exact: truce_core::ExactEventRef<'_>,
+    negotiated_protocol: u8,
+) -> Result<u8, NativeEncodeResult> {
+    let ExactEventBody::Ump { packet, .. } = exact.body() else {
+        return Err(NativeEncodeResult::Invalid);
+    };
+    let message_type = ((packet.words()[0] >> 28) & 0x0f) as u8;
+    if packet.word_count() != usize::from(ump_word_count_for_type(packet.words()[0])) {
+        return Err(NativeEncodeResult::Invalid);
     }
-}
-
-fn raw_ump_protocol<P: PluginExport>(exact: truce_core::ExactEventRef<'_>) -> Option<u8> {
-    match exact.metadata() {
-        ExactEventMetadata::Au(metadata) => Some(metadata.protocol()),
-        ExactEventMetadata::None => match exact.body() {
-            ExactEventBody::Ump { packet, .. } => match packet.words()[0] >> 28 {
-                0x2 => Some(1),
-                0x4 | 0x5 | 0xD | 0xE | 0xF => Some(2),
-                0x0 | 0x1 | 0x3 => Some(default_protocol::<P>()),
-                _ => None,
-            },
-            _ => None,
+    let protocol = match exact.metadata() {
+        ExactEventMetadata::Au(metadata) => metadata.protocol(),
+        ExactEventMetadata::None => match message_type {
+            0x2 => 1,
+            0x4 => 2,
+            _ => negotiated_protocol,
         },
-        _ => None,
+        _ => return Err(NativeEncodeResult::Unsupported),
+    };
+    if !ump_protocol_accepts(protocol, message_type) || protocol != negotiated_protocol {
+        return Err(NativeEncodeResult::Invalid);
     }
+    Ok(protocol)
 }
 
 fn encode_native_output<P: PluginExport>(
@@ -2104,6 +2182,7 @@ fn encode_native_output<P: PluginExport>(
     list: &EventList,
     carrier_mask: u32,
     num_frames: u32,
+    ump_protocol: u8,
 ) -> NativeEncodeResult {
     let sample_offset = match event {
         LosslessEventRef::Typed(event) => event.sample_offset,
@@ -2119,17 +2198,31 @@ fn encode_native_output<P: PluginExport>(
                 return NativeEncodeResult::Invalid;
             };
             if let Some((midi, data_len)) = typed_midi1_bytes(&event.body) {
-                if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
-                    return NativeEncodeResult::Unsupported;
+                if carrier_mask & AU_NATIVE_CARRIER_BYTES != 0 {
+                    return NativeEncodeResult::Emitted(AuNativeEvent {
+                        sample_offset,
+                        port,
+                        kind: AU_NATIVE_EVENT_MIDI1,
+                        data_len,
+                        midi,
+                        ..AuNativeEvent::default()
+                    });
                 }
-                return NativeEncodeResult::Emitted(AuNativeEvent {
-                    sample_offset,
-                    port,
-                    kind: AU_NATIVE_EVENT_MIDI1,
-                    data_len,
-                    midi,
-                    ..AuNativeEvent::default()
-                });
+                if carrier_mask & AU_NATIVE_CARRIER_UMP != 0 && ump_protocol == 1 {
+                    let Some(words) = encode_ump_channel_voice_1(&event.body) else {
+                        return NativeEncodeResult::Invalid;
+                    };
+                    return NativeEncodeResult::Emitted(AuNativeEvent {
+                        sample_offset,
+                        port,
+                        kind: AU_NATIVE_EVENT_UMP,
+                        protocol: 1,
+                        data_len: 1,
+                        words,
+                        ..AuNativeEvent::default()
+                    });
+                }
+                return NativeEncodeResult::Unsupported;
             }
             if let EventBody::SysEx { .. } = event.body {
                 if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
@@ -2150,6 +2243,9 @@ fn encode_native_output<P: PluginExport>(
                     return NativeEncodeResult::Invalid;
                 }
                 if carrier_mask & AU_NATIVE_CARRIER_UMP == 0 {
+                    return NativeEncodeResult::Unsupported;
+                }
+                if ump_protocol != 2 {
                     return NativeEncodeResult::Unsupported;
                 }
                 return NativeEncodeResult::Emitted(AuNativeEvent {
@@ -2214,12 +2310,13 @@ fn encode_native_output<P: PluginExport>(
                     let Some(port) = output_port::<P>(port) else {
                         return NativeEncodeResult::Invalid;
                     };
-                    let Some(protocol) = raw_ump_protocol::<P>(exact) else {
-                        return NativeEncodeResult::Unsupported;
-                    };
                     if carrier_mask & AU_NATIVE_CARRIER_UMP == 0 {
                         return NativeEncodeResult::Unsupported;
                     }
+                    let protocol = match raw_ump_protocol(exact, ump_protocol) {
+                        Ok(protocol) => protocol,
+                        Err(status) => return status,
+                    };
                     NativeEncodeResult::Emitted(AuNativeEvent {
                         sample_offset,
                         port,
@@ -2240,6 +2337,7 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     carrier_mask: u32,
     num_frames: u32,
+    ump_protocol: u32,
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
@@ -2248,6 +2346,7 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
         audio.native_output_carriers =
             carrier_mask & (AU_NATIVE_CARRIER_BYTES | AU_NATIVE_CARRIER_UMP);
         audio.native_output_num_frames = num_frames;
+        audio.native_output_ump_protocol = u8::try_from(ump_protocol).unwrap_or(0);
         audio.native_output_overflow_pending = audio.output_events.overflow().is_some();
     }
 }
@@ -2277,6 +2376,7 @@ unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
             &scr.output_events,
             scr.native_output_carriers,
             scr.native_output_num_frames,
+            scr.native_output_ump_protocol,
         ) {
             NativeEncodeResult::Emitted(event) => {
                 out.write(event);
@@ -2816,13 +2916,8 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
     // effect can opt into a host "MIDI Out" port instead of only note
     // effects advertising one.
     let has_midi_output = i32::from(info.emits_midi);
-    // AU v3 carries multi-port MIDI *output* (`MIDIOutputNames` array,
-    // cable-indexed); the appex sizes its output ports to
-    // `midi_output_ports` and routes each event by `Event::port`. MIDI
-    // *input* is still single-cable on both v2 and v3 (the appex's UMP
-    // read doesn't capture the cable yet), so clamp + warn on input only.
-    // AU v2 is single-stream in both directions and ignores the counts.
-    log_midi_ports_clamped("AU", "input", info.midi_input_ports);
+    // AU v3 exposes both declared directions as cable-indexed native lanes.
+    // AU v2 remains one cable by format design while preserving native UMP.
 
     // Supported (in, out) channel configs from `bus_layouts()`, exposed to
     // the host through AU v2 `SupportedNumChannels` / AU v3

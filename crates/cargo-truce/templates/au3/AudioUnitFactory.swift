@@ -62,6 +62,14 @@ func truceAbiTailVersion(_ cb: UnsafePointer<AuCallbacks>) -> UInt32 {
     }
 }
 
+@inline(__always) func umpProtocolAccepts(_ protocolID: UInt8, _ messageType: UInt8) -> Bool {
+    switch messageType & 0xF {
+    case 0x2: return protocolID == 1
+    case 0x4: return protocolID == 2
+    default: return protocolID == 1 || protocolID == 2
+    }
+}
+
 @inline(__always) func sampleOffset(
     _ eventTime: AUEventSampleTime, _ bufferStart: Int64, _ frameCount: UInt32
 ) -> UInt32? {
@@ -89,14 +97,17 @@ func forwardMIDIEventList(
     var packet = UnsafeRawPointer(list).advanced(by: midiEventListPacketOffset)
         .assumingMemoryBound(to: MIDIEventPacket.self)
     let numPackets = list.pointee.numPackets
+    let eventTime = native.pointee.eventSampleTime
     var packetIdx: UInt32 = 0
     while packetIdx < numPackets {
         let wordCount = packet.pointee.wordCount
         guard wordCount > 0,
-              let packetTime = Int64(exactly: packet.pointee.timeStamp),
-              let offset = sampleOffset(packetTime, bufStart, frameCount) else {
+              let packetOffset = Int64(exactly: packet.pointee.timeStamp) else {
             return false
         }
+        let (packetTime, timeOverflow) = eventTime.addingReportingOverflow(packetOffset)
+        guard !timeOverflow,
+              let offset = sampleOffset(packetTime, bufStart, frameCount) else { return false }
         let words = UnsafeRawPointer(packet).advanced(by: midiEventPacketWordsOffset)
             .assumingMemoryBound(to: UInt32.self)
         var i: UInt32 = 0
@@ -185,7 +196,7 @@ class TruceAUAudioUnit: AUAudioUnit {
         // their names) but lays out `AuCallbacks` differently -
         // calling `create` there would jump through the wrong slot.
         // Refuse instantiation instead of crashing the extension.
-        guard truceAbiTailVersion(callbacks) >= 6 else {
+        guard truceAbiTailVersion(callbacks) >= 7 else {
             logger.error("AU init: plugin binary lacks the native event ABI; rebuild the framework and appex with the same truce version")
             throw NSError(domain: NSOSStatusErrorDomain,
                           code: Int(kAudioUnitErr_FailedInitialization))
@@ -297,6 +308,10 @@ class TruceAUAudioUnit: AUAudioUnit {
         let n = max(1, Int(d.midi_output_ports))
         if n == 1 { return ["MIDI Out"] }
         return (1...n).map { "MIDI Out \($0)" }
+    }
+
+    override var virtualMIDICableCount: Int {
+        Int(g_descriptor?.pointee.midi_input_ports ?? 0)
     }
 
     /// MIDI protocol the host delivers *input* in. Declaring 2.0 makes the
@@ -466,7 +481,8 @@ class TruceAUAudioUnit: AUAudioUnit {
         // Type-erased `AUMIDIEventListBlock?` (the UMP output block).
         // Passed as `Any?` so this signature doesn't reference the
         // macOS-12 / iOS-15-only type; cast back under `#available`.
-        midiOutputListBlock: Any?
+        midiOutputListBlock: Any?,
+        midiOutputProtocol: UInt32
     ) -> AUAudioUnitStatus {
         // Reject a block larger than the scratch was sized for: writing
         // frameCount frames at the scMaxFrames stride would overrun the
@@ -697,21 +713,30 @@ class TruceAUAudioUnit: AUAudioUnit {
             }
         }
 
-        guard truceAbiTailVersion(cb) >= 6,
+        guard truceAbiTailVersion(cb) >= 7,
               let processNative = cb.pointee.process_native,
               let beginOutput = cb.pointee.begin_output_events,
               let nextOutput = cb.pointee.next_output_event else {
             return kAudio_ParamError
         }
-        processNative(ctx, inPtrs, outPtrs, actualIn + UInt32(scActual), actualOut,
-                      frameCount, nativeBuf, numNative, nativeOverflow,
-                      paramBuf, numParam, paramOverflow, transportBuf)
+        if nativeOverflow != 0 || paramOverflow != 0 {
+            return kAudioUnitErr_MIDIOutputBufferFull
+        }
+        let processResult = processNative(
+            ctx, inPtrs, outPtrs, actualIn + UInt32(scActual), actualOut,
+            frameCount, nativeBuf, numNative, nativeOverflow,
+            paramBuf, numParam, paramOverflow, transportBuf)
+        if processResult == UInt32(AU_PROCESS_INVALID) { return kAudio_ParamError }
+        if processResult == UInt32(AU_PROCESS_QUEUE_FULL) {
+            return kAudioUnitErr_MIDIOutputBufferFull
+        }
+        guard processResult == UInt32(AU_PROCESS_OK) else { return kAudio_ParamError }
 
         var carrierMask: UInt32 = midiOutputBlock == nil ? 0 : UInt32(AU_NATIVE_CARRIER_BYTES)
         if #available(macOS 12.0, iOS 15.0, *), midiOutputListBlock != nil {
             carrierMask |= UInt32(AU_NATIVE_CARRIER_UMP)
         }
-        beginOutput(ctx, carrierMask, frameCount)
+        beginOutput(ctx, carrierMask, frameCount, midiOutputProtocol)
         while true {
             var out = AuNativeEvent()
             let result = nextOutput(ctx, &out)
@@ -769,6 +794,12 @@ class TruceAUAudioUnit: AUAudioUnit {
                     return kAudio_ParamError
                 }
                 guard out.data_len > 0, out.data_len <= 4 else {
+                    return kAudio_ParamError
+                }
+                let messageType = UInt8((out.words.0 >> 28) & 0xF)
+                guard Int(out.data_len) == umpPacketLength(messageType: messageType),
+                      UInt32(out.protocol) == midiOutputProtocol,
+                      umpProtocolAccepts(out.protocol, messageType) else {
                     return kAudio_ParamError
                 }
                 var list = MIDIEventList()
@@ -861,10 +892,13 @@ class TruceAUAudioUnit: AUAudioUnit {
         // deployment target can stay below macOS 12 / iOS 15. `render`
         // casts it back under an availability check.
         let midiOutputListBlock: Any?
+        let midiOutputProtocol: UInt32
         if #available(macOS 12.0, iOS 15.0, *) {
             midiOutputListBlock = self.midiOutputEventListBlock
+            midiOutputProtocol = UInt32(exactly: self.hostMIDIProtocol.rawValue) ?? 0
         } else {
             midiOutputListBlock = nil
+            midiOutputProtocol = 0
         }
         return { _, timestamp, frameCount, _, outputData, events, pull in
             return TruceAUAudioUnit.render(
@@ -881,7 +915,8 @@ class TruceAUAudioUnit: AUAudioUnit {
                 musicalContext: musicalContext,
                 transportState: transportState,
                 midiOutputBlock: midiOutputBlock,
-                midiOutputListBlock: midiOutputListBlock)
+                midiOutputListBlock: midiOutputListBlock,
+                midiOutputProtocol: midiOutputProtocol)
         }
     }
 

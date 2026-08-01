@@ -105,8 +105,10 @@ pub struct AuParamDescriptor {
 /// v2: `output_ump_count` / `output_ump_at` gained the `protocol`
 /// argument. v3: appended `latency_samples` / `tail_samples`. v4:
 /// appended `set_render_mode`. v5: appended `param_parse_value`. v6:
-/// appended the strict native event process and sequential output lane.
-pub const TRUCE_AU_ABI_VERSION: u32 = 0x5441_7506;
+/// appended the strict native event process and sequential output lane. v7:
+/// native process returns status and output negotiation carries the host's
+/// UMP protocol.
+pub const TRUCE_AU_ABI_VERSION: u32 = 0x5441_7507;
 
 /// Callbacks from the `ObjC` shim into Rust.
 #[repr(C)]
@@ -315,9 +317,13 @@ pub struct AuCallbacks {
         num_param_events: u32,
         param_overflow: u32,
         transport: *const AuTransportSnapshot,
+    ) -> u32,
+    pub begin_output_events: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        carrier_mask: u32,
+        num_frames: u32,
+        ump_protocol: u32,
     ),
-    pub begin_output_events:
-        unsafe extern "C" fn(ctx: *mut c_void, carrier_mask: u32, num_frames: u32),
     pub next_output_event: unsafe extern "C" fn(ctx: *mut c_void, out: *mut AuNativeEvent) -> u32,
     pub push_sysex_input_native: unsafe extern "C" fn(
         ctx: *mut c_void,
@@ -400,6 +406,10 @@ pub const AU_OUTPUT_EMITTED: u32 = 1;
 pub const AU_OUTPUT_UNSUPPORTED: u32 = 2;
 pub const AU_OUTPUT_INVALID: u32 = 3;
 pub const AU_OUTPUT_QUEUE_FULL: u32 = 4;
+
+pub const AU_PROCESS_OK: u32 = 0;
+pub const AU_PROCESS_INVALID: u32 = 1;
+pub const AU_PROCESS_QUEUE_FULL: u32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
