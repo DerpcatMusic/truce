@@ -466,6 +466,7 @@ class TruceAUAudioUnit: AUAudioUnit {
         outPtrs: UnsafeMutablePointer<UnsafeMutablePointer<Float>?>,
         nativeBuf: UnsafeMutablePointer<AuNativeEvent>,
         scCh: Int,
+        sidechainEnabled: Bool,
         scScratch: UnsafeMutablePointer<Float>?,
         scABL: UnsafeMutableAudioBufferListPointer?,
         scMaxFrames: Int,
@@ -635,20 +636,23 @@ class TruceAUAudioUnit: AUAudioUnit {
             outPtrs[c] = abl[c].mData?.assumingMemoryBound(to: Float.self)
         }
 
-        // Pull the sidechain input (bus 1) into scratch and append its
-        // channels after the main input, so the flat array is
-        // [main..., sidechain...]. An unconnected sidechain reads silence.
+        // Pull the sidechain input (bus 1) only after the host enables it,
+        // then append its fixed-width channels so the flat array stays
+        // [main..., sidechain...]. A disabled or failed pull reads silence.
         var scActual = 0
-        if scCh > 0, let pull = pull, let scScratch = scScratch, let scABL = scABL {
+        if scCh > 0, let scScratch = scScratch, let scABL = scABL {
             for c in 0..<scCh {
                 scABL[c] = AudioBuffer(
                     mNumberChannels: 1,
                     mDataByteSize: frameCount * UInt32(MemoryLayout<Float>.size),
                     mData: UnsafeMutableRawPointer(scScratch.advanced(by: c * scMaxFrames)))
             }
-            var f = AudioUnitRenderActionFlags()
-            let s = pull(&f, timestamp, frameCount, 1, scABL.unsafeMutablePointer)
-            if s != noErr {
+            var pulled = false
+            if sidechainEnabled, let pull = pull {
+                var f = AudioUnitRenderActionFlags()
+                pulled = pull(&f, timestamp, frameCount, 1, scABL.unsafeMutablePointer) == noErr
+            }
+            if !pulled {
                 for c in 0..<scCh {
                     memset(scScratch.advanced(by: c * scMaxFrames), 0,
                            Int(frameCount) * MemoryLayout<Float>.size)
@@ -859,6 +863,10 @@ class TruceAUAudioUnit: AUAudioUnit {
         // scratch to pull into and append after the main channels. Sized
         // once to the render-graph's max frame count.
         let scCh = Int(g_descriptor?.pointee.sidechain_in_channels ?? 0)
+        // AUAudioUnitBus.isEnabled is the format's connection/activation
+        // contract. Snapshot it while the host builds the render graph; the
+        // realtime block must not query Objective-C state.
+        let sidechainEnabled = _inputBusArray.count > 1 && _inputBusArray[1].isEnabled
         // Size to the authoritative max captured in allocateRenderResources
         // (`_maxFrames`), not `maximumFramesToRender` sampled now: the host
         // may have finalized the max after a smaller default, and this
@@ -908,7 +916,8 @@ class TruceAUAudioUnit: AUAudioUnit {
                 timestamp: timestamp, frameCount: frameCount,
                 outputData: outputData, events: events, pull: pull,
                 inPtrs: inPtrs, outPtrs: outPtrs, nativeBuf: nativeBuf,
-                scCh: scCh, scScratch: scScratch, scABL: scABL, scMaxFrames: scMaxFrames,
+                scCh: scCh, sidechainEnabled: sidechainEnabled,
+                scScratch: scScratch, scABL: scABL, scMaxFrames: scMaxFrames,
                 mainInScratch: mainInScratch, mainInABL: mainInABL,
                 paramBuf: paramBuf,
                 transportBuf: transportBuf,

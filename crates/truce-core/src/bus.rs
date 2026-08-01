@@ -138,8 +138,9 @@ impl BusLayout {
     }
 
     /// Append a structurally stable sidechain which a dynamic bus layout may
-    /// omit. This keeps VST3 bus count/kind/width immutable while CLAP can
-    /// expose only the ports enabled by its selected configuration.
+    /// omit. CLAP exposes it only in enabled configurations; fixed-topology
+    /// VST3, AU, and AAX adapters keep the declaration but feed silence until
+    /// the host activates/connects it. LV2 currently exposes main I/O only.
     #[must_use]
     pub fn with_optional_sidechain_input(
         mut self,

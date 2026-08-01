@@ -237,6 +237,24 @@ unsafe impl<P: PluginExport> Send for Lv2Instance<P> {}
 // LV2 lifecycle callbacks
 // ---------------------------------------------------------------------------
 
+/// One-shot warning that a plugin's structural sidechain input is unavailable
+/// in LV2. Fires once per process so a default-disabled optional bus is not
+/// silently presented as supported just because it contributes no enabled
+/// channels to the default layout.
+fn warn_lv2_sidechain_dropped_once(channels: u32) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "[truce LV2] sidechain input ({channels} ch) unavailable: the LV2 \
+             TTL is generated from the plugin category and can't declare the \
+             sidechain ports yet. LV2 has no bus-activation callback; only \
+             ports declared lv2:connectionOptional may be left unconnected, \
+             so the plugin runs main-only rather than faking activation."
+        );
+    });
+}
+
 /// Build a `PortLayout` from a plugin instance's declared bus layout + params.
 ///
 /// Caller passes in `&P` so the layout extraction reuses the existing
@@ -250,22 +268,6 @@ unsafe impl<P: PluginExport> Send for Lv2Instance<P> {}
 /// The FFI entry points (`instantiate`, `instantiate_ui`) treat `None`
 /// as a graceful instantiation failure (log + null) rather than
 /// panicking across the host boundary.
-/// One-shot warning that a plugin's sidechain input is unavailable in
-/// LV2. Fires once per process on the first instantiation of a sidechain
-/// plugin so the author sees why the extra input is missing without the
-/// message repeating per instance.
-fn warn_lv2_sidechain_dropped_once(channels: u32) {
-    use std::sync::Once;
-    static WARNED: Once = Once::new();
-    WARNED.call_once(|| {
-        eprintln!(
-            "[truce LV2] sidechain input ({channels} ch) unavailable: the LV2 \
-             TTL is generated from the plugin category and can't declare the \
-             sidechain ports yet, so the plugin runs main-only in LV2 hosts."
-        );
-    });
-}
-
 pub fn derive_port_layout<P: PluginExport>(plugin: &P) -> Option<PortLayout> {
     // LV2 ports are fixed in the TTL and can't be reconfigured at runtime,
     // so a multi-layout plugin exposes only its first (default) layout.
@@ -288,10 +290,15 @@ pub fn derive_port_layout<P: PluginExport>(plugin: &P) -> Option<PortLayout> {
     let main_in: u32 = default_layout
         .inputs
         .iter()
-        .filter(|b| b.kind == BusKind::Main)
+        .filter(|b| b.enabled && b.kind == BusKind::Main)
         .map(|b| b.channels.channel_count())
         .sum();
-    let dropped_sidechain = default_layout.total_input_channels() - main_in;
+    let dropped_sidechain: u32 = default_layout
+        .inputs
+        .iter()
+        .filter(|b| b.kind == BusKind::Sidechain)
+        .map(|b| b.channels.channel_count())
+        .sum();
     if dropped_sidechain > 0 {
         warn_lv2_sidechain_dropped_once(dropped_sidechain);
     }

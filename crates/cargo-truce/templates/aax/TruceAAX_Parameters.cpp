@@ -378,12 +378,11 @@ void TruceAAX_Parameters::RenderAudio(
     // plugin sees flat channel indexing (main then sidechain). Pro Tools
     // side-chain is always mono; duplicate it across the plugin's declared
     // sidechain width so a stereo-sidechain plugin gets it on both
-    // channels. `*mSideChainP` is 0 when no side-chain source is patched -
-    // the plugin still negotiated the wider layout, so feed block-sized
-    // silence for the declared sidechain width rather than leaving numIn
-    // short (reading an absent sidechain channel is an out-of-range panic
-    // in the Rust bridge). The `!mSilence.empty()` guard keeps a null out
-    // of `inputs` if EffectInit never sized the buffer.
+    // channels. AddSideChainIn's per-block channel index is AAX's only
+    // realtime activation signal: 0 means no source is patched. Keep the
+    // declared topology stable, but feed silence until the host supplies a
+    // positive index. The `!mSilence.empty()` guard keeps a null out of
+    // `inputs` if EffectInit never sized the buffer.
     if (g_descriptor.sidechain_in_channels > 0 && !mSilence.empty()) {
         auto* extInfo = reinterpret_cast<TruceAaxExtendedRenderInfo*>(ioRenderInfo);
         const float* scBuf = nullptr;

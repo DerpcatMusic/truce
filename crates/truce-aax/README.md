@@ -23,6 +23,11 @@ wrapping, and codesigning) is driven by `cargo truce build --aax` /
 - Custom native NSView rendering on macOS (avoids Pro Tools autorelease pool
   crashes that occur with standard compositor-based approaches)
 
+AAX exposes one mono sidechain port. Truce preserves the plugin's declared
+sidechain width, duplicates the host's mono source across it when Pro Tools
+patches the port, and otherwise supplies silence. AAX has no general per-bus
+activation API or independently routable multi-channel sidechain.
+
 ## Architecture
 
 The pre-built AAX template binary implements the real AAX SDK interfaces and

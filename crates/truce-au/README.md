@@ -24,6 +24,11 @@ an `au` Cargo feature.
 - GUI view hosting via `NSViewController` (v2) / `AUViewController` (v3)
 - Effects (`aufx`), instruments (`aumu`), and MIDI processors (`aumi`)
 
+Optional sidechains keep a fixed AU input element. AU v2 treats a render
+callback/connection as active; AU v3 uses `AUAudioUnitBus.isEnabled`. Until the
+host connects/enables that element, the plugin receives silence for its
+declared channels and no sidechain pull is performed.
+
 ## Architecture
 
 - **v2** uses a hand-written C shim (`shim/au_v2_shim.c`) that exposes an
