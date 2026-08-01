@@ -1292,7 +1292,10 @@ pub unsafe fn _process_native<P: PluginExport>(
                 }
             }
             audio.event_list.clear();
+            audio.event_list.clear_overflow();
             audio.output_events.clear();
+            audio.output_events.clear_overflow();
+            audio.sub_event_scratch.clear_overflow();
             event_status = TRUCE_AAX_EVENT_INVALID;
             return;
         }
@@ -1331,6 +1334,8 @@ pub unsafe fn _process_native<P: PluginExport>(
         // Ingest one all-or-nothing native event transaction. A C++-side
         // overflow/validation failure deliberately delivers no prefix.
         scr.event_list.clear();
+        scr.event_list.clear_overflow();
+        scr.sub_event_scratch.clear_overflow();
         if event_status == TRUCE_AAX_EVENT_END && num_events > 0 && events.is_null() {
             event_status = TRUCE_AAX_EVENT_INVALID;
         }
@@ -1390,6 +1395,7 @@ pub unsafe fn _process_native<P: PluginExport>(
                 TransportInfo::default()
             };
             scr.output_events.clear();
+            scr.output_events.clear_overflow();
             inst.transport_slot.write(&transport);
 
             let mut transport_snap = transport;
@@ -1546,7 +1552,9 @@ fn encode_native_output(
                 return NativeEncodeResult::Invalid;
             }
             if let EventBody::SysEx { .. } = event.body {
-                let bytes = list.sysex_bytes(&event.body);
+                let Some(bytes) = list.sysex_bytes_checked(&event.body) else {
+                    return NativeEncodeResult::Invalid;
+                };
                 if bytes.iter().any(|byte| byte & 0x80 != 0) {
                     return NativeEncodeResult::Invalid;
                 }

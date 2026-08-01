@@ -152,7 +152,6 @@ AAX_Result TruceAAX_Parameters::EffectInit() {
     Controller()->GetSampleRate(&sr);
     mMaxBlockSize = 8192;
     g_bridge.reset(mRustCtx, (double)sr, mMaxBlockSize);
-    mSampleRate = (double)sr;
     // Silence for unpatched/missing input channels (see mSilence).
     mSilence.assign(mMaxBlockSize, 0.0f);
     mNativeEvents.reserve(TRUCE_AAX_NATIVE_EVENT_CAP);
@@ -336,17 +335,17 @@ void TruceAAX_Parameters::RenderAudio(
     // Get audio buffers
     int32_t bufferSize = *ioRenderInfo->mNumSamples;
 
-    // Defensive: if the host violates the 8192-sample cap declared
-    // in EffectInit, re-reset the plugin so its internal scratch
-    // can fit the new block. This will glitch the audio - but a
-    // glitch is recoverable; reading past the end of an allocated
-    // buffer is not.
+    // A host block beyond the declared cap cannot be made safe by resetting
+    // here: reset and scratch growth allocate on the audio thread. Fail closed
+    // with silence; a compliant host never takes this path.
     if (bufferSize > 0 && (uint32_t)bufferSize > mMaxBlockSize) {
-        mMaxBlockSize = (uint32_t)bufferSize;
-        g_bridge.reset(mRustCtx, mSampleRate, mMaxBlockSize);
-        // Keep the silence buffer block-sized (the host already broke its
-        // own cap, so this one-off reallocation rides with the reset).
-        mSilence.assign(mMaxBlockSize, 0.0f);
+        if (ioRenderInfo->mAudioOutputs) {
+            for (uint32_t ch = 0; ch < mNumOutputChannels; ch++) {
+                float* output = ioRenderInfo->mAudioOutputs[ch];
+                if (output) std::memset(output, 0, (size_t)bufferSize * sizeof(float));
+            }
+        }
+        return;
     }
 
     // Build channel pointers. This instance's channel count comes from
