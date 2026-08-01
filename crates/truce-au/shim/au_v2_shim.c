@@ -35,6 +35,7 @@ typedef struct {
     AudioComponentPlugInInterface interface; // MUST be first
     AudioComponentInstance componentInstance;
     void *rustCtx;
+    Boolean paramFeedbackAvailable;
 
     AudioStreamBasicDescription inputFormat;
     AudioStreamBasicDescription outputFormat;
@@ -230,14 +231,15 @@ static void notify_listeners(TruceAUv2 *inst, AudioUnitPropertyID prop,
 static void *g_au_ctx_keys[kMaxAUInstances] = {0};
 static TruceAUv2 *g_au_ctx_vals[kMaxAUInstances] = {0};
 
-static void au_ctx_map_register(void *ctx, TruceAUv2 *inst) {
+static bool au_ctx_map_register(void *ctx, TruceAUv2 *inst) {
     for (int i = 0; i < kMaxAUInstances; i++) {
         if (!g_au_ctx_keys[i]) {
             g_au_ctx_keys[i] = ctx;
             g_au_ctx_vals[i] = inst;
-            return;
+            return true;
         }
     }
+    return false;
 }
 
 static void au_ctx_map_unregister(void *ctx) {
@@ -380,7 +382,7 @@ static OSStatus au_v2_open(void *self_, AudioComponentInstance instance) {
     if (!g_callbacks) return kAudioUnitErr_FailedInitialization;
     inst->rustCtx = g_callbacks->create();
     if (!inst->rustCtx) return kAudioUnitErr_FailedInitialization;
-    au_ctx_map_register(inst->rustCtx, inst);
+    inst->paramFeedbackAvailable = au_ctx_map_register(inst->rustCtx, inst);
 
     inst->sampleRate = 44100.0;
     inst->maxFramesPerSlice = 1024;
@@ -406,9 +408,14 @@ static OSStatus au_v2_open(void *self_, AudioComponentInstance instance) {
 static OSStatus au_v2_close(void *self_) {
     TruceAUv2 *inst = (TruceAUv2 *)self_;
     if (inst->rustCtx && g_callbacks) {
-        au_ctx_map_unregister(inst->rustCtx);
-        g_callbacks->destroy(inst->rustCtx);
+        void *ctx = inst->rustCtx;
+        // Destroy joins the Rust notifier and flushes its queue. Keep the map
+        // live until that join completes so accepted feedback cannot vanish
+        // during teardown.
+        g_callbacks->destroy(ctx);
+        au_ctx_map_unregister(ctx);
         inst->rustCtx = NULL;
+        inst->paramFeedbackAvailable = false;
     }
     for (int c = 0; c < 32; c++) {
         free(inst->outputBuffers[c]);
@@ -1911,6 +1918,8 @@ static OSStatus au_v2_render(void *self_,
     inst->midiOverflow = 0;
     inst->paramEventCount = 0;
     inst->paramOverflow = 0;
+    if (processStatus != AU_PROCESS_OK && g_callbacks->finish_output_events)
+        g_callbacks->finish_output_events(inst->rustCtx, AU_OUTPUT_INVALID);
     if (processStatus == AU_PROCESS_QUEUE_FULL)
         return kAudioUnitErr_MIDIOutputBufferFull;
     if (processStatus != AU_PROCESS_OK)
@@ -1931,10 +1940,11 @@ static OSStatus au_v2_render(void *self_,
         uint32_t carriers = 0;
         if (inst->midiOutputCallback) carriers |= AU_NATIVE_CARRIER_BYTES;
         if (inst->midiOutputEventListBlock) carriers |= AU_NATIVE_CARRIER_UMP;
-        g_callbacks->begin_output_events_v9(
+        g_callbacks->begin_output_events_v10(
             inst->rustCtx, carriers, inFrameCount,
             (uint32_t)inst->hostMIDIProtocol, UINT32_MAX,
-            umpTimeValid ? 1u : 0u);
+            umpTimeValid ? 1u : 0u,
+            inst->paramFeedbackAvailable ? 1u : 0u);
         for (;;) {
             AuNativeEvent ev = {0};
             uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
@@ -2027,10 +2037,11 @@ static OSStatus au_v2_render(void *self_,
     } else {
         /* Probe the Rust lane so a plugin that emitted events without a host
          * receiver observes queue unavailability on its next block. */
-        g_callbacks->begin_output_events_v9(
+        g_callbacks->begin_output_events_v10(
             inst->rustCtx, 0, inFrameCount,
             (uint32_t)inst->hostMIDIProtocol, UINT32_MAX,
-            umpTimeValid ? 1u : 0u);
+            umpTimeValid ? 1u : 0u,
+            inst->paramFeedbackAvailable ? 1u : 0u);
         AuNativeEvent ev = {0};
         uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
         if (status == AU_OUTPUT_INVALID)

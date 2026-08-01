@@ -388,6 +388,7 @@ struct AuAudio<P: PluginExport> {
     native_output_ump_protocol: u8,
     native_output_max_absolute_offset: u32,
     native_output_ump_time_valid: bool,
+    native_output_param_feedback_available: bool,
     native_output_status: u32,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     sub_event_scratch: EventList,
@@ -503,6 +504,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     native_output_ump_protocol: 0,
                     native_output_max_absolute_offset: u32::MAX,
                     native_output_ump_time_valid: true,
+                    native_output_param_feedback_available: false,
                     native_output_status: AU_OUTPUT_END,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sysex_assembler: SysExAssembler::with_capacity(SYSEX_POOL_PREALLOC),
@@ -968,6 +970,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
             // leaving these would re-deliver the previous block's
             // MIDI/SysEx (duplicated note-ons, stuck notes).
             audio.output_events.clear();
+            audio.output_events.clear_overflow();
             audio.ump_drain_cursor = UmpDrainCursor::HEAD;
             // Not prepared: discard any host-queued `SysEx`, recycling the
             // buffers so the queue can't accumulate stale messages.
@@ -976,6 +979,14 @@ unsafe fn cb_process_impl<P: PluginExport>(
             }
             return;
         }
+
+        // Start the output transaction before any author-controlled state or
+        // DSP can panic. `clear` preserves the preceding delivery status for
+        // this block to inspect; clearing the old overflow ensures a failed
+        // current block cannot inherit an earlier block's staging failure.
+        audio.output_events.clear();
+        audio.output_events.clear_overflow();
+        audio.ump_drain_cursor = UmpDrainCursor::HEAD;
 
         // Take ownership of the plugin for the whole block: an
         // uncontended `Acquire`, never a wait, since the host contract
@@ -1189,9 +1200,6 @@ unsafe fn cb_process_impl<P: PluginExport>(
         } else {
             TransportInfo::default()
         };
-        scr.output_events.clear();
-        scr.output_events.clear_overflow();
-        scr.ump_drain_cursor = UmpDrainCursor::HEAD;
         inst.transport_slot.write(&transport);
 
         let mut transport_snap = transport;
@@ -2395,6 +2403,7 @@ fn encode_native_output_checked<P: PluginExport>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn begin_output_events<P: PluginExport>(
     inst: &AuInstance<P>,
     audio: &mut AuAudio<P>,
@@ -2403,6 +2412,7 @@ fn begin_output_events<P: PluginExport>(
     ump_protocol: u32,
     max_absolute_offset: u32,
     ump_time_valid: u32,
+    param_feedback_available: u32,
 ) {
     audio.native_output_cursor = LosslessEventCursor::default();
     audio.native_output_carriers = carrier_mask & (AU_NATIVE_CARRIER_BYTES | AU_NATIVE_CARRIER_UMP);
@@ -2410,6 +2420,7 @@ fn begin_output_events<P: PluginExport>(
     audio.native_output_ump_protocol = u8::try_from(ump_protocol).unwrap_or(0);
     audio.native_output_max_absolute_offset = max_absolute_offset;
     audio.native_output_ump_time_valid = ump_time_valid != 0;
+    audio.native_output_param_feedback_available = param_feedback_available != 0;
     if audio.output_events.overflow().is_some() {
         audio.native_output_status = AU_OUTPUT_QUEUE_FULL;
         return;
@@ -2435,7 +2446,7 @@ fn begin_output_events<P: PluginExport>(
                 if !f32::from_f64(*value).is_finite() {
                     return Some(AU_OUTPUT_INVALID);
                 }
-                if inst.param_notify.is_none() {
+                if !audio.native_output_param_feedback_available || inst.param_notify.is_none() {
                     return Some(AU_OUTPUT_UNSUPPORTED);
                 }
                 param_count += 1;
@@ -2491,6 +2502,7 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
             ump_protocol,
             u32::MAX,
             1,
+            0,
         );
     }
 }
@@ -2514,6 +2526,32 @@ unsafe extern "C" fn cb_begin_output_events_v9<P: PluginExport>(
             ump_protocol,
             max_absolute_offset,
             ump_time_valid,
+            0,
+        );
+    }
+}
+
+unsafe extern "C" fn cb_begin_output_events_v10<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    carrier_mask: u32,
+    num_frames: u32,
+    ump_protocol: u32,
+    max_absolute_offset: u32,
+    ump_time_valid: u32,
+    param_feedback_available: u32,
+) {
+    unsafe {
+        let inst = &*ctx.cast::<AuInstance<P>>();
+        let mut audio = inst.audio.enter();
+        begin_output_events(
+            inst,
+            &mut audio,
+            carrier_mask,
+            num_frames,
+            ump_protocol,
+            max_absolute_offset,
+            ump_time_valid,
+            param_feedback_available,
         );
     }
 }
@@ -2574,6 +2612,19 @@ unsafe extern "C" fn cb_commit_output_params<P: PluginExport>(ctx: *mut std::ffi
         let audio = inst.audio.enter();
         if audio.output_events.overflow().is_some() {
             return AU_OUTPUT_QUEUE_FULL;
+        }
+        if !audio.native_output_param_feedback_available
+            && audio.output_events.lossless_iter().any(|event| {
+                matches!(
+                    event,
+                    LosslessEventRef::Typed(Event {
+                        body: EventBody::ParamChange { .. },
+                        ..
+                    })
+                )
+            })
+        {
+            return AU_OUTPUT_UNSUPPORTED;
         }
 
         #[cfg(target_os = "macos")]
@@ -3274,6 +3325,7 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         finish_output_events: cb_finish_output_events::<P>,
         begin_output_events_v9: cb_begin_output_events_v9::<P>,
         commit_output_params: cb_commit_output_params::<P>,
+        begin_output_events_v10: cb_begin_output_events_v10::<P>,
     }));
 
     let param_descs = param_descs.leak();

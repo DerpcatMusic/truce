@@ -720,9 +720,9 @@ class TruceAUAudioUnit: AUAudioUnit {
             }
         }
 
-        guard truceAbiTailVersion(cb) >= 9,
+        guard truceAbiTailVersion(cb) >= 10,
               let processNative = cb.pointee.process_native,
-              let beginOutput = cb.pointee.begin_output_events_v9,
+              let beginOutput = cb.pointee.begin_output_events_v10,
               let nextOutput = cb.pointee.next_output_event,
               let finishOutput = cb.pointee.finish_output_events,
               let commitOutputParams = cb.pointee.commit_output_params else {
@@ -735,11 +735,13 @@ class TruceAUAudioUnit: AUAudioUnit {
             ctx, inPtrs, outPtrs, actualIn + UInt32(scActual), actualOut,
             frameCount, nativeBuf, numNative, nativeOverflow,
             paramBuf, numParam, paramOverflow, transportBuf)
-        if processResult == UInt32(AU_PROCESS_INVALID) { return kAudio_ParamError }
-        if processResult == UInt32(AU_PROCESS_QUEUE_FULL) {
-            return kAudioUnitErr_MIDIOutputBufferFull
+        if processResult != UInt32(AU_PROCESS_OK) {
+            finishOutput(ctx, UInt32(AU_OUTPUT_INVALID))
+            if processResult == UInt32(AU_PROCESS_QUEUE_FULL) {
+                return kAudioUnitErr_MIDIOutputBufferFull
+            }
+            return kAudio_ParamError
         }
-        guard processResult == UInt32(AU_PROCESS_OK) else { return kAudio_ParamError }
 
         var outputStatus = UInt32(AU_OUTPUT_EMITTED)
         defer { finishOutput(ctx, outputStatus) }
@@ -749,7 +751,7 @@ class TruceAUAudioUnit: AUAudioUnit {
             carrierMask |= UInt32(AU_NATIVE_CARRIER_UMP)
         }
         beginOutput(ctx, carrierMask, frameCount, midiOutputProtocol,
-                    maxAbsoluteOffset, 1)
+                    maxAbsoluteOffset, 1, 0)
         while true {
             var out = AuNativeEvent()
             let result = nextOutput(ctx, &out)

@@ -49,9 +49,10 @@
 // v8: appended final output-delivery status publication.
 // v9: appended wrapper-time output preflight and transactional parameter
 // feedback publication.
+// v10: appended explicit parameter-feedback carrier negotiation.
 #define TRUCE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define TRUCE_AU_ABI_MAGIC 0x54417500u
-#define TRUCE_AU_ABI_VERSION 0x54417509u
+#define TRUCE_AU_ABI_VERSION 0x5441750Au
 
 typedef struct {
     uint8_t component_type[4];
@@ -418,6 +419,11 @@ typedef struct {
                                    uint32_t max_absolute_offset,
                                    uint32_t ump_time_valid);
     uint32_t (*commit_output_params)(void *ctx);
+    void (*begin_output_events_v10)(void *ctx, uint32_t carrier_mask,
+                                    uint32_t num_frames, uint32_t ump_protocol,
+                                    uint32_t max_absolute_offset,
+                                    uint32_t ump_time_valid,
+                                    uint32_t param_feedback_available);
 } AuCallbacks;
 
 // Globals shared between v2 and v3 shims.
