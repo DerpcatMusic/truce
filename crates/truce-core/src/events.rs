@@ -841,6 +841,28 @@ pub enum PushError {
     PoolFull,
 }
 
+/// Result of the previous attempt to deliver a plugin's output events to the
+/// host. [`EventList::clear`] preserves this value, so `process()` can inspect
+/// the preceding block before emitting the current one.
+///
+/// Staging failures remain available through [`EventList::overflow`]; keeping
+/// them separate distinguishes framework storage exhaustion from a host queue
+/// refusing an otherwise valid event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputEventStatus {
+    /// Every supported, valid event reached the host.
+    #[default]
+    Success,
+    /// The bounded [`EventList`] could not retain the complete block.
+    BufferFull(PushError),
+    /// The host's output queue or buffer refused an event.
+    HostQueueFull,
+    /// The active plugin format cannot represent an emitted event.
+    Unsupported,
+    /// An emitted event was malformed or outside the current block/port range.
+    Invalid,
+}
+
 impl core::fmt::Display for PushError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -873,6 +895,7 @@ pub struct EventList {
     exact_order: Vec<usize>,
     sysex_pool: Vec<u8>,
     overflow: Option<PushError>,
+    output_status: OutputEventStatus,
     token_owner: u64,
     next_sequence: u64,
 }
@@ -923,6 +946,7 @@ impl Clone for EventList {
             exact_order: clone_vec_preserving_capacity(&self.exact_order),
             sysex_pool: clone_vec_preserving_capacity(&self.sysex_pool),
             overflow: self.overflow,
+            output_status: self.output_status,
             token_owner,
             next_sequence: self.next_sequence,
         }
@@ -963,6 +987,7 @@ impl EventList {
             exact_order: Vec::with_capacity(capacity),
             sysex_pool: Vec::with_capacity(SYSEX_POOL_PREALLOC),
             overflow: None,
+            output_status: OutputEventStatus::Success,
             token_owner: allocate_event_list_owner(),
             next_sequence: 0,
         }
@@ -1582,6 +1607,19 @@ impl EventList {
 
     pub fn clear_overflow(&mut self) {
         self.overflow = None;
+    }
+
+    /// Delivery result for the preceding completed output block.
+    #[must_use]
+    pub fn output_status(&self) -> OutputEventStatus {
+        self.output_status
+    }
+
+    /// Publish the completed host-delivery result. Format adapters call this
+    /// after draining the list; plugin code reads it on the next block.
+    #[doc(hidden)]
+    pub fn set_output_status(&mut self, status: OutputEventStatus) {
+        self.output_status = status;
     }
 
     /// Add `shift` to typed and exact timestamps appended at or after the

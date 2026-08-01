@@ -479,6 +479,7 @@ struct Vst3Callbacks {
     void (*begin_output_events)(void*);
     uint32_t (*next_output_event)(void*, Vst3NativeEvent*);
     void (*commit_output_event)(void*);
+    void (*finish_output_events)(void*, uint32_t);
     // GUI
     int32_t (*gui_has_editor)(void*);
     void (*gui_get_size)(void*, uint32_t*, uint32_t*);
@@ -1650,11 +1651,20 @@ public:
                           transportPtr, paramChanges, numParamChanges,
                           data->processMode);
 
+        enum OutputEventResult : uint32_t {
+            kOutputEnd = 0,
+            kOutputEmitted = 1,
+            kOutputUnsupported = 2,
+            kOutputInvalid = 3,
+            kOutputQueueFull = 4,
+        };
+        OutputEventResult drainResult = kOutputEnd;
+
         // Drain exactly one globally ordered lossless stream. Rust validates
         // each event and proposes note-ID lifecycle changes; those changes are
         // committed only after the host accepts the corresponding SDK event.
-        if (data->outputEvents && g_cb->begin_output_events
-                && g_cb->next_output_event && g_cb->commit_output_event) {
+        if (g_cb->begin_output_events && g_cb->next_output_event
+                && g_cb->commit_output_event) {
             struct OEVtbl {
                 tresult (*qi)(void*, const TUID, void**);
                 uint32 (*addRef)(void*);
@@ -1663,27 +1673,26 @@ public:
                 tresult (*getEvent)(void*, int32, void*);
                 tresult (*addEvent)(void*, void*);
             };
-            struct { OEVtbl* vtbl; } *eventList =
-                (decltype(eventList))data->outputEvents;
-            enum OutputEventResult : uint32_t {
-                kOutputEnd = 0,
-                kOutputEmitted = 1,
-                kOutputUnsupported = 2,
-                kOutputInvalid = 3,
-                kOutputQueueFull = 4,
-            };
+            struct { OEVtbl* vtbl; } *eventList = data->outputEvents
+                ? (decltype(eventList))data->outputEvents : nullptr;
 
             g_cb->begin_output_events(ctx);
-            OutputEventResult drainResult = kOutputEnd;
             for (;;) {
                 Vst3NativeEvent native = {};
                 const uint32_t next = g_cb->next_output_event(ctx, &native);
                 if (next == kOutputEnd)
                     break;
-                if (next == kOutputUnsupported || next == kOutputInvalid)
-                    continue;
+                if (next == kOutputUnsupported || next == kOutputInvalid) {
+                    drainResult = (OutputEventResult)next;
+                    break;
+                }
                 if (next != kOutputEmitted) {
-                    drainResult = kOutputInvalid;
+                    drainResult = next == kOutputQueueFull
+                        ? kOutputQueueFull : kOutputInvalid;
+                    break;
+                }
+                if (!eventList) {
+                    drainResult = kOutputUnsupported;
                     break;
                 }
 
@@ -1732,17 +1741,20 @@ public:
                         ev.midiCCOut.value2 = (int8_t)native.data2;
                         break;
                     default:
-                        continue;
+                        drainResult = kOutputInvalid;
+                        break;
                 }
+                if (drainResult == kOutputInvalid)
+                    break;
 
                 if (eventList->vtbl->addEvent(data->outputEvents, &ev) != kResultOk) {
                     drainResult = kOutputQueueFull;
                     break;
                 }
                 g_cb->commit_output_event(ctx);
-                drainResult = kOutputEmitted;
+                if (drainResult == kOutputEnd)
+                    drainResult = kOutputEmitted;
             }
-            (void)drainResult;
         }
 
         // Forward process-emitted parameter changes to the host's
@@ -1750,9 +1762,13 @@ public:
         // controller so the UI / automation reflect values the plugin
         // changed during processing (e.g. an envelope follower). The
         // Rust side already normalized each value to [0,1].
-        if (data->outputParameterChanges && g_cb->get_output_param_count) {
+        if (g_cb->get_output_param_count
+                && (drainResult == kOutputEnd || drainResult == kOutputEmitted)) {
             uint32_t pcount = g_cb->get_output_param_count(ctx);
             if (pcount > 0) {
+                if (!data->outputParameterChanges) {
+                    drainResult = kOutputUnsupported;
+                } else {
                 struct IPCVtbl {
                     tresult (*qi)(void*, const TUID, void**);
                     uint32 (*addRef)(void*);
@@ -1780,14 +1796,24 @@ public:
                     int32 qidx = 0;
                     void* queue = changes->vtbl->addParameterData(
                         data->outputParameterChanges, &pid, &qidx);
-                    if (queue) {
-                        IQVtbl* qv = *(IQVtbl**)queue;
-                        int32 pidx = 0;
-                        qv->addPoint(queue, soff, val, &pidx);
+                    if (!queue) {
+                        drainResult = kOutputQueueFull;
+                        break;
                     }
+                    IQVtbl* qv = *(IQVtbl**)queue;
+                    int32 pidx = 0;
+                    if (qv->addPoint(queue, soff, val, &pidx) != kResultOk) {
+                        drainResult = kOutputQueueFull;
+                        break;
+                    }
+                    if (drainResult == kOutputEnd)
+                        drainResult = kOutputEmitted;
+                }
                 }
             }
         }
+        if (g_cb->finish_output_events)
+            g_cb->finish_output_events(ctx, drainResult);
 
         return kResultOk;
     }

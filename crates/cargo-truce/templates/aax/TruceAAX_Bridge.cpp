@@ -111,6 +111,7 @@ bool TruceBridge_Load(TruceBridge* bridge, const char* bundle_path) {
     RESOLVE(process_native);
     RESOLVE(begin_output_events);
     RESOLVE(next_output_event);
+    RESOLVE(finish_output_events);
     RESOLVE(get_param);
     RESOLVE(set_param);
     RESOLVE(format_param);

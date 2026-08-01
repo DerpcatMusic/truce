@@ -235,6 +235,8 @@ pub struct Vst3Callbacks {
     /// Commit the pending note-ID lifecycle mutation only after the host
     /// accepted the event through `IEventList::addEvent`.
     pub commit_output_event: unsafe extern "C" fn(ctx: *mut c_void),
+    /// Publish the completed host drain result for the next process block.
+    pub finish_output_events: unsafe extern "C" fn(ctx: *mut c_void, status: u32),
     // GUI
     pub gui_has_editor: unsafe extern "C" fn(ctx: *mut c_void) -> i32,
     pub gui_get_size: unsafe extern "C" fn(ctx: *mut c_void, w: *mut u32, h: *mut u32),

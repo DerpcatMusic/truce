@@ -25,7 +25,7 @@ use truce_core::editor::{
 use truce_core::events::{
     EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody,
     ExactEventMetadata, ExactEventQualifiers, ExactNoteAddress, ExactNoteKind, LosslessEventCursor,
-    LosslessEventRef, PushError, TransportInfo, Vst3EventMetadata,
+    LosslessEventRef, OutputEventStatus, PushError, TransportInfo, Vst3EventMetadata,
 };
 use truce_core::export::PluginExport;
 use truce_core::info::{PluginCategory, PluginInfo, resolve_name_override};
@@ -217,6 +217,7 @@ struct Vst3Scratch<P: PluginExport> {
     /// by `P::Sample` (widening path for `prelude64` plugins).
     scratch: RawBufferScratch<<P as PluginRuntime>::Sample>,
     output_cursor: LosslessEventCursor,
+    output_preflight_status: u32,
     output_note_ids: OutputNoteIds,
     pending_output_mutation: PendingOutputMutation,
 }
@@ -616,6 +617,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     prepared: false,
                     scratch: RawBufferScratch::default(),
                     output_cursor: LosslessEventCursor::default(),
+                    output_preflight_status: VST3_EVENT_END,
                     output_note_ids: OutputNoteIds::new(),
                     pending_output_mutation: PendingOutputMutation::None,
                 }),
@@ -1339,6 +1341,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
         };
 
         scr.output_events.clear();
+        scr.output_events.clear_overflow();
         inst.transport_slot.write(&transport);
 
         let mut transport_snap = transport;
@@ -2038,6 +2041,11 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(ctx: *mut std::ffi:
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let mut audio = inst.audio.enter();
         audio.output_cursor = LosslessEventCursor::default();
+        audio.output_preflight_status = if audio.output_events.overflow().is_some() {
+            VST3_EVENT_QUEUE_FULL
+        } else {
+            VST3_EVENT_END
+        };
         audio.pending_output_mutation = PendingOutputMutation::None;
     }
 }
@@ -2054,8 +2062,23 @@ unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
         let mut audio = inst.audio.enter();
         audio.pending_output_mutation = PendingOutputMutation::None;
         let scr = &mut *audio;
-        let Some(event) = scr.output_events.lossless_next(&mut scr.output_cursor) else {
-            return VST3_EVENT_END;
+        if scr.output_preflight_status != VST3_EVENT_END {
+            return std::mem::replace(&mut scr.output_preflight_status, VST3_EVENT_END);
+        }
+        let event = loop {
+            let Some(event) = scr.output_events.lossless_next(&mut scr.output_cursor) else {
+                return VST3_EVENT_END;
+            };
+            if matches!(
+                event,
+                LosslessEventRef::Typed(Event {
+                    body: EventBody::ParamChange { .. },
+                    ..
+                })
+            ) {
+                continue;
+            }
+            break event;
         };
         match encode_vst3_output_event::<P>(
             event,
@@ -2071,6 +2094,26 @@ unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
             Vst3EncodeResult::Unsupported => VST3_EVENT_UNSUPPORTED,
             Vst3EncodeResult::Invalid => VST3_EVENT_INVALID,
         }
+    }
+}
+
+unsafe extern "C" fn cb_finish_output_events<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    status: u32,
+) {
+    unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let mut audio = inst.audio.enter();
+        let status = audio.output_events.overflow().map_or_else(
+            || match status {
+                VST3_EVENT_END | VST3_EVENT_EMITTED => OutputEventStatus::Success,
+                VST3_EVENT_UNSUPPORTED => OutputEventStatus::Unsupported,
+                VST3_EVENT_QUEUE_FULL => OutputEventStatus::HostQueueFull,
+                _ => OutputEventStatus::Invalid,
+            },
+            OutputEventStatus::BufferFull,
+        );
+        audio.output_events.set_output_status(status);
     }
 }
 
@@ -3412,6 +3455,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         begin_output_events: cb_begin_output_events::<P>,
         next_output_event: cb_next_output_event::<P>,
         commit_output_event: cb_commit_output_event::<P>,
+        finish_output_events: cb_finish_output_events::<P>,
         gui_has_editor: cb_gui_has_editor::<P>,
         gui_get_size: cb_gui_get_size::<P>,
         gui_open: cb_gui_open::<P>,

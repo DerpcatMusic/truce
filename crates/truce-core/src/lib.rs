@@ -31,8 +31,8 @@ pub use editor::{Editor, EditorBuilder, IntoEditor, PluginContext};
 pub use events::{
     AuEventMetadata, Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody,
     ExactEventMetadata, ExactEventQualifiers, ExactEventRef, ExactEventToken, ExactNoteAddress,
-    ExactNoteKind, LosslessEventCursor, LosslessEventRef, PushError, RawMidi1, RawUmp,
-    SYSEX_POOL_PREALLOC, TransportInfo, Vst3EventMetadata,
+    ExactNoteKind, LosslessEventCursor, LosslessEventRef, OutputEventStatus, PushError, RawMidi1,
+    RawUmp, SYSEX_POOL_PREALLOC, TransportInfo, Vst3EventMetadata,
 };
 pub use export::PluginExport;
 pub use info::{AutomationConfig, MidiDialect, PluginCategory, PluginInfo};

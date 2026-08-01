@@ -27,8 +27,8 @@ use truce_core::editor::EditorBuilder;
 use truce_core::editor::{ClosureBridge, Editor, PluginContext, RawWindowHandle};
 use truce_core::events::{
     EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
-    ExactEventMetadata, ExactEventQualifiers, LosslessEventCursor, LosslessEventRef, RawMidi1,
-    TransportInfo,
+    ExactEventMetadata, ExactEventQualifiers, LosslessEventCursor, LosslessEventRef,
+    OutputEventStatus, RawMidi1, TransportInfo,
 };
 use truce_core::export::PluginExport;
 use truce_core::info::{PluginCategory, PluginInfo, resolve_name_override};
@@ -833,6 +833,13 @@ macro_rules! export_aax {
                 out: *mut ::truce_aax::TruceAaxNativeEvent,
             ) -> u32 {
                 ::truce_aax::_next_output_event::<$plugin_type>(ctx, out)
+            }
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn truce_aax_finish_output_events(
+                ctx: *mut ::std::ffi::c_void,
+                status: u32,
+            ) {
+                ::truce_aax::_finish_output_events::<$plugin_type>(ctx, status);
             }
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn truce_aax_get_param(
@@ -1676,6 +1683,21 @@ pub unsafe fn _next_output_event<P: PluginExport>(
         NativeEncodeResult::Unsupported => TRUCE_AAX_EVENT_UNSUPPORTED,
         NativeEncodeResult::Invalid => TRUCE_AAX_EVENT_INVALID,
     }
+}
+
+pub unsafe fn _finish_output_events<P: PluginExport>(ctx: *mut std::ffi::c_void, status: u32) {
+    let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+    let mut audio = inst.audio.enter();
+    let status = audio.output_events.overflow().map_or_else(
+        || match status {
+            TRUCE_AAX_EVENT_END | TRUCE_AAX_EVENT_EMITTED => OutputEventStatus::Success,
+            TRUCE_AAX_EVENT_UNSUPPORTED => OutputEventStatus::Unsupported,
+            TRUCE_AAX_EVENT_QUEUE_FULL => OutputEventStatus::HostQueueFull,
+            _ => OutputEventStatus::Invalid,
+        },
+        OutputEventStatus::BufferFull,
+    );
+    audio.output_events.set_output_status(status);
 }
 
 pub unsafe fn _get_param<P: PluginExport>(ctx: *mut std::ffi::c_void, id: u32) -> f64 {

@@ -717,10 +717,11 @@ class TruceAUAudioUnit: AUAudioUnit {
             }
         }
 
-        guard truceAbiTailVersion(cb) >= 7,
+        guard truceAbiTailVersion(cb) >= 8,
               let processNative = cb.pointee.process_native,
               let beginOutput = cb.pointee.begin_output_events,
-              let nextOutput = cb.pointee.next_output_event else {
+              let nextOutput = cb.pointee.next_output_event,
+              let finishOutput = cb.pointee.finish_output_events else {
             return kAudio_ParamError
         }
         if nativeOverflow != 0 || paramOverflow != 0 {
@@ -736,6 +737,9 @@ class TruceAUAudioUnit: AUAudioUnit {
         }
         guard processResult == UInt32(AU_PROCESS_OK) else { return kAudio_ParamError }
 
+        var outputStatus = UInt32(AU_OUTPUT_EMITTED)
+        defer { finishOutput(ctx, outputStatus) }
+
         var carrierMask: UInt32 = midiOutputBlock == nil ? 0 : UInt32(AU_NATIVE_CARRIER_BYTES)
         if #available(macOS 12.0, iOS 15.0, *), midiOutputListBlock != nil {
             carrierMask |= UInt32(AU_NATIVE_CARRIER_UMP)
@@ -746,36 +750,54 @@ class TruceAUAudioUnit: AUAudioUnit {
             let result = nextOutput(ctx, &out)
             if result == UInt32(AU_OUTPUT_END) { break }
             if result == UInt32(AU_OUTPUT_UNSUPPORTED) {
+                outputStatus = UInt32(AU_OUTPUT_UNSUPPORTED)
                 return kAudioUnitErr_FormatNotSupported
             }
-            if result == UInt32(AU_OUTPUT_INVALID) { return kAudio_ParamError }
+            if result == UInt32(AU_OUTPUT_INVALID) {
+                outputStatus = UInt32(AU_OUTPUT_INVALID)
+                return kAudio_ParamError
+            }
             if result == UInt32(AU_OUTPUT_QUEUE_FULL) {
+                outputStatus = UInt32(AU_OUTPUT_QUEUE_FULL)
                 return kAudioUnitErr_MIDIOutputBufferFull
             }
             guard result == UInt32(AU_OUTPUT_EMITTED),
                   out.sample_offset < frameCount,
                   out.port <= UInt16(UInt8.max) else {
+                outputStatus = UInt32(AU_OUTPUT_INVALID)
                 return kAudio_ParamError
             }
 
             let (absoluteTime, timeOverflow) =
                 bufStart.addingReportingOverflow(Int64(out.sample_offset))
-            guard !timeOverflow else { return kAudio_ParamError }
+            guard !timeOverflow else {
+                outputStatus = UInt32(AU_OUTPUT_INVALID)
+                return kAudio_ParamError
+            }
             let eventTime = AUEventSampleTime(absoluteTime)
             let cable = UInt8(out.port)
             if out.kind == UInt8(AU_NATIVE_EVENT_MIDI1), let outputBlock = midiOutputBlock {
                 guard out.data_len > 0, out.data_len <= 3 else {
+                    outputStatus = UInt32(AU_OUTPUT_INVALID)
                     return kAudio_ParamError
                 }
                 let status: OSStatus = withUnsafeBytes(of: out.midi) { raw in
                     outputBlock(eventTime, cable, Int(out.data_len),
                                 raw.baseAddress!.assumingMemoryBound(to: UInt8.self))
                 }
-                if status != noErr { return status }
+                if status != noErr {
+                    outputStatus = status == kAudioUnitErr_MIDIOutputBufferFull
+                        ? UInt32(AU_OUTPUT_QUEUE_FULL) : UInt32(AU_OUTPUT_INVALID)
+                    return status
+                }
             } else if out.kind == UInt8(AU_NATIVE_EVENT_SYSEX), let outputBlock = midiOutputBlock {
-                guard let bytes = out.sysex else { return kAudio_ParamError }
+                guard let bytes = out.sysex else {
+                    outputStatus = UInt32(AU_OUTPUT_INVALID)
+                    return kAudio_ParamError
+                }
                 let payloadLen = Int(out.data_len)
                 guard payloadLen <= sysexOutScratchCap - 2 else {
+                    outputStatus = UInt32(AU_OUTPUT_QUEUE_FULL)
                     return kAudioUnitErr_MIDIOutputBufferFull
                 }
                 sysexOutScratch[0] = 0xF0
@@ -783,10 +805,15 @@ class TruceAUAudioUnit: AUAudioUnit {
                 sysexOutScratch[payloadLen + 1] = 0xF7
                 let status = outputBlock(
                     eventTime, cable, payloadLen + 2, UnsafePointer(sysexOutScratch))
-                if status != noErr { return status }
+                if status != noErr {
+                    outputStatus = status == kAudioUnitErr_MIDIOutputBufferFull
+                        ? UInt32(AU_OUTPUT_QUEUE_FULL) : UInt32(AU_OUTPUT_INVALID)
+                    return status
+                }
             } else if out.kind == UInt8(AU_NATIVE_EVENT_UMP) {
                 guard #available(macOS 12.0, iOS 15.0, *),
                       let listBlock = midiOutputListBlock as? AUMIDIEventListBlock else {
+                    outputStatus = UInt32(AU_OUTPUT_UNSUPPORTED)
                     return kAudioUnitErr_FormatNotSupported
                 }
                 // Preserve the source list protocol. Apple's AU boundary
@@ -797,15 +824,18 @@ class TruceAUAudioUnit: AUAudioUnit {
                 } else if out.protocol == 2 {
                     protocolID = ._2_0
                 } else {
+                    outputStatus = UInt32(AU_OUTPUT_INVALID)
                     return kAudio_ParamError
                 }
                 guard out.data_len > 0, out.data_len <= 4 else {
+                    outputStatus = UInt32(AU_OUTPUT_INVALID)
                     return kAudio_ParamError
                 }
                 let messageType = UInt8((out.words.0 >> 28) & 0xF)
                 guard Int(out.data_len) == umpPacketLength(messageType: messageType),
                       midiOutputProtocol == 1 || midiOutputProtocol == 2,
                       umpProtocolAccepts(out.protocol, messageType) else {
+                    outputStatus = UInt32(AU_OUTPUT_INVALID)
                     return kAudio_ParamError
                 }
                 var list = MIDIEventList()
@@ -817,10 +847,18 @@ class TruceAUAudioUnit: AUAudioUnit {
                             Int(out.data_len),
                             raw.baseAddress!.assumingMemoryBound(to: UInt32.self))
                     }
-                guard added != nil else { return kAudioUnitErr_MIDIOutputBufferFull }
+                guard added != nil else {
+                    outputStatus = UInt32(AU_OUTPUT_QUEUE_FULL)
+                    return kAudioUnitErr_MIDIOutputBufferFull
+                }
                 let status = listBlock(eventTime, cable, &list)
-                if status != noErr { return status }
+                if status != noErr {
+                    outputStatus = status == kAudioUnitErr_MIDIOutputBufferFull
+                        ? UInt32(AU_OUTPUT_QUEUE_FULL) : UInt32(AU_OUTPUT_INVALID)
+                    return status
+                }
             } else {
+                outputStatus = UInt32(AU_OUTPUT_UNSUPPORTED)
                 return kAudio_ParamError
             }
         }

@@ -42,8 +42,9 @@ extern "C" {
  *           route a skewed param's coefficient<->plain mapping through the
  *           plugin's ParamRange (AAX has no native skew taper).
  *   10 → 11: one strict native MIDI 1.0 / SysEx event lane with explicit
- *            loss status and a sequential output cursor. */
-#define TRUCE_AAX_ABI_VERSION 11u
+ *            loss status and a sequential output cursor.
+ *   11 → 12: completed output-event delivery status. */
+#define TRUCE_AAX_ABI_VERSION 12u
 
 /* Capacity of TruceAaxDescriptor::legacy_chunk_ids. */
 #define TRUCE_AAX_MAX_LEGACY_CHUNKS 8u
@@ -230,6 +231,7 @@ uint32_t truce_aax_process_native(void* ctx,
  * An error is returned before any event when the block cannot round-trip. */
 void     truce_aax_begin_output_events(void* ctx, uint32_t num_frames);
 uint32_t truce_aax_next_output_event(void* ctx, TruceAaxNativeEvent* out);
+void     truce_aax_finish_output_events(void* ctx, uint32_t status);
 
 /* Parameters (plain values, not normalized). */
 double truce_aax_get_param(void* ctx, uint32_t id);

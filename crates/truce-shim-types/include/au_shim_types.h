@@ -46,9 +46,10 @@
 // v6: appended the strict native event process and sequential output lane.
 // v7: native process returns status and output negotiation carries the host's
 // UMP protocol; current shims require this exact boundary.
+// v8: appended final output-delivery status publication.
 #define TRUCE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define TRUCE_AU_ABI_MAGIC 0x54417500u
-#define TRUCE_AU_ABI_VERSION 0x54417507u
+#define TRUCE_AU_ABI_VERSION 0x54417508u
 
 typedef struct {
     uint8_t component_type[4];
@@ -409,6 +410,7 @@ typedef struct {
     uint32_t (*next_output_event)(void *ctx, AuNativeEvent *out);
     uint32_t (*push_sysex_input_native)(void *ctx, uint32_t sample_offset,
                                         const uint8_t *bytes, uint32_t len);
+    void (*finish_output_events)(void *ctx, uint32_t status);
 } AuCallbacks;
 
 // Globals shared between v2 and v3 shims.

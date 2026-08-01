@@ -597,20 +597,29 @@ void TruceAAX_Parameters::RenderAudio(
     // the inherited fields, plus one extra slot for `mOutputNode`).
     auto* extendedInfo = reinterpret_cast<TruceAaxExtendedRenderInfo*>(ioRenderInfo);
     AAX_IMIDINode* outputNode = extendedInfo->mOutputNode;
+    g_bridge.begin_output_events(mRustCtx, (uint32_t)bufferSize);
     if (outputNode) {
-        g_bridge.begin_output_events(mRustCtx, (uint32_t)bufferSize);
         for (;;) {
             TruceAaxNativeEvent event = {};
             uint32_t status = g_bridge.next_output_event(mRustCtx, &event);
-            if (status == TRUCE_AAX_EVENT_END) break;
-            if (status != TRUCE_AAX_EVENT_EMITTED) return;
+            if (status == TRUCE_AAX_EVENT_END) {
+                g_bridge.finish_output_events(mRustCtx, TRUCE_AAX_EVENT_EMITTED);
+                break;
+            }
+            if (status != TRUCE_AAX_EVENT_EMITTED) {
+                g_bridge.finish_output_events(mRustCtx, status);
+                return;
+            }
 
             if (event.kind == TRUCE_AAX_NATIVE_EVENT_MIDI1) {
                 AAX_CMidiPacket pkt = {};
                 pkt.mTimestamp = event.sample_offset;
                 pkt.mLength = event.data_len;
                 for (uint32_t j = 0; j < event.data_len; j++) pkt.mData[j] = event.midi[j];
-                if (outputNode->PostMIDIPacket(&pkt) != AAX_SUCCESS) return;
+                if (outputNode->PostMIDIPacket(&pkt) != AAX_SUCCESS) {
+                    g_bridge.finish_output_events(mRustCtx, TRUCE_AAX_EVENT_QUEUE_FULL);
+                    return;
+                }
                 continue;
             }
 
@@ -628,10 +637,19 @@ void TruceAAX_Parameters::RenderAudio(
                     pkt.mData[j] = p == 0 ? 0xF0
                         : (p + 1 == totalLen ? 0xF7 : event.sysex[p - 1]);
                 }
-                if (outputNode->PostMIDIPacket(&pkt) != AAX_SUCCESS) return;
+                if (outputNode->PostMIDIPacket(&pkt) != AAX_SUCCESS) {
+                    g_bridge.finish_output_events(mRustCtx, TRUCE_AAX_EVENT_QUEUE_FULL);
+                    return;
+                }
                 pos += pkt.mLength;
             }
         }
+    } else {
+        TruceAaxNativeEvent event = {};
+        uint32_t status = g_bridge.next_output_event(mRustCtx, &event);
+        if (status == TRUCE_AAX_EVENT_EMITTED)
+            status = TRUCE_AAX_EVENT_UNSUPPORTED;
+        g_bridge.finish_output_events(mRustCtx, status);
     }
 }
 

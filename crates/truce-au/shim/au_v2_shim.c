@@ -2018,6 +2018,28 @@ static OSStatus au_v2_render(void *self_,
                 break;
             }
         }
+    } else {
+        /* Probe the Rust lane so a plugin that emitted events without a host
+         * receiver observes queue unavailability on its next block. */
+        g_callbacks->begin_output_events(inst->rustCtx, 0, inFrameCount,
+                                         (uint32_t)inst->hostMIDIProtocol);
+        AuNativeEvent ev = {0};
+        uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
+        if (status == AU_OUTPUT_INVALID)
+            midiOutputStatus = kAudioUnitErr_InvalidParameter;
+        else if (status != AU_OUTPUT_END)
+            midiOutputStatus = kAudioUnitErr_FormatNotSupported;
+    }
+
+    if (g_callbacks->finish_output_events) {
+        uint32_t status = AU_OUTPUT_EMITTED;
+        if (midiOutputStatus == kAudioUnitErr_MIDIOutputBufferFull)
+            status = AU_OUTPUT_QUEUE_FULL;
+        else if (midiOutputStatus == kAudioUnitErr_FormatNotSupported)
+            status = AU_OUTPUT_UNSUPPORTED;
+        else if (midiOutputStatus != noErr)
+            status = AU_OUTPUT_INVALID;
+        g_callbacks->finish_output_events(inst->rustCtx, status);
     }
 
     // Copy our processed audio to the host's original buffers

@@ -44,8 +44,8 @@ use truce_core::bus::BusLayout;
 use truce_core::editor::fit_logical_size;
 use truce_core::events::{
     AuEventMetadata, EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
-    ExactEventMetadata, ExactEventQualifiers, LosslessEventCursor, LosslessEventRef, PushError,
-    RawMidi1, RawUmp, TransportInfo,
+    ExactEventMetadata, ExactEventQualifiers, LosslessEventCursor, LosslessEventRef,
+    OutputEventStatus, PushError, RawMidi1, RawUmp, TransportInfo,
 };
 use truce_core::export::PluginExport;
 use truce_core::info::{MidiDialect, PluginInfo, resolve_name_override};
@@ -386,7 +386,7 @@ struct AuAudio<P: PluginExport> {
     native_output_carriers: u32,
     native_output_num_frames: u32,
     native_output_ump_protocol: u8,
-    native_output_overflow_pending: bool,
+    native_output_status: u32,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     sub_event_scratch: EventList,
     /// Per-instance UMP `SysEx` reassembler. AU v3 hosts deliver
@@ -499,7 +499,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     native_output_carriers: 0,
                     native_output_num_frames: 0,
                     native_output_ump_protocol: 0,
-                    native_output_overflow_pending: false,
+                    native_output_status: AU_OUTPUT_END,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sysex_assembler: SysExAssembler::with_capacity(SYSEX_POOL_PREALLOC),
                     sample_rate: 44100.0,
@@ -2361,7 +2361,27 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
             carrier_mask & (AU_NATIVE_CARRIER_BYTES | AU_NATIVE_CARRIER_UMP);
         audio.native_output_num_frames = num_frames;
         audio.native_output_ump_protocol = u8::try_from(ump_protocol).unwrap_or(0);
-        audio.native_output_overflow_pending = audio.output_events.overflow().is_some();
+        audio.native_output_status = if audio.output_events.overflow().is_some() {
+            AU_OUTPUT_QUEUE_FULL
+        } else {
+            audio
+                .output_events
+                .lossless_iter()
+                .find_map(|event| {
+                    match encode_native_output::<P>(
+                        event,
+                        &audio.output_events,
+                        audio.native_output_carriers,
+                        audio.native_output_num_frames,
+                        audio.native_output_ump_protocol,
+                    ) {
+                        NativeEncodeResult::Emitted(_) => None,
+                        NativeEncodeResult::Unsupported => Some(AU_OUTPUT_UNSUPPORTED),
+                        NativeEncodeResult::Invalid => Some(AU_OUTPUT_INVALID),
+                    }
+                })
+                .unwrap_or(AU_OUTPUT_END)
+        };
     }
 }
 
@@ -2376,13 +2396,13 @@ unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
         let inst = &*ctx.cast::<AuInstance<P>>();
         let mut audio = inst.audio.enter();
         let scr = &mut *audio;
+        if scr.native_output_status != AU_OUTPUT_END {
+            return std::mem::replace(&mut scr.native_output_status, AU_OUTPUT_END);
+        }
         let Some(event) = scr
             .output_events
             .lossless_next(&mut scr.native_output_cursor)
         else {
-            if std::mem::take(&mut scr.native_output_overflow_pending) {
-                return AU_OUTPUT_QUEUE_FULL;
-            }
             return AU_OUTPUT_END;
         };
         match encode_native_output::<P>(
@@ -2399,6 +2419,26 @@ unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
             NativeEncodeResult::Unsupported => AU_OUTPUT_UNSUPPORTED,
             NativeEncodeResult::Invalid => AU_OUTPUT_INVALID,
         }
+    }
+}
+
+unsafe extern "C" fn cb_finish_output_events<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    status: u32,
+) {
+    unsafe {
+        let inst = &*ctx.cast::<AuInstance<P>>();
+        let mut audio = inst.audio.enter();
+        let status = audio.output_events.overflow().map_or_else(
+            || match status {
+                AU_OUTPUT_END | AU_OUTPUT_EMITTED => OutputEventStatus::Success,
+                AU_OUTPUT_UNSUPPORTED => OutputEventStatus::Unsupported,
+                AU_OUTPUT_QUEUE_FULL => OutputEventStatus::HostQueueFull,
+                _ => OutputEventStatus::Invalid,
+            },
+            OutputEventStatus::BufferFull,
+        );
+        audio.output_events.set_output_status(status);
     }
 }
 
@@ -3033,6 +3073,7 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         begin_output_events: cb_begin_output_events::<P>,
         next_output_event: cb_next_output_event::<P>,
         push_sysex_input_native: cb_au_push_sysex_input_native::<P>,
+        finish_output_events: cb_finish_output_events::<P>,
     }));
 
     let param_descs = param_descs.leak();

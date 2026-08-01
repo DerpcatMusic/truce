@@ -110,7 +110,7 @@ use truce_core::editor::{
 use truce_core::events::{
     EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
     ExactEventQualifiers, ExactEventRef, ExactNoteAddress, ExactNoteKind, LosslessEventRef,
-    PushError, RawMidi1, RawUmp, TransportInfo,
+    OutputEventStatus, PushError, RawMidi1, RawUmp, TransportInfo,
 };
 use truce_core::export::PluginExport;
 use truce_core::info::{MidiDialect, PluginCategory, PluginInfo, resolve_name_override};
@@ -2546,6 +2546,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             );
 
         scr.output_events.clear();
+        scr.output_events.clear_overflow();
 
         // Publish transport to the editor slot before the plugin runs.
         data.transport_slot.write(&transport);
@@ -2632,11 +2633,32 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
 
         // Flush GUI-initiated param changes to host output events
         let output_queue_open = flush_gui_changes::<P>(data, proc.out_events);
+        let mut output_status = scr
+            .output_events
+            .overflow()
+            .map_or(OutputEventStatus::Success, OutputEventStatus::BufferFull);
+        if !output_queue_open {
+            output_status = OutputEventStatus::HostQueueFull;
+        }
 
         // Forward plugin output events (MIDI output from instruments/effects)
-        if output_queue_open && !proc.out_events.is_null() && !scr.output_events.is_empty() {
-            let Some(try_push) = (*proc.out_events).try_push else {
-                return CLAP_PROCESS_CONTINUE;
+        if output_status == OutputEventStatus::Success && !scr.output_events.is_empty() {
+            let try_push = if proc.out_events.is_null() {
+                None
+            } else {
+                (*proc.out_events).try_push
+            };
+            let Some(try_push) = try_push else {
+                scr.output_events
+                    .set_output_status(OutputEventStatus::Unsupported);
+                scr.input_slices.clear();
+                scr.output_slices.clear();
+                return match status {
+                    ProcessStatus::Normal => CLAP_PROCESS_CONTINUE,
+                    ProcessStatus::Tail(0) => CLAP_PROCESS_SLEEP,
+                    ProcessStatus::Tail(_) => CLAP_PROCESS_TAIL,
+                    ProcessStatus::KeepAlive => CLAP_PROCESS_CONTINUE_IF_NOT_QUIET,
+                };
             };
             // CLAP requires the output queue sorted by time; a plugin
             // that pushes block-level events (an LFO, a mode-switch
@@ -2649,10 +2671,13 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             macro_rules! push_output {
                 ($queue:ident, $header:expr) => {
                     $queue = try_push(proc.out_events, $header);
+                    if !$queue {
+                        output_status = OutputEventStatus::HostQueueFull;
+                    }
                 };
             }
             'output_events: for replay in scr.output_events.lossless_iter() {
-                let mut queue_open = true;
+                let queue_open;
                 let event = match replay {
                     LosslessEventRef::Typed(event) => event,
                     LosslessEventRef::Exact(exact) => {
@@ -2670,22 +2695,35 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                                 }
                                 continue;
                             }
-                            ExactEmit::Invalid | ExactEmit::Unsupported => continue,
-                            ExactEmit::QueueFull => break 'output_events,
+                            ExactEmit::Invalid => {
+                                output_status = OutputEventStatus::Invalid;
+                                break 'output_events;
+                            }
+                            ExactEmit::Unsupported => {
+                                output_status = OutputEventStatus::Unsupported;
+                                break 'output_events;
+                            }
+                            ExactEmit::QueueFull => {
+                                output_status = OutputEventStatus::HostQueueFull;
+                                break 'output_events;
+                            }
                         }
                     }
                 };
                 if event.sample_offset >= proc.frames_count {
-                    continue;
+                    output_status = OutputEventStatus::Invalid;
+                    break 'output_events;
                 }
                 if !typed_output_body_is_valid(&event.body) {
-                    continue;
+                    output_status = OutputEventStatus::Invalid;
+                    break 'output_events;
                 }
                 if !is_portless_output_body(&event.body)
                     && (data.info.midi_output_ports == 0
                         || event.port >= data.info.midi_output_ports)
                 {
-                    continue;
+                    output_status = OutputEventStatus::Invalid;
+                    break 'output_events;
                 }
                 let out_port = event.port;
                 match &event.body {
@@ -2859,7 +2897,8 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                         // `process()` is still fine because the
                         // pool stays valid through the whole block.
                         let Some(bytes) = scr.output_events.sysex_bytes_checked(&event.body) else {
-                            continue;
+                            output_status = OutputEventStatus::Invalid;
+                            break 'output_events;
                         };
                         let ev = clap_event_midi_sysex {
                             header: clap_event_header {
@@ -2892,10 +2931,12 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                     | EventBody::RegisteredController { .. }
                     | EventBody::AssignableController { .. }) => {
                         if data.info.midi_output_dialect != MidiDialect::Midi2 {
-                            continue;
+                            output_status = OutputEventStatus::Unsupported;
+                            break 'output_events;
                         }
                         let Some(words) = encode_ump_channel_voice_2(body) else {
-                            continue;
+                            output_status = OutputEventStatus::Invalid;
+                            break 'output_events;
                         };
                         let ev = clap_event_midi2 {
                             header: clap_event_header {
@@ -2910,13 +2951,17 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                         };
                         push_output!(queue_open, &raw const ev.header);
                     }
-                    EventBody::ParamMod { .. } | EventBody::Transport(_) => {}
+                    EventBody::ParamMod { .. } | EventBody::Transport(_) => {
+                        output_status = OutputEventStatus::Unsupported;
+                        break 'output_events;
+                    }
                 }
                 if !queue_open {
                     break 'output_events;
                 }
             }
         }
+        scr.output_events.set_output_status(output_status);
 
         // Drop the channel-slice borrows we transmuted to `'static`
         // for the duration of this call. The host's `audio_inputs` /

@@ -20,6 +20,7 @@ typedef uint32_t (*fn_process_native)(void*, const float**, float**, uint32_t, u
                                       uint32_t, const TruceAaxTransportSnapshot*);
 typedef void     (*fn_begin_output_events)(void*, uint32_t);
 typedef uint32_t (*fn_next_output_event)(void*, TruceAaxNativeEvent*);
+typedef void     (*fn_finish_output_events)(void*, uint32_t);
 typedef double (*fn_get_param)(void*, uint32_t);
 typedef void   (*fn_set_param)(void*, uint32_t, double);
 typedef void   (*fn_format_param)(void*, uint32_t, double, char*, uint32_t);
@@ -50,6 +51,7 @@ struct TruceBridge {
     fn_process_native      process_native;
     fn_begin_output_events begin_output_events;
     fn_next_output_event   next_output_event;
+    fn_finish_output_events finish_output_events;
     fn_get_param           get_param;
     fn_set_param           set_param;
     fn_format_param        format_param;
