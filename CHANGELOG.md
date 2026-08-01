@@ -4,7 +4,7 @@ Notable changes per release.
 
 ## 7.0.0
 
-Breaking: `truce-egui` now uses egui and egui-wgpu 0.35. Plugins that name egui types in their editor code must update their direct `egui` dependency to 0.35; the `EguiEditor`, `EditorUi`, and widget APIs otherwise keep the same shape.
+Breaking: move every direct `truce*` dependency in a plugin to 7.0 together. `truce-egui` now uses egui and egui-wgpu 0.35, so plugins that name egui types in their editor code must also update their direct `egui` dependency to 0.35; the `EguiEditor`, `EditorUi`, and widget APIs otherwise keep the same shape.
 
 - `truce-egui` shares BUFFR's egui 0.35 and wgpu 29 dependency graph, so native BUFFR editor code can move onto Truce without a second incompatible egui stack.
 
