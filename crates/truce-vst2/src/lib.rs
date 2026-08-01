@@ -18,11 +18,15 @@ use truce_core::chunked_process::{ChunkedProcess, process_chunked};
 use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::editor::EditorBuilder;
 use truce_core::editor::{ClosureBridge, Editor, PluginContext, RawWindowHandle, SendPtr};
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, TransportInfo};
+use truce_core::events::{
+    EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEventBody, ExactEventMetadata,
+    ExactEventQualifiers, LosslessEventCursor, LosslessEventRef, OutputEventStatus, RawMidi1,
+    TransportInfo,
+};
 use truce_core::export::PluginExport;
 use truce_core::info::{PluginInfo, resolve_name_override};
 use truce_core::meters::MeterStore;
-use truce_core::midi::{decode_short_message, downconvert_to_midi1, pitch_bend_to_bytes};
+use truce_core::midi::{decode_short_message, event_to_midi1};
 use truce_core::plugin::PluginRuntime;
 use truce_core::rt::{RtSection, audit};
 use truce_core::snapshot::SnapshotSlot;
@@ -36,7 +40,9 @@ use truce_core::wrapper::{
 use truce_core::{Float, Sample};
 use truce_params::{ParamFlags, ParamInfo, Params};
 
-use ffi::{Vst2Callbacks, Vst2MidiEvent, Vst2ParamDescriptor, Vst2PluginDescriptor};
+use ffi::{
+    Vst2Callbacks, Vst2MidiEvent, Vst2OutputEvent, Vst2ParamDescriptor, Vst2PluginDescriptor,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
@@ -50,6 +56,15 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 /// double-recall doesn't get the audio thread to apply a stale state
 /// after the host already moved on.
 type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
+
+const VST2_OUTPUT_END: u32 = 0;
+const VST2_OUTPUT_EMITTED: u32 = 1;
+const VST2_OUTPUT_UNSUPPORTED: u32 = 2;
+const VST2_OUTPUT_INVALID: u32 = 3;
+const VST2_OUTPUT_QUEUE_FULL: u32 = 4;
+
+const VST2_OUTPUT_MIDI1: u32 = 1;
+const VST2_OUTPUT_SYSEX: u32 = 2;
 
 struct Vst2Instance<P: PluginExport> {
     /// The plugin in the wrapper-standard ownership cell: the audio
@@ -125,6 +140,9 @@ struct Vst2Audio<P: PluginExport> {
     /// sets this; `process` consumes it instead of re-clearing.
     sysex_inputs_pending: bool,
     output_events: EventList,
+    output_cursor: LosslessEventCursor,
+    output_num_frames: u32,
+    output_preflight_status: u32,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     sub_event_scratch: EventList,
     sample_rate: f64,
@@ -332,6 +350,9 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sysex_inputs_pending: false,
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                    output_cursor: LosslessEventCursor::default(),
+                    output_num_frames: 0,
+                    output_preflight_status: VST2_OUTPUT_END,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sample_rate: 44100.0,
                     // 8192 covers the largest block sizes mainstream DAWs use; a
@@ -608,6 +629,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             }
         };
         scr.output_events.clear();
+        scr.output_events.clear_overflow();
         inst.transport_slot.write(&transport);
 
         let mut transport_snap = transport;
@@ -736,86 +758,247 @@ fn notify_process_param_changes<P: PluginExport>(
     }
 }
 
-/// Map a truce `Event` body to a 3-byte VST2 MIDI packet. Returns
-/// `None` for event types that don't fit (MIDI 2.0, `ParamChange`,
-/// Transport, etc.).
-fn try_encode_vst2_midi(event: &Event) -> Option<Vst2MidiEvent> {
-    // VST2 is MIDI 1.0 only; down-convert any 2.0 output first so it
-    // isn't dropped.
-    let body = downconvert_to_midi1(&event.body).unwrap_or(event.body);
-    let (status, data1, data2) = match &body {
-        EventBody::NoteOn {
-            channel,
-            note,
-            velocity,
-            ..
-        } => (0x90 | (channel & 0x0F), *note, *velocity),
-        EventBody::NoteOff {
-            channel,
-            note,
-            velocity,
-            ..
-        } => (0x80 | (channel & 0x0F), *note, *velocity),
-        EventBody::ControlChange {
-            channel, cc, value, ..
-        } => (0xB0 | (channel & 0x0F), *cc, *value),
-        EventBody::Aftertouch {
-            channel,
-            note,
-            pressure,
-            ..
-        } => (0xA0 | (channel & 0x0F), *note, *pressure),
-        EventBody::ChannelPressure {
-            channel, pressure, ..
-        } => (0xD0 | (channel & 0x0F), *pressure, 0),
-        EventBody::PitchBend { channel, value, .. } => {
-            let (lsb, msb) = pitch_bend_to_bytes(*value);
-            (0xE0 | (channel & 0x0F), lsb, msb)
-        }
-        EventBody::ProgramChange {
-            channel, program, ..
-        } => (0xC0 | (channel & 0x0F), *program, 0),
-        _ => return None,
-    };
-    Some(Vst2MidiEvent {
-        delta_frames: event.sample_offset,
-        status,
-        data1,
-        data2,
-        _pad: 0,
-    })
-}
-
-unsafe extern "C" fn cb_output_event_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
-    unsafe {
-        let inst = &*ctx.cast::<Vst2Instance<P>>();
-        let audio = inst.audio.enter();
-        len_u32(
-            audio
-                .output_events
-                .iter()
-                .filter(|e| try_encode_vst2_midi(e).is_some())
-                .count(),
-        )
+fn midi1_message_len(status: u8) -> Option<usize> {
+    if (0x80..=0xEF).contains(&status) {
+        return Some(if matches!(status & 0xF0, 0xC0 | 0xD0) {
+            2
+        } else {
+            3
+        });
+    }
+    match status {
+        0xF1 | 0xF3 => Some(2),
+        0xF2 => Some(3),
+        0xF6 | 0xF8 | 0xFA | 0xFB | 0xFC | 0xFE | 0xFF => Some(1),
+        _ => None,
     }
 }
 
-unsafe extern "C" fn cb_output_event_at<P: PluginExport>(
+fn raw_midi1_valid(message: RawMidi1) -> bool {
+    let bytes = message.bytes();
+    midi1_message_len(bytes[0]) == Some(bytes.len())
+        && bytes.iter().skip(1).all(|byte| byte & 0x80 == 0)
+}
+
+fn typed_midi1_roundtrip(body: &EventBody) -> Option<([u8; 3], usize)> {
+    let (len, bytes) = event_to_midi1(body)?;
+    let decoded = decode_short_message(bytes[0], bytes[1], bytes[2])?;
+    (decoded == *body).then_some((bytes, len))
+}
+
+enum Vst2EncodeResult {
+    Emitted(Vst2OutputEvent),
+    Unsupported,
+    Invalid,
+}
+
+fn vst2_output_port(port: u16, declared_ports: u8) -> Result<(), Vst2EncodeResult> {
+    if port >= u16::from(declared_ports) {
+        Err(Vst2EncodeResult::Invalid)
+    } else if port != 0 {
+        Err(Vst2EncodeResult::Unsupported)
+    } else {
+        Ok(())
+    }
+}
+
+fn encode_vst2_output(
+    event: LosslessEventRef<'_>,
+    list: &EventList,
+    declared_ports: u8,
+    num_frames: u32,
+) -> Vst2EncodeResult {
+    let sample_offset = match event {
+        LosslessEventRef::Typed(event) => event.sample_offset,
+        LosslessEventRef::Exact(exact) => exact.sample_offset(),
+    };
+    if sample_offset >= num_frames {
+        return Vst2EncodeResult::Invalid;
+    }
+
+    match event {
+        LosslessEventRef::Typed(event) => {
+            if let Err(status) = vst2_output_port(u16::from(event.port), declared_ports) {
+                return status;
+            }
+            if let Some((midi, len)) = typed_midi1_roundtrip(&event.body) {
+                return Vst2EncodeResult::Emitted(Vst2OutputEvent {
+                    delta_frames: sample_offset,
+                    kind: VST2_OUTPUT_MIDI1,
+                    data_len: u32::try_from(len).unwrap_or(0),
+                    midi,
+                    _pad: 0,
+                    sysex: std::ptr::null(),
+                });
+            }
+            if event_to_midi1(&event.body).is_some() {
+                return Vst2EncodeResult::Invalid;
+            }
+            if let EventBody::SysEx { .. } = event.body {
+                let Some(bytes) = list.sysex_bytes_checked(&event.body) else {
+                    return Vst2EncodeResult::Invalid;
+                };
+                if bytes.iter().any(|byte| byte & 0x80 != 0) {
+                    return Vst2EncodeResult::Invalid;
+                }
+                return Vst2EncodeResult::Emitted(Vst2OutputEvent {
+                    delta_frames: sample_offset,
+                    kind: VST2_OUTPUT_SYSEX,
+                    data_len: len_u32(bytes.len()),
+                    midi: [0; 3],
+                    _pad: 0,
+                    sysex: bytes.as_ptr(),
+                });
+            }
+            Vst2EncodeResult::Unsupported
+        }
+        LosslessEventRef::Exact(exact) => {
+            if exact.qualifiers() != ExactEventQualifiers::default()
+                || !matches!(exact.metadata(), ExactEventMetadata::None)
+            {
+                return Vst2EncodeResult::Unsupported;
+            }
+            match *exact.body() {
+                ExactEventBody::Midi1 { port, message } => {
+                    if let Err(status) = vst2_output_port(port, declared_ports) {
+                        return status;
+                    }
+                    if !raw_midi1_valid(message) {
+                        return Vst2EncodeResult::Invalid;
+                    }
+                    Vst2EncodeResult::Emitted(Vst2OutputEvent {
+                        delta_frames: sample_offset,
+                        kind: VST2_OUTPUT_MIDI1,
+                        data_len: u32::try_from(message.len()).unwrap_or(0),
+                        midi: *message.storage(),
+                        _pad: 0,
+                        sysex: std::ptr::null(),
+                    })
+                }
+                ExactEventBody::SysEx { port } => {
+                    if let Err(status) = vst2_output_port(port, declared_ports) {
+                        return status;
+                    }
+                    let Some(bytes) = exact.sysex_bytes_checked() else {
+                        return Vst2EncodeResult::Invalid;
+                    };
+                    if bytes.iter().any(|byte| byte & 0x80 != 0) {
+                        return Vst2EncodeResult::Invalid;
+                    }
+                    Vst2EncodeResult::Emitted(Vst2OutputEvent {
+                        delta_frames: sample_offset,
+                        kind: VST2_OUTPUT_SYSEX,
+                        data_len: len_u32(bytes.len()),
+                        midi: [0; 3],
+                        _pad: 0,
+                        sysex: bytes.as_ptr(),
+                    })
+                }
+                _ => Vst2EncodeResult::Unsupported,
+            }
+        }
+    }
+}
+
+fn is_vst2_param_change(event: LosslessEventRef<'_>) -> bool {
+    matches!(
+        event,
+        LosslessEventRef::Typed(Event {
+            body: EventBody::ParamChange { .. },
+            ..
+        })
+    )
+}
+
+unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
-    index: u32,
-    out: *mut Vst2MidiEvent,
+    num_frames: u32,
 ) {
     unsafe {
         let inst = &*ctx.cast::<Vst2Instance<P>>();
-        let audio = inst.audio.enter();
-        if let Some(packet) = audio
-            .output_events
-            .iter()
-            .filter_map(try_encode_vst2_midi)
-            .nth(index as usize)
-        {
-            *out = packet;
+        let mut audio = inst.audio.enter();
+        audio.output_events.ensure_sorted_by_offset();
+        audio.output_cursor = LosslessEventCursor::default();
+        audio.output_num_frames = num_frames;
+        audio.output_preflight_status = if audio.output_events.overflow().is_some() {
+            VST2_OUTPUT_QUEUE_FULL
+        } else {
+            audio
+                .output_events
+                .lossless_iter()
+                .filter(|event| !is_vst2_param_change(*event))
+                .find_map(|event| {
+                    match encode_vst2_output(
+                        event,
+                        &audio.output_events,
+                        P::info().midi_output_ports,
+                        num_frames,
+                    ) {
+                        Vst2EncodeResult::Emitted(_) => None,
+                        Vst2EncodeResult::Unsupported => Some(VST2_OUTPUT_UNSUPPORTED),
+                        Vst2EncodeResult::Invalid => Some(VST2_OUTPUT_INVALID),
+                    }
+                })
+                .unwrap_or(VST2_OUTPUT_END)
+        };
+    }
+}
+
+unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    out: *mut Vst2OutputEvent,
+) -> u32 {
+    unsafe {
+        if out.is_null() {
+            return VST2_OUTPUT_INVALID;
         }
+        let inst = &*ctx.cast::<Vst2Instance<P>>();
+        let mut audio = inst.audio.enter();
+        let scr = &mut *audio;
+        if scr.output_preflight_status != VST2_OUTPUT_END {
+            return std::mem::replace(&mut scr.output_preflight_status, VST2_OUTPUT_END);
+        }
+        let event = loop {
+            let Some(event) = scr.output_events.lossless_next(&mut scr.output_cursor) else {
+                return VST2_OUTPUT_END;
+            };
+            if !is_vst2_param_change(event) {
+                break event;
+            }
+        };
+        match encode_vst2_output(
+            event,
+            &scr.output_events,
+            P::info().midi_output_ports,
+            scr.output_num_frames,
+        ) {
+            Vst2EncodeResult::Emitted(event) => {
+                out.write(event);
+                VST2_OUTPUT_EMITTED
+            }
+            Vst2EncodeResult::Unsupported => VST2_OUTPUT_UNSUPPORTED,
+            Vst2EncodeResult::Invalid => VST2_OUTPUT_INVALID,
+        }
+    }
+}
+
+unsafe extern "C" fn cb_finish_output_events<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    status: u32,
+) {
+    unsafe {
+        let inst = &*ctx.cast::<Vst2Instance<P>>();
+        let mut audio = inst.audio.enter();
+        let status = audio.output_events.overflow().map_or_else(
+            || match status {
+                VST2_OUTPUT_END | VST2_OUTPUT_EMITTED => OutputEventStatus::Success,
+                VST2_OUTPUT_UNSUPPORTED => OutputEventStatus::Unsupported,
+                VST2_OUTPUT_QUEUE_FULL => OutputEventStatus::HostQueueFull,
+                _ => OutputEventStatus::Invalid,
+            },
+            OutputEventStatus::BufferFull,
+        );
+        audio.output_events.set_output_status(status);
     }
 }
 
@@ -844,44 +1027,6 @@ unsafe extern "C" fn cb_push_sysex_input<P: PluginExport>(
         }
         let slice = std::slice::from_raw_parts(bytes, len as usize);
         let _ = scr.event_list.push_sysex(delta_frames, slice);
-    }
-}
-
-unsafe extern "C" fn cb_output_sysex_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
-    unsafe {
-        let inst = &*ctx.cast::<Vst2Instance<P>>();
-        let audio = inst.audio.enter();
-        len_u32(
-            audio
-                .output_events
-                .iter()
-                .filter(|e| matches!(e.body, EventBody::SysEx { .. }))
-                .count(),
-        )
-    }
-}
-
-unsafe extern "C" fn cb_output_sysex_at<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    index: u32,
-    out_delta_frames: *mut u32,
-    out_bytes: *mut *const u8,
-    out_len: *mut u32,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst2Instance<P>>();
-        let audio = inst.audio.enter();
-        if let Some(event) = audio
-            .output_events
-            .iter()
-            .filter(|e| matches!(e.body, EventBody::SysEx { .. }))
-            .nth(index as usize)
-        {
-            let bytes = audio.output_events.sysex_bytes(&event.body);
-            *out_delta_frames = event.sample_offset;
-            *out_bytes = bytes.as_ptr();
-            *out_len = len_u32(bytes.len());
-        }
     }
 }
 
@@ -1396,11 +1541,10 @@ fn register_vst2_inner<P: PluginExport>(layout: &BusLayout) {
         param_set_normalized: cb_param_set_normalized::<P>,
         param_format_current: cb_param_format_current::<P>,
         param_parse: cb_param_parse::<P>,
-        output_event_count: cb_output_event_count::<P>,
-        output_event_at: cb_output_event_at::<P>,
+        begin_output_events: cb_begin_output_events::<P>,
+        next_output_event: cb_next_output_event::<P>,
+        finish_output_events: cb_finish_output_events::<P>,
         push_sysex_input: cb_push_sysex_input::<P>,
-        output_sysex_count: cb_output_sysex_count::<P>,
-        output_sysex_at: cb_output_sysex_at::<P>,
         state_save: cb_state_save::<P>,
         state_load: cb_state_load::<P>,
         state_free: cb_state_free,

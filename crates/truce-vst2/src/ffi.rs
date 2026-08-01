@@ -64,6 +64,18 @@ pub struct Vst2MidiEvent {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Vst2OutputEvent {
+    pub delta_frames: u32,
+    pub kind: u32,
+    pub data_len: u32,
+    pub midi: [u8; 3],
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad: u8,
+    pub sysex: *const u8,
+}
+
+#[repr(C)]
 pub struct Vst2Callbacks {
     pub create: unsafe extern "C" fn() -> *mut c_void,
     pub destroy: unsafe extern "C" fn(ctx: *mut c_void),
@@ -113,15 +125,12 @@ pub struct Vst2Callbacks {
     /// can't be parsed. The parse + set happen Rust-side (VST2 has no
     /// plain<->normalized callback for the shim to bridge).
     pub param_parse: unsafe extern "C" fn(ctx: *mut c_void, id: u32, text: *const c_char) -> i32,
-    /// Number of *encodable* plugin → host MIDI events queued by the
-    /// last `process()` call. Unsupported event types (MIDI 2.0,
-    /// `ParamChange`, Transport) are filtered out so the C shim can
-    /// iterate `0..count` without checking for skipped slots.
-    pub output_event_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
-    /// Fill `out` with the index-th encodable output event. The
-    /// `Vst2MidiEventCompact` shape mirrors the input direction.
-    pub output_event_at:
-        unsafe extern "C" fn(ctx: *mut c_void, index: u32, out: *mut Vst2MidiEvent),
+    /// Preflight the complete ordered output lane and reset its cursor.
+    pub begin_output_events: unsafe extern "C" fn(ctx: *mut c_void, num_frames: u32),
+    /// Return the next native MIDI 1.0 or `SysEx` event without filtering holes.
+    pub next_output_event: unsafe extern "C" fn(ctx: *mut c_void, out: *mut Vst2OutputEvent) -> u32,
+    /// Publish the completed host-delivery result for the next process block.
+    pub finish_output_events: unsafe extern "C" fn(ctx: *mut c_void, status: u32),
     /// `SysEx` input - shim calls once per `kVstSysExType` event in
     /// `effProcessEvents`, **after** stripping the leading `0xF0`
     /// / trailing `0xF7` framing the host includes (Steinberg
@@ -130,22 +139,6 @@ pub struct Vst2Callbacks {
     /// only; valid for the duration of this call.
     pub push_sysex_input:
         unsafe extern "C" fn(ctx: *mut c_void, delta_frames: u32, bytes: *const u8, len: u32),
-    /// Count of `SysEx`-shaped events the plug-in pushed during
-    /// `process()`.
-    pub output_sysex_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
-    /// Fill `out_delta_frames`, `out_bytes`, `out_len` with the
-    /// index-th `SysEx` output event. Returns inner bytes (no
-    /// `0xF0` / `0xF7` framing) - the shim re-adds framing into
-    /// its per-block scratch before handing the bytes to the host.
-    /// Pointer is valid until the next `process()` call clears the
-    /// pool (which happens after the host has consumed the event).
-    pub output_sysex_at: unsafe extern "C" fn(
-        ctx: *mut c_void,
-        index: u32,
-        out_delta_frames: *mut u32,
-        out_bytes: *mut *const u8,
-        out_len: *mut u32,
-    ),
     pub state_save:
         unsafe extern "C" fn(ctx: *mut c_void, out_data: *mut *mut u8, out_len: *mut u32),
     /// Returns `1` when the blob was accepted (truce envelope, or

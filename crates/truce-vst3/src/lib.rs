@@ -267,6 +267,7 @@ impl OutputNoteSlot {
     };
 }
 
+#[derive(Clone, Copy)]
 struct OutputNoteIds {
     slots: [OutputNoteSlot; EVENT_LIST_PREALLOC],
     next_id: i32,
@@ -2044,7 +2045,37 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(ctx: *mut std::ffi:
         audio.output_preflight_status = if audio.output_events.overflow().is_some() {
             VST3_EVENT_QUEUE_FULL
         } else {
-            VST3_EVENT_END
+            let mut note_ids = audio.output_note_ids;
+            audio
+                .output_events
+                .lossless_iter()
+                .find_map(|event| {
+                    if let LosslessEventRef::Typed(Event {
+                        sample_offset,
+                        body: EventBody::ParamChange { id, value },
+                        ..
+                    }) = event
+                    {
+                        let valid = *sample_offset < audio.input_num_frames
+                            && value.is_finite()
+                            && inst.param_infos.iter().any(|info| info.id == *id);
+                        return (!valid).then_some(VST3_EVENT_INVALID);
+                    }
+                    match encode_vst3_output_event::<P>(
+                        event,
+                        &audio.output_events,
+                        &note_ids,
+                        audio.input_num_frames,
+                    ) {
+                        Vst3EncodeResult::Emitted(_, mutation) => {
+                            note_ids.commit(mutation);
+                            None
+                        }
+                        Vst3EncodeResult::Unsupported => Some(VST3_EVENT_UNSUPPORTED),
+                        Vst3EncodeResult::Invalid => Some(VST3_EVENT_INVALID),
+                    }
+                })
+                .unwrap_or(VST3_EVENT_END)
         };
         audio.pending_output_mutation = PendingOutputMutation::None;
     }
@@ -2412,7 +2443,7 @@ fn encode_typed_vst3_output<P: PluginExport>(
             channel,
             note,
             velocity,
-        } if channel < 16 && note < 128 => {
+        } if channel < 16 && note < 128 && velocity < 128 => {
             let Some((note_id, mutation)) =
                 note_ids.propose_note_on(OutputSourceIdentity::Anonymous, bus, channel, note)
             else {
@@ -2430,7 +2461,7 @@ fn encode_typed_vst3_output<P: PluginExport>(
             channel,
             note,
             velocity,
-        } if channel < 16 && note < 128 => {
+        } if channel < 16 && note < 128 && velocity < 128 => {
             let Some((note_id, mutation)) =
                 note_ids.propose_note_off(OutputSourceIdentity::Anonymous, bus, channel, note)
             else {
@@ -2505,7 +2536,7 @@ fn encode_typed_vst3_output<P: PluginExport>(
             group: 0,
             channel,
             value,
-        } if channel < 16 => {
+        } if channel < 16 && value < 16_384 => {
             let (lsb, msb) = pitch_bend_to_bytes(value);
             native.kind = VST3_EVENT_LEGACY_MIDI_CC_OUT;
             native.channel = i16::from(channel);

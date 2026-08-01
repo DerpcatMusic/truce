@@ -848,6 +848,14 @@ pub enum PushError {
 /// Staging failures remain available through [`EventList::overflow`]; keeping
 /// them separate distinguishes framework storage exhaustion from a host queue
 /// refusing an otherwise valid event.
+///
+/// Adapters publish the plugin output lane only, not unrelated GUI-originated
+/// control traffic. A staging [`OutputEventStatus::BufferFull`] prevents
+/// draining and remains authoritative. Otherwise adapters preflight known
+/// [`OutputEventStatus::Invalid`] / [`OutputEventStatus::Unsupported`] blocks
+/// before emission; once draining begins, a present carrier's refusal is
+/// [`OutputEventStatus::HostQueueFull`]. This ordering keeps independent causes
+/// from overwriting one another.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputEventStatus {
     /// Every supported, valid event reached the host.

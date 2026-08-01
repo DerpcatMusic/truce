@@ -1401,6 +1401,13 @@ fn push_exact_with_fallback(
 type ClapTryPush =
     unsafe extern "C" fn(list: *const clap_output_events, event: *const clap_event_header) -> bool;
 
+unsafe extern "C" fn accept_output_push(
+    _list: *const clap_output_events,
+    _event: *const clap_event_header,
+) -> bool {
+    true
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExactEmit {
     Emitted,
@@ -1431,6 +1438,28 @@ fn note_expression_value_is_valid(expression_id: i32, value: f64) -> bool {
         CLAP_NOTE_EXPRESSION_TUNING => (-120.0..=120.0).contains(&value),
         _ => false,
     }
+}
+
+fn midi1_message_len(status: u8) -> Option<usize> {
+    if (0x80..=0xEF).contains(&status) {
+        return Some(if matches!(status & 0xF0, 0xC0 | 0xD0) {
+            2
+        } else {
+            3
+        });
+    }
+    match status {
+        0xF1 | 0xF3 => Some(2),
+        0xF2 => Some(3),
+        0xF6 | 0xF8 | 0xFA | 0xFB | 0xFC | 0xFE | 0xFF => Some(1),
+        _ => None,
+    }
+}
+
+fn raw_midi1_valid(message: RawMidi1) -> bool {
+    let bytes = message.bytes();
+    midi1_message_len(bytes[0]) == Some(bytes.len())
+        && bytes.iter().skip(1).all(|byte| byte & 0x80 == 0)
 }
 
 fn typed_output_body_is_valid(body: &EventBody) -> bool {
@@ -1612,7 +1641,7 @@ unsafe fn emit_exact_clap(
     let flags = clap_exact_flags(event.qualifiers());
     match event.body() {
         ExactEventBody::Midi1 { port, message } => {
-            if *port >= u16::from(info.midi_output_ports) {
+            if *port >= u16::from(info.midi_output_ports) || !raw_midi1_valid(*message) {
                 return ExactEmit::Invalid;
             }
             let ev = clap_event_midi {
@@ -1750,6 +1779,74 @@ unsafe fn emit_exact_clap(
         }
         _ => ExactEmit::Unsupported,
     }
+}
+
+fn preflight_clap_output(
+    events: &EventList,
+    info: &PluginInfo,
+    frames_count: u32,
+) -> OutputEventStatus {
+    for replay in events.lossless_iter() {
+        let event = match replay {
+            LosslessEventRef::Exact(exact) => {
+                let status = unsafe {
+                    emit_exact_clap(
+                        std::ptr::null(),
+                        accept_output_push,
+                        exact,
+                        info,
+                        frames_count,
+                    )
+                };
+                match status {
+                    ExactEmit::Emitted => continue,
+                    ExactEmit::Unsupported => return OutputEventStatus::Unsupported,
+                    ExactEmit::Invalid | ExactEmit::QueueFull => {
+                        return OutputEventStatus::Invalid;
+                    }
+                }
+            }
+            LosslessEventRef::Typed(event) => event,
+        };
+        if event.sample_offset >= frames_count
+            || !typed_output_body_is_valid(&event.body)
+            || (!is_portless_output_body(&event.body)
+                && (info.midi_output_ports == 0 || event.port >= info.midi_output_ports))
+        {
+            return OutputEventStatus::Invalid;
+        }
+        match &event.body {
+            EventBody::SysEx { .. } => {
+                if events.sysex_bytes_checked(&event.body).is_none() {
+                    return OutputEventStatus::Invalid;
+                }
+            }
+            body @ (EventBody::NoteOn2 { .. }
+            | EventBody::NoteOff2 { .. }
+            | EventBody::PolyPressure2 { .. }
+            | EventBody::PerNoteCC { .. }
+            | EventBody::PerNotePitchBend { .. }
+            | EventBody::PerNoteManagement { .. }
+            | EventBody::ControlChange2 { .. }
+            | EventBody::ChannelPressure2 { .. }
+            | EventBody::PitchBend2 { .. }
+            | EventBody::ProgramChange2 { .. }
+            | EventBody::RegisteredController { .. }
+            | EventBody::AssignableController { .. }) => {
+                if info.midi_output_dialect != MidiDialect::Midi2 {
+                    return OutputEventStatus::Unsupported;
+                }
+                if encode_ump_channel_voice_2(body).is_none() {
+                    return OutputEventStatus::Invalid;
+                }
+            }
+            EventBody::ParamMod { .. } | EventBody::Transport(_) => {
+                return OutputEventStatus::Unsupported;
+            }
+            _ => {}
+        }
+    }
+    OutputEventStatus::Success
 }
 
 fn outbound_note_end_pattern(event: ExactEventRef<'_>, info: &PluginInfo) -> Option<VoicePattern> {
@@ -2631,14 +2728,20 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             changed(data.host);
         }
 
-        // Flush GUI-initiated param changes to host output events
-        let output_queue_open = flush_gui_changes::<P>(data, proc.out_events);
+        // GUI delivery has its own queue semantics. The public status belongs
+        // to the plugin output lane, so an unrelated GUI refusal cannot hide
+        // a staging BufferFull root cause.
+        let _ = flush_gui_changes::<P>(data, proc.out_events);
         let mut output_status = scr
             .output_events
             .overflow()
             .map_or(OutputEventStatus::Success, OutputEventStatus::BufferFull);
-        if !output_queue_open {
-            output_status = OutputEventStatus::HostQueueFull;
+        if output_status == OutputEventStatus::Success && !scr.output_events.is_empty() {
+            // CLAP requires globally time-sorted output. Preflight the exact
+            // sequence the host will see before allowing the first push.
+            scr.output_events.ensure_sorted_by_offset();
+            output_status =
+                preflight_clap_output(&scr.output_events, &data.info, proc.frames_count);
         }
 
         // Forward plugin output events (MIDI output from instruments/effects)
@@ -2660,11 +2763,6 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                     ProcessStatus::KeepAlive => CLAP_PROCESS_CONTINUE_IF_NOT_QUIET,
                 };
             };
-            // CLAP requires the output queue sorted by time; a plugin
-            // that pushes block-level events (an LFO, a mode-switch
-            // sweep) after per-event ones would otherwise hand the
-            // host an unsorted queue.
-            scr.output_events.ensure_sorted_by_offset();
             // Exact payloads are authoritative. `lossless_iter` suppresses a
             // linked typed view, and an unsupported exact representation is
             // never replayed through a lossy compatibility conversion.

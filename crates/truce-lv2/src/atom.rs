@@ -433,19 +433,16 @@ pub fn midi_bytes_to_event(sample_offset: u32, bytes: &[u8]) -> Option<Event> {
 // ---------------------------------------------------------------------------
 
 /// Bytes available for sequence *events* in a host output-port buffer.
-/// The host sets `atom.size` to the buffer's total capacity measured
-/// from `out` (the LV2 convention a plugin feeds straight to
-/// `lv2_atom_forge_set_buffer`), so the outer atom header and the
-/// sequence-body header - both written before the first event - come
-/// out of it. Guarding events against the raw `atom.size` would permit
-/// one padded event past the buffer end. Saturating so a degenerate
-/// undersized buffer yields 0 rather than underflowing.
+/// LV2 defines `atom.size` as the bytes following the outer [`Atom`] header,
+/// so it already excludes that header and includes the sequence body plus
+/// events. Only [`AtomSequenceBody`] comes out of the advertised capacity.
+/// Saturating makes a degenerate undersized buffer yield zero.
 ///
 /// # Safety
 /// `out` must point to a readable [`AtomSequence`].
 unsafe fn sequence_event_capacity(out: *const AtomSequence) -> usize {
     let total = unsafe { (*out).atom.size } as usize;
-    total.saturating_sub(core::mem::size_of::<Atom>() + core::mem::size_of::<AtomSequenceBody>())
+    total.saturating_sub(core::mem::size_of::<AtomSequenceBody>())
 }
 
 /// Reset an output atom port to a well-formed, zero-event sequence.
@@ -467,6 +464,105 @@ pub unsafe fn write_empty_sequence(out: *mut AtomSequence, urid: &UridMap) {
         (*out).atom.size = len_u32(core::mem::size_of::<AtomSequenceBody>());
         (*out).body.unit = 0;
         (*out).body.pad = 0;
+    }
+}
+
+fn lv2_midi_body_len(events: &EventList, event: &Event) -> Result<usize, OutputEventStatus> {
+    match event.body {
+        EventBody::NoteOn {
+            group,
+            channel,
+            note,
+            velocity,
+        }
+        | EventBody::NoteOff {
+            group,
+            channel,
+            note,
+            velocity,
+        } if group == 0 && channel < 16 && note < 128 && velocity < 128 => Ok(3),
+        EventBody::Aftertouch {
+            group,
+            channel,
+            note,
+            pressure,
+        } if group == 0 && channel < 16 && note < 128 && pressure < 128 => Ok(3),
+        EventBody::ControlChange {
+            group,
+            channel,
+            cc,
+            value,
+        } if group == 0 && channel < 16 && cc < 128 && value < 128 => Ok(3),
+        EventBody::ChannelPressure {
+            group,
+            channel,
+            pressure,
+        } if group == 0 && channel < 16 && pressure < 128 => Ok(2),
+        EventBody::PitchBend {
+            group,
+            channel,
+            value,
+        } if group == 0 && channel < 16 && value < 16_384 => Ok(3),
+        EventBody::ProgramChange {
+            group,
+            channel,
+            program,
+        } if group == 0 && channel < 16 && program < 128 => Ok(2),
+        EventBody::SysEx { .. } => events
+            .sysex_bytes_checked(&event.body)
+            .filter(|bytes| bytes.iter().all(|byte| byte & 0x80 == 0))
+            .and_then(|bytes| bytes.len().checked_add(2))
+            .ok_or(OutputEventStatus::Invalid),
+        EventBody::NoteOn { .. }
+        | EventBody::NoteOff { .. }
+        | EventBody::Aftertouch { .. }
+        | EventBody::ControlChange { .. }
+        | EventBody::ChannelPressure { .. }
+        | EventBody::PitchBend { .. }
+        | EventBody::ProgramChange { .. } => Err(OutputEventStatus::Invalid),
+        _ => Err(OutputEventStatus::Unsupported),
+    }
+}
+
+unsafe fn preflight_midi_out_sequence(
+    out: *const AtomSequence,
+    events: &EventList,
+    port: u8,
+    port_count: u8,
+) -> OutputEventStatus {
+    let event_capacity = unsafe { sequence_event_capacity(out) };
+    let event_header = core::mem::size_of::<AtomEventHeader>();
+    let mut required = 0usize;
+    for replay in events.lossless_iter() {
+        let LosslessEventRef::Typed(event) = replay else {
+            return OutputEventStatus::Unsupported;
+        };
+        if event.port >= port_count {
+            return OutputEventStatus::Invalid;
+        }
+        if event.port != port {
+            continue;
+        }
+        let body_len = match lv2_midi_body_len(events, event) {
+            Ok(len) => len,
+            Err(status) => return status,
+        };
+        let Some(padded) = event_header
+            .checked_add(body_len)
+            .and_then(|total| total.checked_add(7))
+            .map(|total| total & !7)
+        else {
+            return OutputEventStatus::Invalid;
+        };
+        let Some(next_required) = required.checked_add(padded) else {
+            return OutputEventStatus::Invalid;
+        };
+        required = next_required;
+    }
+    if required > event_capacity {
+        OutputEventStatus::HostQueueFull
+    } else {
+        OutputEventStatus::Success
     }
 }
 
@@ -503,6 +599,11 @@ pub unsafe fn write_midi_out_sequence(
         // exit. `event_capacity` is what's left for events after the
         // two fixed headers `body_start` skips past.
         let event_capacity = sequence_event_capacity(out);
+        let preflight = preflight_midi_out_sequence(out, events, port, port_count);
+        if preflight != OutputEventStatus::Success {
+            write_empty_sequence(out, urid);
+            return preflight;
+        }
         let atom_size = core::mem::size_of::<Atom>();
         let header_size = core::mem::size_of::<AtomSequenceBody>();
         let body_start = out.cast::<u8>().add(atom_size + header_size);
