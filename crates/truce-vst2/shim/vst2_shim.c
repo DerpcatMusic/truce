@@ -729,12 +729,13 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
                 status = TRUCE_VST2_OUTPUT_UNSUPPORTED;
             } else {
                 inst->output_events.numEvents = (int32_t)emitted;
-                VstIntPtr accepted = inst->master(
-                    e, audioMasterProcessEvents, 0, 0,
-                    &inst->output_events, 0.0f);
-                status = accepted != 0
-                    ? TRUCE_VST2_OUTPUT_EMITTED
-                    : TRUCE_VST2_OUTPUT_QUEUE_FULL;
+                /* VST2 hosts disagree on the return value: some return zero
+                 * after consuming the complete batch. The callback has no
+                 * reliable queue-rejection signal, so a completed invocation
+                 * is the strongest truthful success boundary available. */
+                inst->master(e, audioMasterProcessEvents, 0, 0,
+                             &inst->output_events, 0.0f);
+                status = TRUCE_VST2_OUTPUT_EMITTED;
             }
         }
         g_vst2_callbacks->finish_output_events(inst->rust_ctx, status);

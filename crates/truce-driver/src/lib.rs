@@ -52,7 +52,9 @@ use truce_core::cast::sample_rate_u32;
 use truce_core::cast::{len_u32, sample_count_usize};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked};
 use truce_core::config::{AudioConfig, ProcessMode};
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, TransportInfo};
+use truce_core::events::{
+    EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus, TransportInfo,
+};
 use truce_core::export::PluginExport;
 use truce_core::info::PluginCategory;
 use truce_core::plugin::PluginRuntime;
@@ -1029,6 +1031,7 @@ impl<P: PluginExport> PluginDriver<P> {
                 ..Default::default()
             };
             output_events_block.clear();
+            output_events_block.clear_overflow();
 
             let mut transport_snap = transport_info;
             let chunk_args = ChunkedProcess {
@@ -1050,6 +1053,7 @@ impl<P: PluginExport> PluginDriver<P> {
                 chunk_args,
             );
             let _ = audio;
+            output_events_block.ensure_sorted_by_offset();
             // Narrow rendered f64 output back into the f32 `out_bufs`
             // when the plugin's `Sample = f64`. No-op otherwise.
             // SAFETY: same pointers + counts as the `build` call above.
@@ -1071,7 +1075,19 @@ impl<P: PluginExport> PluginDriver<P> {
             // wrapping. The captured offsets are still informative
             // up to that point and clamped beyond rather than
             // silently mis-attributed to early frames.
-            if self.capture.output_events {
+            let output_status = output_events_block.overflow().map_or_else(
+                || {
+                    if output_events_block.is_empty()
+                        || (self.capture.output_events && output_events_block.exact_len() == 0)
+                    {
+                        OutputEventStatus::Success
+                    } else {
+                        OutputEventStatus::Unsupported
+                    }
+                },
+                OutputEventStatus::BufferFull,
+            );
+            if output_status == OutputEventStatus::Success && self.capture.output_events {
                 let cursor_u32 = u32::try_from(cursor).unwrap_or(u32::MAX);
                 for ev in output_events_block.iter() {
                     let mut e = *ev;
@@ -1086,6 +1102,7 @@ impl<P: PluginExport> PluginDriver<P> {
                     }
                 }
             }
+            output_events_block.set_output_status(output_status);
 
             // Capture per-block meters / param snapshots.
             if matches!(self.capture.meters, MeterCapture::PerBlock) {

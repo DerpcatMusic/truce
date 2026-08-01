@@ -26,7 +26,7 @@ use truce_core::buffer::RawBufferScratch;
 use truce_core::cast::{sample_count_usize, sample_rate_u32};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked};
 use truce_core::config::{AudioConfig, ProcessMode};
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList};
+use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus};
 use truce_core::export::PluginExport;
 use truce_core::info::PluginCategory;
 use truce_params::{ParamInfo, Params};
@@ -1917,6 +1917,7 @@ fn audio_callback<P: PluginExport>(
     // arrive one block late at offset 0 instead.
     event_list.clear();
     output_events.clear();
+    output_events.clear_overflow();
     while let Some(ev) = pending.pop() {
         event_list.push(Event {
             sample_offset: 0,
@@ -2076,6 +2077,17 @@ fn audio_callback<P: PluginExport>(
         chunk_args,
     );
     let _ = audio_buffer;
+    let output_status = output_events.overflow().map_or_else(
+        || {
+            if output_events.is_empty() {
+                OutputEventStatus::Success
+            } else {
+                OutputEventStatus::Unsupported
+            }
+        },
+        OutputEventStatus::BufferFull,
+    );
+    output_events.set_output_status(output_status);
     // Narrow rendered f64 output back to host f32 when the plugin's
     // `Sample = f64`. No-op for `f32` plugins.
     // SAFETY: `ptr_scratch.outputs` lives through this function;

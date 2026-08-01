@@ -524,7 +524,7 @@ fn lv2_midi_body_len(events: &EventList, event: &Event) -> Result<usize, OutputE
     }
 }
 
-unsafe fn preflight_midi_out_sequence(
+pub(crate) unsafe fn preflight_midi_out_sequence(
     out: *const AtomSequence,
     events: &EventList,
     port: u8,

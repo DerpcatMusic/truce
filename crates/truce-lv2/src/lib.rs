@@ -741,6 +741,7 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
             );
             // End the `audio` borrow before reaching back into `scratch`.
             let _ = audio;
+            s.output_events.ensure_sorted_by_offset();
             // Narrow rendered output back to host f32 pointers when
             // the plugin's `Sample = f64`. No-op for f32 plugins.
             s.scratch.finish_widening(out_ptrs, num_out, n_samples);
@@ -874,6 +875,32 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                 }
             }
         }
+        if output_status == OutputEventStatus::Success
+            && inst.urid_map.midi_event == 0
+            && !inst.output_events.is_empty()
+        {
+            output_status = OutputEventStatus::Unsupported;
+        }
+        if output_status == OutputEventStatus::Success {
+            // Capacity is known before any port is mutated. Preflight the
+            // complete output set so a narrow later port cannot leave an
+            // earlier port published as a retry-prone prefix.
+            for (i, &out_ptr) in inst.midi_out_ports.iter().enumerate() {
+                if out_ptr.is_null() {
+                    continue;
+                }
+                let port = u8::try_from(i).unwrap_or(u8::MAX);
+                output_status = atom::preflight_midi_out_sequence(
+                    out_ptr,
+                    &inst.output_events,
+                    port,
+                    port_count,
+                );
+                if output_status != OutputEventStatus::Success {
+                    break;
+                }
+            }
+        }
         if output_status == OutputEventStatus::Success {
             for (i, &out_ptr) in inst.midi_out_ports.iter().enumerate() {
                 let port = u8::try_from(i).unwrap_or(u8::MAX);
@@ -887,14 +914,13 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                     port,
                     port_count,
                 );
-                if status == OutputEventStatus::HostQueueFull
-                    || (status != OutputEventStatus::Success
-                        && output_status != OutputEventStatus::HostQueueFull)
-                {
+                if status != OutputEventStatus::Success {
                     output_status = status;
+                    break;
                 }
             }
-        } else {
+        }
+        if output_status != OutputEventStatus::Success {
             for &out_ptr in &inst.midi_out_ports {
                 atom::write_empty_sequence(out_ptr, &inst.urid_map);
             }
