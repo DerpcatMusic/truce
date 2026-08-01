@@ -2,6 +2,12 @@
 
 Notable changes per release.
 
+## 7.0.0
+
+Breaking: `truce-egui` now uses egui and egui-wgpu 0.35. Plugins that name egui types in their editor code must update their direct `egui` dependency to 0.35; the `EguiEditor`, `EditorUi`, and widget APIs otherwise keep the same shape.
+
+- `truce-egui` shares BUFFR's egui 0.35 and wgpu 29 dependency graph, so native BUFFR editor code can move onto Truce without a second incompatible egui stack.
+
 ## 6.3.0
 
 - Per-format builds (`cargo truce build` / `install` / `package` / `run` / `screenshot`) keep a plugin's non-format default features instead of dropping them; `--no-default-features` opts back into a minimal build.
