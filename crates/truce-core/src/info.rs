@@ -4,7 +4,8 @@
 /// variants of [`crate::events::EventBody`] instead of the MIDI 1.0
 /// down-conversion. Formats with a UMP transport (CLAP, AU v3) honor
 /// `Midi2` both ways; VST3 carries the per-note subset via note
-/// expression; VST2 / AU v2 / AAX / LV2 clamp to MIDI 1.0.
+/// expression. AAX exposes its native MIDI 1.0 carrier without converting
+/// MIDI 2.0 events; unrepresentable output is reported as unsupported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum MidiDialect {
     #[default]

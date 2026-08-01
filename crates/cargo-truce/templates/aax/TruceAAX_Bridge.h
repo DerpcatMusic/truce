@@ -15,15 +15,11 @@ typedef void  (*fn_destroy)(void*);
 typedef void  (*fn_reset)(void*, double, uint32_t);
 typedef void  (*fn_set_render_mode)(void*, uint32_t);
 typedef uint32_t (*fn_latency)(void*);
-typedef void  (*fn_process)(void*, const float**, float**, uint32_t, uint32_t, uint32_t,
-                            const TruceAaxMidiEvent*, uint32_t,
-                            const TruceAaxTransportSnapshot*);
-typedef uint32_t (*fn_output_event_count)(void*);
-typedef void     (*fn_output_event_at)(void*, uint32_t, TruceAaxMidiEvent*);
-typedef void     (*fn_push_sysex_input)(void*, uint32_t, const uint8_t*, uint32_t);
-typedef uint32_t (*fn_output_sysex_count)(void*);
-typedef void     (*fn_output_sysex_at)(void*, uint32_t,
-                                        uint32_t*, const uint8_t**, uint32_t*);
+typedef uint32_t (*fn_process_native)(void*, const float**, float**, uint32_t, uint32_t,
+                                      uint32_t, const TruceAaxNativeEvent*, uint32_t,
+                                      uint32_t, const TruceAaxTransportSnapshot*);
+typedef void     (*fn_begin_output_events)(void*, uint32_t);
+typedef uint32_t (*fn_next_output_event)(void*, TruceAaxNativeEvent*);
 typedef double (*fn_get_param)(void*, uint32_t);
 typedef void   (*fn_set_param)(void*, uint32_t, double);
 typedef void   (*fn_format_param)(void*, uint32_t, double, char*, uint32_t);
@@ -51,12 +47,9 @@ struct TruceBridge {
     fn_reset               reset;
     fn_set_render_mode     set_render_mode;
     fn_latency             latency;
-    fn_process             process;
-    fn_output_event_count  output_event_count;
-    fn_output_event_at     output_event_at;
-    fn_push_sysex_input    push_sysex_input;
-    fn_output_sysex_count  output_sysex_count;
-    fn_output_sysex_at     output_sysex_at;
+    fn_process_native      process_native;
+    fn_begin_output_events begin_output_events;
+    fn_next_output_event   next_output_event;
     fn_get_param           get_param;
     fn_set_param           set_param;
     fn_format_param        format_param;

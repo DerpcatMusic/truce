@@ -3,6 +3,7 @@
 #include "AAX_CMonolithicParameters.h"
 #include "AAX_IMIDINode.h"
 #include "TruceAAX_Bridge.h"
+#include <vector>
 
 // Extended render-info struct used by TruceAAX_Describe.cpp's hand-built
 // component descriptor.
@@ -102,6 +103,10 @@ private:
     // EffectInit so RenderAudio stays alloc-free; shared read-only across
     // every silent channel.
     std::vector<float> mSilence;
+    // Fixed-capacity native MIDI transaction scratch. Reserved in EffectInit;
+    // RenderAudio only clears and appends within these bounds.
+    std::vector<TruceAaxNativeEvent> mNativeEvents;
+    std::vector<uint8_t> mNativeSysex;
     // Last latency (samples) pushed to the host via SetSignalLatency.
     // -1 sentinel so the first TimerWakeup always reports, even if the
     // plugin's latency is 0. Touched only on the host idle thread.
