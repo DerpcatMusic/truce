@@ -514,6 +514,13 @@ fn parse_range_value(
         let (lo, hi) = parse_pair_f64(inner)?;
         return Ok(Lv2Range::Linear { min: lo, max: hi });
     }
+    // LV2 control ports cannot express an arbitrary floating step interval in
+    // their range metadata. Preserve the numeric bounds; runtime snapping
+    // still occurs in the parameter implementation.
+    if let Some(inner) = s.strip_prefix("stepped(").and_then(|x| x.strip_suffix(')')) {
+        let (lo, hi) = parse_leading_pair_f64(inner)?;
+        return Ok(Lv2Range::Linear { min: lo, max: hi });
+    }
     if let Some(inner) = s.strip_prefix("log(").and_then(|x| x.strip_suffix(')')) {
         let (lo, hi) = parse_pair_f64(inner)?;
         return Ok(Lv2Range::Logarithmic { min: lo, max: hi });

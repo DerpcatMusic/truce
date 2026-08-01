@@ -89,7 +89,7 @@ pub const TRUCE_AAX_RANGE_CUSTOM: u8 = 3;
 /// `Reversed(Discrete/Enum)` stays a stepped param with a reversed taper.
 fn aax_range_type(range: &ParamRange) -> u8 {
     match range {
-        ParamRange::Linear { .. } => TRUCE_AAX_RANGE_LINEAR,
+        ParamRange::Linear { .. } | ParamRange::Stepped { .. } => TRUCE_AAX_RANGE_LINEAR,
         // Skew shapes have no native AAX taper; a reversed range's
         // `1 - inner.normalize` has none either. Both route through the
         // custom taper (truce's own normalize/denormalize).

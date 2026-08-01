@@ -129,6 +129,13 @@ pub fn format_param_value(info: &ParamInfo, value: f64) -> String {
                 std::cmp::Ordering::Greater => format!("{pct}R"),
             }
         }
+        ParamUnit::Custom(unit) => {
+            if is_int {
+                format!("{int_value}{unit}")
+            } else {
+                format!("{value:.2}{unit}")
+            }
+        }
         ParamUnit::None => {
             if is_int {
                 format!("{int_value}")

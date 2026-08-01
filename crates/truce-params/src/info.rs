@@ -157,6 +157,8 @@ pub enum ParamUnit {
     Semitones,
     Pan,
     Degrees,
+    /// Plugin-defined host/display suffix, preserved verbatim.
+    Custom(&'static str),
 }
 
 impl ParamUnit {
@@ -171,6 +173,7 @@ impl ParamUnit {
             Self::Percent => "%",
             Self::Semitones => "st",
             Self::Degrees => "°",
+            Self::Custom(unit) => unit,
             Self::Pan | Self::None => "",
         }
     }

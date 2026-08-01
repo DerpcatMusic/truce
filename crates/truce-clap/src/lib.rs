@@ -3150,7 +3150,7 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
             ParamRange::Enum { .. } => {
                 flags |= CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM;
             }
-            ParamRange::Discrete { .. } => {
+            ParamRange::Discrete { .. } | ParamRange::Stepped { .. } => {
                 flags |= CLAP_PARAM_IS_STEPPED;
             }
             _ => {}
@@ -3686,9 +3686,9 @@ unsafe extern "C" fn audio_ports_count<P: PluginExport>(
         return 0;
     };
     if is_input {
-        len_u32(layout.inputs.len())
+        len_u32(layout.inputs.iter().filter(|bus| bus.enabled).count())
     } else {
-        len_u32(layout.outputs.len())
+        len_u32(layout.outputs.iter().filter(|bus| bus.enabled).count())
     }
 }
 
@@ -3711,7 +3711,7 @@ unsafe extern "C" fn audio_ports_get<P: PluginExport>(
             &layout.outputs
         };
 
-        let Some(bus) = buses.get(index as usize) else {
+        let Some(bus) = buses.iter().filter(|bus| bus.enabled).nth(index as usize) else {
             return false;
         };
 
@@ -3777,25 +3777,29 @@ unsafe extern "C" fn audio_ports_config_get<P: PluginExport>(
             layout.total_output_channels()
         );
         copy_str_to_buf(&mut out.name, &name);
-        out.input_port_count = len_u32(layout.inputs.len());
-        out.output_port_count = len_u32(layout.outputs.len());
-        out.has_main_input = !layout.inputs.is_empty();
+        out.input_port_count = len_u32(layout.inputs.iter().filter(|bus| bus.enabled).count());
+        out.output_port_count = len_u32(layout.outputs.iter().filter(|bus| bus.enabled).count());
+        out.has_main_input = layout.inputs.iter().any(|bus| bus.enabled);
         out.main_input_channel_count = layout
             .inputs
-            .first()
+            .iter()
+            .find(|bus| bus.enabled)
             .map_or(0, |b| b.channels.channel_count());
         out.main_input_port_type = layout
             .inputs
-            .first()
+            .iter()
+            .find(|bus| bus.enabled)
             .map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
-        out.has_main_output = !layout.outputs.is_empty();
+        out.has_main_output = layout.outputs.iter().any(|bus| bus.enabled);
         out.main_output_channel_count = layout
             .outputs
-            .first()
+            .iter()
+            .find(|bus| bus.enabled)
             .map_or(0, |b| b.channels.channel_count());
         out.main_output_port_type = layout
             .outputs
-            .first()
+            .iter()
+            .find(|bus| bus.enabled)
             .map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
         true
     }

@@ -1247,6 +1247,33 @@ fn parse_range_tokens(range: &str) -> proc_macro2::TokenStream {
         let (min, max) = (f64_lit(min), f64_lit(max));
         return quote! { ::truce::params::ParamRange::Linear { min: #min, max: #max } };
     }
+    if let Some(inner) = range
+        .strip_prefix("stepped(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.len() != 3 {
+            return bad(format!(
+                "stepped range needs three arguments `stepped(min, max, step)`, got `stepped({inner})`"
+            ));
+        }
+        let Ok(min) = parts[0].parse::<f64>() else {
+            return bad(format!("stepped range min `{}` is not a number", parts[0]));
+        };
+        let Ok(max) = parts[1].parse::<f64>() else {
+            return bad(format!("stepped range max `{}` is not a number", parts[1]));
+        };
+        let Ok(step) = parts[2].parse::<f64>() else {
+            return bad(format!("stepped range step `{}` is not a number", parts[2]));
+        };
+        if !min.is_finite() || !max.is_finite() || !step.is_finite() || min >= max || step <= 0.0 {
+            return bad(format!(
+                "stepped range needs finite min < max and step > 0, got `stepped({min}, {max}, {step})`"
+            ));
+        }
+        let (min, max, step) = (f64_lit(min), f64_lit(max), f64_lit(step));
+        return quote! { ::truce::params::ParamRange::Stepped { min: #min, max: #max, step: #step } };
+    }
     if let Some(inner) = range.strip_prefix("log(").and_then(|s| s.strip_suffix(')')) {
         let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
         if parts.len() != 2 {
@@ -1336,7 +1363,7 @@ fn parse_range_tokens(range: &str) -> proc_macro2::TokenStream {
     }
     bad(format!(
         "unknown range `{range}` - supported: linear(min, max), log(min, max), \
-         skewed(min, max, factor), sym_skewed(min, max, factor, center), \
+         stepped(min, max, step), skewed(min, max, factor), sym_skewed(min, max, factor, center), \
          discrete(min, max), enum(count), reversed(<range>)"
     ))
 }
@@ -1360,7 +1387,7 @@ fn range_bounds(range: &str) -> Option<(f64, f64)> {
         let hi = parts.get(1)?.parse::<f64>().ok()?;
         Some((lo.min(hi), lo.max(hi)))
     };
-    for prefix in ["linear(", "log(", "skewed(", "sym_skewed("] {
+    for prefix in ["linear(", "stepped(", "log(", "skewed(", "sym_skewed("] {
         if let Some(inner) = range.strip_prefix(prefix).and_then(|s| s.strip_suffix(')')) {
             return leading_pair(inner);
         }
@@ -1420,6 +1447,9 @@ fn default_range_error(f: &ParamField) -> Option<String> {
 
 /// Parse a unit string into `ParamUnit` tokens.
 fn parse_unit_tokens(unit: &str) -> proc_macro2::TokenStream {
+    if let Some(suffix) = unit.strip_prefix("custom:") {
+        return quote! { ::truce::params::ParamUnit::Custom(#suffix) };
+    }
     match unit {
         "dB" | "Db" | "db" => quote! { ::truce::params::ParamUnit::Db },
         "Hz" | "hz" => quote! { ::truce::params::ParamUnit::Hz },
@@ -1435,8 +1465,9 @@ fn parse_unit_tokens(unit: &str) -> proc_macro2::TokenStream {
         // to `ParamUnit::None` and surface only as "0.5" instead of
         // "0.5 Hz" in the host.
         other => {
-            let msg =
-                format!("unknown unit `{other}` - supported: dB, Hz, ms, s, %, st, pan, deg, none");
+            let msg = format!(
+                "unknown unit `{other}` - supported: dB, Hz, ms, s, %, st, pan, deg, none, custom:<suffix>"
+            );
             quote! { compile_error!(#msg) }
         }
     }
@@ -1448,6 +1479,9 @@ fn parse_flags_tokens(flags: &str) -> proc_macro2::TokenStream {
     for flag in flags.split('|').map(|s| s.trim().to_lowercase()) {
         match flag.as_str() {
             "automatable" => parts.push(quote! { ::truce::params::ParamFlags::AUTOMATABLE }),
+            "non_automatable" => {
+                parts.push(quote! { ::truce::params::ParamFlags::empty() });
+            }
             "hidden" => parts.push(quote! { ::truce::params::ParamFlags::HIDDEN }),
             "readonly" => parts.push(quote! { ::truce::params::ParamFlags::READONLY }),
             "bypass" => parts.push(quote! { ::truce::params::ParamFlags::IS_BYPASS }),
@@ -1463,7 +1497,7 @@ fn parse_flags_tokens(flags: &str) -> proc_macro2::TokenStream {
             "" => {}
             other => {
                 let msg = format!(
-                    "unknown param flag `{other}` - supported: automatable, hidden, \
+                    "unknown param flag `{other}` - supported: automatable, non_automatable, hidden, \
                      readonly, bypass, modulatable, modulatable_per_note",
                 );
                 return quote! { compile_error!(#msg) };

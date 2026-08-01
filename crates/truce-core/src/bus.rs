@@ -27,6 +27,9 @@ pub struct BusConfig {
     pub name: &'static str,
     pub channels: ChannelConfig,
     pub kind: BusKind,
+    /// Whether this bus is present in the selected dynamic layout. Fixed-
+    /// topology adapters may still describe the bus structurally.
+    pub enabled: bool,
 }
 
 /// Whether a bus is the plugin's main audio I/O or a secondary
@@ -115,6 +118,7 @@ impl BusLayout {
             name,
             channels,
             kind,
+            enabled: true,
         });
         self
     }
@@ -128,6 +132,26 @@ impl BusLayout {
             name,
             channels,
             kind: BusKind::Sidechain,
+            enabled: true,
+        });
+        self
+    }
+
+    /// Append a structurally stable sidechain which a dynamic bus layout may
+    /// omit. This keeps VST3 bus count/kind/width immutable while CLAP can
+    /// expose only the ports enabled by its selected configuration.
+    #[must_use]
+    pub fn with_optional_sidechain_input(
+        mut self,
+        name: &'static str,
+        channels: ChannelConfig,
+        enabled: bool,
+    ) -> Self {
+        self.inputs.push(BusConfig {
+            name,
+            channels,
+            kind: BusKind::Sidechain,
+            enabled,
         });
         self
     }
@@ -138,6 +162,7 @@ impl BusLayout {
             name,
             channels,
             kind: BusKind::Main,
+            enabled: true,
         });
         self
     }
@@ -147,19 +172,24 @@ impl BusLayout {
         self.inputs
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.kind == BusKind::Sidechain)
+            .filter(|(_, b)| b.enabled && b.kind == BusKind::Sidechain)
             .map(|(i, _)| i)
     }
 
     #[must_use]
     pub fn total_input_channels(&self) -> u32 {
-        self.inputs.iter().map(|b| b.channels.channel_count()).sum()
+        self.inputs
+            .iter()
+            .filter(|b| b.enabled)
+            .map(|b| b.channels.channel_count())
+            .sum()
     }
 
     #[must_use]
     pub fn total_output_channels(&self) -> u32 {
         self.outputs
             .iter()
+            .filter(|b| b.enabled)
             .map(|b| b.channels.channel_count())
             .sum()
     }
