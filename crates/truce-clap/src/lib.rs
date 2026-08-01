@@ -3323,11 +3323,25 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
         if info.flags.contains(ParamFlags::MODULATABLE_PER_NOTE) {
             flags |= CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID;
         }
-        match &info.range {
+        match info.range.base() {
             ParamRange::Enum { .. } => {
                 flags |= CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM;
             }
-            ParamRange::Discrete { .. } | ParamRange::Stepped { .. } => {
+            ParamRange::Discrete { .. } => {
+                flags |= CLAP_PARAM_IS_STEPPED;
+            }
+            // CLAP's stepped flag means every plain value is an integer.
+            // Keep fractional fixed-step ranges quantized in Truce, but
+            // advertise them as continuous to CLAP hosts so the descriptor
+            // stays valid and the plug-in remains loadable.
+            ParamRange::Stepped { min, max, step }
+                if min.is_finite()
+                    && max.is_finite()
+                    && step.is_finite()
+                    && min.fract() == 0.0
+                    && max.fract() == 0.0
+                    && step.fract() == 0.0 =>
+            {
                 flags |= CLAP_PARAM_IS_STEPPED;
             }
             _ => {}

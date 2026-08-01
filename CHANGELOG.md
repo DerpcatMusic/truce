@@ -8,6 +8,7 @@ Breaking: move every direct `truce*` dependency in a plugin to 7.0 together. `tr
 
 - `truce-egui` shares BUFFR's egui 0.35 and wgpu 29 dependency graph, so native BUFFR editor code can move onto Truce without a second incompatible egui stack.
 - Plug-ins can inspect whether the preceding output-event block succeeded, overflowed staging, met a full host queue, used an unsupported carrier, or contained invalid data; MIDI and process-emitted parameter feedback reject known incomplete, failed, or unavailable blocks before delivery across CLAP, VST3, Audio Unit, AAX, LV2, VST2, standalone, and the offline driver.
+- CLAP descriptors keep fractional fixed-step parameters loadable by exposing them as continuous host ranges while Truce still applies the plug-in's requested quantization.
 
 ## 6.3.0
 
