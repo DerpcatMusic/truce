@@ -23,12 +23,18 @@ import AppKit
 
 // MARK: - UMP helpers
 
-/// `AURenderEventMIDIEventList` raw value from
-/// `AudioToolbox/AudioUnitProperties.h`. Compared against
-/// `head.eventType.rawValue` instead of a Swift enum case so older
-/// Xcode versions (where the case isn't yet imported) still
-/// compile. The enum value is stable per Apple's header.
-let kAURenderEventMIDIEventListRaw: UInt16 = 10
+/// `AURenderEventMIDISysEx` / `AURenderEventMIDIEventList` raw values from
+/// `AudioToolbox/AudioUnitProperties.h`. Compare the imported event's raw
+/// discriminator so the code does not depend on Swift overlay case spelling.
+let kAURenderEventMIDISysExRaw: UInt8 = 9
+let kAURenderEventMIDIEventListRaw: UInt8 = 10
+private let auMIDIDataOffset = MemoryLayout<AUMIDIEvent>.offset(of: \AUMIDIEvent.data)!
+private let auMIDIEventListOffset =
+    MemoryLayout<AUMIDIEventList>.offset(of: \AUMIDIEventList.eventList)!
+private let midiEventListPacketOffset =
+    MemoryLayout<MIDIEventList>.offset(of: \MIDIEventList.packet)!
+private let midiEventPacketWordsOffset =
+    MemoryLayout<MIDIEventPacket>.offset(of: \MIDIEventPacket.words)!
 
 /// The ABI tail version the plugin binary declares, or 0 when the
 /// version word lacks its 'TAu\0' magic tag. A pre-2.0 binary has the
@@ -48,96 +54,80 @@ func truceAbiTailVersion(_ cb: UnsafePointer<AuCallbacks>) -> UInt32 {
 /// UMP packet length in 32-bit words by message type. Spec: MIDI
 /// 2.0 M2-104-UM, §2.1.4 (Message Type field).
 @inline(__always) func umpPacketLength(messageType mt: UInt8) -> Int {
-    switch mt {
-    case 0x0, 0x1, 0x2: return 1            // utility, system, MIDI 1.0 CV
-    case 0x3, 0x4: return 2                  // SysEx-7, MIDI 2.0 CV
-    case 0x5, 0xD, 0xE, 0xF: return 4        // data 128, flex, UMP stream
-    default: return 1
+    switch mt & 0xF {
+    case 0x0, 0x1, 0x2, 0x6, 0x7: return 1
+    case 0x3, 0x4, 0x8, 0x9, 0xA: return 2
+    case 0xB, 0xC: return 3
+    default: return 4
     }
 }
 
-/// Read the `MIDIEventsList` slot of an `AURenderEvent` and forward
-/// every UMP it carries into the appropriate AuMidi(2)Event buffer.
-/// Returns `(midi1_added, midi2_added)`. Pointer-based: avoids the
-/// Swift overlay's `.midiEventList` discriminator which isn't
-/// exposed on every Xcode version we want to support.
+@inline(__always) func sampleOffset(
+    _ eventTime: AUEventSampleTime, _ bufferStart: Int64, _ frameCount: UInt32
+) -> UInt32? {
+    let (relative, overflow) = eventTime.subtractingReportingOverflow(bufferStart)
+    guard !overflow, relative >= 0, relative < Int64(frameCount) else { return nil }
+    return UInt32(relative)
+}
+
+/// Forward every UMP in Apple's native `AUMIDIEventList` layout without
+/// decoding or changing its protocol, cable, words, or packet width.
 func forwardMIDIEventList(
     event: UnsafePointer<AURenderEvent>,
     bufStart: Int64,
     frameCount: UInt32,
-    midiBuf: UnsafeMutablePointer<AuMidiEvent>, midiStart: UInt32,
-    midi2Buf: UnsafeMutablePointer<AuMidi2Event>, midi2Start: UInt32
-) -> (UInt32, UInt32) {
-    // AURenderEvent is a tagged union; reach into the variable-length
-    // `MIDIEventsList` tail via raw pointer arithmetic so the code
-    // compiles on Xcodes that haven't imported the overlay symbol.
-    // Only the tail needs hand offsets - the fixed header (timing) is
-    // read through the Swift overlay to avoid mis-offsetting it:
-    //   AUMIDIEventList { AURenderEventHeader head; MIDIEventList list; }
-    // `eventSampleTime` lives inside `head`; the list begins one
-    // aligned `AURenderEventHeader` past the event base. Reading the
-    // timestamp from a hand offset instead traps on `Int64` overflow
-    // when the offset lands on header padding.
-    let raw = UnsafeRawPointer(event)
-    let absTime = event.pointee.head.eventSampleTime
-    let relOffset = max(0, absTime - bufStart)
-    let offset = UInt32(min(relOffset, Int64(frameCount - 1)))
-    // MIDIEventList layout (CoreMIDI/MIDIServices.h):
-    //   MIDIProtocolID protocol; uint32_t numPackets;
-    //   MIDIEventPacket packet[1];  // variable-length tail
-    let listBase = raw.advanced(by: MemoryLayout<AURenderEventHeader>.stride)
-    let proto = listBase.assumingMemoryBound(to: UInt32.self).pointee
-    let numPackets = listBase.advanced(by: 4).assumingMemoryBound(to: UInt32.self).pointee
-    // Protocol 1 = MIDI 1.0 UMP, 2 = MIDI 2.0 UMP. We accept both.
-    _ = proto
-    var pktBase = listBase.advanced(by: 8) // start of first packet
-    var midiCount: UInt32 = midiStart
-    var midi2Count: UInt32 = midi2Start
+    nativeBuf: UnsafeMutablePointer<AuNativeEvent>,
+    nativeCount: inout UInt32,
+    overflow: inout UInt32
+) -> Bool {
+    let native = UnsafeRawPointer(event).assumingMemoryBound(to: AUMIDIEventList.self)
+    let list = UnsafeRawPointer(native).advanced(by: auMIDIEventListOffset)
+        .assumingMemoryBound(to: MIDIEventList.self)
+    let rawProtocol = list.pointee.protocol.rawValue
+    guard rawProtocol == 1 || rawProtocol == 2 else { return false }
+    let protocolID = UInt8(rawProtocol)
+    var packet = UnsafeRawPointer(list).advanced(by: midiEventListPacketOffset)
+        .assumingMemoryBound(to: MIDIEventPacket.self)
+    let numPackets = list.pointee.numPackets
     var packetIdx: UInt32 = 0
-    while packetIdx < numPackets && midiCount < 256 && midi2Count < 256 {
-        // MIDIEventPacket: { MIDITimeStamp timeStamp; uint32_t
-        // wordCount; uint32_t words[64]; }
-        let wordCount = pktBase.advanced(by: 8).assumingMemoryBound(to: UInt32.self).pointee
-        let wordsPtr = pktBase.advanced(by: 12).assumingMemoryBound(to: UInt32.self)
+    while packetIdx < numPackets {
+        let wordCount = packet.pointee.wordCount
+        guard wordCount > 0,
+              let packetTime = Int64(exactly: packet.pointee.timeStamp),
+              let offset = sampleOffset(packetTime, bufStart, frameCount) else {
+            return false
+        }
+        let words = UnsafeRawPointer(packet).advanced(by: midiEventPacketWordsOffset)
+            .assumingMemoryBound(to: UInt32.self)
         var i: UInt32 = 0
-        while i < wordCount && midiCount < 256 && midi2Count < 256 {
-            let w0 = (wordsPtr + Int(i)).pointee
+        while i < wordCount {
+            let w0 = words[Int(i)]
             let mt = UInt8((w0 >> 28) & 0xF)
             let packetWords = UInt32(umpPacketLength(messageType: mt))
-            if i + packetWords > wordCount { break }
-            if mt == 0x2 {
-                // MIDI 1.0 CV: extract the 3-byte legacy message
-                // so the existing Rust decoder handles it.
-                midiBuf[Int(midiCount)] = AuMidiEvent(
-                    sample_offset: offset,
-                    status: UInt8((w0 >> 16) & 0xFF),
-                    data1: UInt8((w0 >> 8) & 0xFF),
-                    data2: UInt8(w0 & 0xFF),
-                    port: 0)
-                midiCount += 1
-            } else if mt == 0x3 || mt == 0x4 || mt == 0x5 {
-                // MIDI 2.0 CV (0x4), SysEx-7 (0x3), SysEx-8 (0x5):
-                // forward the packet words verbatim. The Rust side
-                // dispatches on message type - decoding CV via
-                // `decode_ump_channel_voice_2` and reassembling the
-                // SysEx-7/8 packet chains into one `EventBody::SysEx`.
-                // Reads as `[u32; 4]`; zero-pad the unused tail.
-                let w1 = packetWords > 1 ? (wordsPtr + Int(i) + 1).pointee : 0
-                let w2 = packetWords > 2 ? (wordsPtr + Int(i) + 2).pointee : 0
-                let w3 = packetWords > 3 ? (wordsPtr + Int(i) + 3).pointee : 0
-                midi2Buf[Int(midi2Count)] = AuMidi2Event(
-                    sample_offset: offset,
-                    words: (w0, w1, w2, w3))
-                midi2Count += 1
+            if packetWords > wordCount - i { return false }
+            if nativeCount < 256 {
+                var out = AuNativeEvent()
+                out.sample_offset = offset
+                out.port = UInt16(native.pointee.cable)
+                out.kind = UInt8(AU_NATIVE_EVENT_UMP)
+                out.protocol = protocolID
+                out.data_len = packetWords
+                out.words = (
+                    w0,
+                    packetWords > 1 ? words[Int(i + 1)] : 0,
+                    packetWords > 2 ? words[Int(i + 2)] : 0,
+                    packetWords > 3 ? words[Int(i + 3)] : 0)
+                nativeBuf[Int(nativeCount)] = out
+                nativeCount += 1
+            } else {
+                overflow = 1
             }
             i += packetWords
         }
-        // Advance to the next packet. Variable-length packets are
-        // tightly packed; total bytes = header (12) + wordCount * 4.
-        pktBase = pktBase.advanced(by: 12 + Int(wordCount) * 4)
+        packet = UnsafePointer(MIDIEventPacketNext(packet))
         packetIdx += 1
     }
-    return (midiCount - midiStart, midi2Count - midi2Start)
+    return true
 }
 
 // A deinterleaved float32 format for `channels`. `standardFormat` only
@@ -195,8 +185,8 @@ class TruceAUAudioUnit: AUAudioUnit {
         // their names) but lays out `AuCallbacks` differently -
         // calling `create` there would jump through the wrong slot.
         // Refuse instantiation instead of crashing the extension.
-        guard truceAbiTailVersion(callbacks) >= 1 else {
-            logger.error("AU init: plugin binary predates the AU ABI version word; rebuild the framework with a matching truce version")
+        guard truceAbiTailVersion(callbacks) >= 6 else {
+            logger.error("AU init: plugin binary lacks the native event ABI; rebuild the framework and appex with the same truce version")
             throw NSError(domain: NSOSStatusErrorDomain,
                           code: Int(kAudioUnitErr_FailedInitialization))
         }
@@ -459,14 +449,13 @@ class TruceAUAudioUnit: AUAudioUnit {
         events: UnsafePointer<AURenderEvent>?, pull: AURenderPullInputBlock?,
         inPtrs: UnsafeMutablePointer<UnsafePointer<Float>?>,
         outPtrs: UnsafeMutablePointer<UnsafeMutablePointer<Float>?>,
-        midiBuf: UnsafeMutablePointer<AuMidiEvent>,
+        nativeBuf: UnsafeMutablePointer<AuNativeEvent>,
         scCh: Int,
         scScratch: UnsafeMutablePointer<Float>?,
         scABL: UnsafeMutableAudioBufferListPointer?,
         scMaxFrames: Int,
         mainInScratch: UnsafeMutablePointer<Float>?,
         mainInABL: UnsafeMutableAudioBufferListPointer?,
-        midi2Buf: UnsafeMutablePointer<AuMidi2Event>,
         paramBuf: UnsafeMutablePointer<AuParamEvent>,
         transportBuf: UnsafeMutablePointer<AuTransportSnapshot>,
         sysexOutScratch: UnsafeMutablePointer<UInt8>,
@@ -477,11 +466,7 @@ class TruceAUAudioUnit: AUAudioUnit {
         // Type-erased `AUMIDIEventListBlock?` (the UMP output block).
         // Passed as `Any?` so this signature doesn't reference the
         // macOS-12 / iOS-15-only type; cast back under `#available`.
-        midiOutputListBlock: Any?,
-        // `true` when the host set `hostMIDIProtocol` to MIDI 1.0 -
-        // the UMP drain then declares a 1.0 list and asks the Rust
-        // side for an MT 0x2 stream.
-        hostWantsMidi1: Bool
+        midiOutputListBlock: Any?
     ) -> AUAudioUnitStatus {
         // Reject a block larger than the scratch was sized for: writing
         // frameCount frames at the scMaxFrames stride would overrun the
@@ -511,40 +496,69 @@ class TruceAUAudioUnit: AUAudioUnit {
                 if s != noErr { return s }
             }
         }
-        var numMidi: UInt32 = 0
-        var numMidi2: UInt32 = 0
+        var numNative: UInt32 = 0
+        var nativeOverflow: UInt32 = 0
         var numParam: UInt32 = 0
-        let bufStart = Int64(timestamp.pointee.mSampleTime)
+        var paramOverflow: UInt32 = 0
+        let sampleTime = timestamp.pointee.mSampleTime
+        guard sampleTime.isFinite,
+              sampleTime.rounded(.towardZero) == sampleTime,
+              sampleTime >= Double(Int64.min),
+              sampleTime < Double(Int64.max) else {
+            return kAudio_ParamError
+        }
+        let bufStart = Int64(sampleTime)
         var ev = events
-        while let event = ev, numMidi < 256 && numMidi2 < 256 && numParam < 256 {
+        while let event = ev {
             let head = event.pointee.head
             if head.eventType == .MIDI {
-                let m = event.pointee.MIDI
-                // Convert absolute eventSampleTime to relative offset within buffer
-                let absTime = m.eventSampleTime
-                let relOffset = max(0, absTime - bufStart)
-                midiBuf[Int(numMidi)] = AuMidiEvent(
-                    sample_offset: UInt32(min(relOffset, Int64(frameCount - 1))),
-                    status: m.data.0, data1: m.length > 1 ? m.data.1 : 0,
-                    data2: m.length > 2 ? m.data.2 : 0, port: 0)
-                numMidi += 1
+                let native = UnsafeRawPointer(event).assumingMemoryBound(to: AUMIDIEvent.self)
+                let m = native.pointee
+                guard let offset = sampleOffset(m.eventSampleTime, bufStart, frameCount),
+                      m.length > 0, m.length <= 3 else { return kAudio_ParamError }
+                if numNative < 256 {
+                    var out = AuNativeEvent()
+                    out.sample_offset = offset
+                    out.port = UInt16(m.cable)
+                    out.kind = UInt8(AU_NATIVE_EVENT_MIDI1)
+                    out.data_len = UInt32(m.length)
+                    out.midi = m.data
+                    nativeBuf[Int(numNative)] = out
+                    numNative += 1
+                } else {
+                    nativeOverflow = 1
+                }
+            } else if head.eventType.rawValue == kAURenderEventMIDISysExRaw {
+                let native = UnsafeRawPointer(event).assumingMemoryBound(to: AUMIDIEvent.self)
+                let m = native.pointee
+                let data = UnsafeRawPointer(native).advanced(by: auMIDIDataOffset)
+                    .assumingMemoryBound(to: UInt8.self)
+                guard let offset = sampleOffset(m.eventSampleTime, bufStart, frameCount),
+                      m.length >= 2,
+                      data[0] == 0xF0,
+                      data[Int(m.length) - 1] == 0xF7 else {
+                    return kAudio_ParamError
+                }
+                if numNative < 256 {
+                    var out = AuNativeEvent()
+                    out.sample_offset = offset
+                    out.port = UInt16(m.cable)
+                    out.kind = UInt8(AU_NATIVE_EVENT_SYSEX)
+                    out.data_len = UInt32(m.length)
+                    out.sysex = data
+                    nativeBuf[Int(numNative)] = out
+                    numNative += 1
+                } else {
+                    nativeOverflow = 1
+                }
             } else if head.eventType.rawValue == kAURenderEventMIDIEventListRaw {
-                // iOS 17+ / macOS 14+: AU hosts deliver UMPs through
-                // AURenderEvent.MIDIEventsList (CoreMIDI's MIDIEventList
-                // structure). Walk the packet list and classify each
-                // word group by UMP message type - MIDI 1.0 channel
-                // voice (mt=0x2, 32 bits) flows through the legacy
-                // 3-byte path; MIDI 2.0 channel voice (mt=0x4, 64
-                // bits) flows through midi2Buf. Other UMP types
-                // (utility, system, SysEx, data) are not surfaced.
-                let (midiAdded, midi2Added) = forwardMIDIEventList(
+                guard forwardMIDIEventList(
                     event: event,
                     bufStart: bufStart,
                     frameCount: frameCount,
-                    midiBuf: midiBuf, midiStart: numMidi,
-                    midi2Buf: midi2Buf, midi2Start: numMidi2)
-                numMidi += midiAdded
-                numMidi2 += midi2Added
+                    nativeBuf: nativeBuf,
+                    nativeCount: &numNative,
+                    overflow: &nativeOverflow) else { return kAudio_ParamError }
             } else if head.eventType == .parameter || head.eventType == .parameterRamp {
                 // Decode .parameter / .parameterRamp into AuParamEvent
                 // with the proper within-block sample offset so the
@@ -555,17 +569,21 @@ class TruceAUAudioUnit: AUAudioUnit {
                 // matches truce-vst3's step-at-point treatment of VST3
                 // parameter queues.
                 //
-                // `eventSampleTime` is absolute (host timeline);
-                // subtract `bufStart` to get a within-block offset
-                // and clamp to [0, frameCount - 1] for safety.
                 let absTime = event.pointee.parameter.eventSampleTime
-                let relOffset = max(0, absTime - bufStart)
-                let clamped = UInt32(min(relOffset, Int64(frameCount - 1)))
-                paramBuf[Int(numParam)] = AuParamEvent(
-                    sample_offset: clamped,
-                    param_id: UInt32(event.pointee.parameter.parameterAddress),
-                    value: event.pointee.parameter.value)
-                numParam += 1
+                guard let offset = sampleOffset(absTime, bufStart, frameCount),
+                      let paramID = UInt32(exactly: event.pointee.parameter.parameterAddress)
+                else { return kAudio_ParamError }
+                if numParam < 256 {
+                    paramBuf[Int(numParam)] = AuParamEvent(
+                        sample_offset: offset,
+                        param_id: paramID,
+                        value: event.pointee.parameter.value)
+                    numParam += 1
+                } else {
+                    paramOverflow = 1
+                }
+            } else {
+                return kAudioUnitErr_FormatNotSupported
             }
             ev = UnsafePointer(head.next)
         }
@@ -679,116 +697,94 @@ class TruceAUAudioUnit: AUAudioUnit {
             }
         }
 
-        cb.pointee.process(ctx, inPtrs, outPtrs, actualIn + UInt32(scActual), actualOut,
-                           frameCount, midiBuf, numMidi,
-                           midi2Buf, numMidi2,
-                           paramBuf, numParam,
-                           transportBuf)
-
-        // Drain plug-in → host MIDI output. `eventSampleTime` is the
-        // host's absolute sample time, so the plug-in's within-block
-        // `delta` is added to the buffer's starting sample. Both
-        // blocks nil means the host doesn't accept MIDI output;
-        // skipping the drain is correct then.
-        // `bufStart` is already bound above (input timing); reuse it.
-
-        // Preferred path: the UMP `MIDIEventList` block (macOS 12+ /
-        // iOS 15+), used for every output dialect so a host that only
-        // supplies the list block hears MIDI 1.0 plugins too. The Rust
-        // side encodes a *pure* stream in the chosen protocol - all MT
-        // 0x2 channel voice for 1.0, all MT 0x4 for 2.0, SysEx as MT 0x3
-        // SysEx-7 chains (legal in both) - because the UMP spec forbids
-        // mixing the two channel-voice types in one protocol stream.
-        //
-        // A `midi2_output` plugin's stream stays 2.0 even when the host's
-        // *input* protocol (`hostMIDIProtocol`) is 1.0: its per-note UMP
-        // (PerNotePitchBend / PerNoteCC) has no 1.0 form, so a 1.0 stream
-        // would fold shared-channel per-note messages onto one channel.
-        // Input and output are separate self-describing MIDIEventList
-        // streams, so 1.0-in / 2.0-out is spec-clean per stream. A
-        // 1.0-output plugin follows the host protocol.
-        // The protocol-taking `output_ump_*` shape is AU ABI version
-        // 2; this appex may be newer than the plugin binary, so gate
-        // on the (magic-validated) reported version before draining
-        // through them.
-        var drainedViaUMP = false
-        if truceAbiTailVersion(cb) >= 2, #available(macOS 12.0, iOS 15.0, *),
-           let listBlock = midiOutputListBlock as? AUMIDIEventListBlock {
-            drainedViaUMP = true
-            // Force 2.0 for a `midi2_output` plugin; otherwise follow the
-            // host's protocol (up-converting a 1.0 plugin to a 2.0 host so
-            // the stream stays pure).
-            let wantMidi2Out = (g_descriptor?.pointee.midi2_output ?? 0) != 0 || !hostWantsMidi1
-            let proto: UInt32 = wantMidi2Out ? 2 : 1
-            let listProto: MIDIProtocolID = wantMidi2Out ? ._2_0 : ._1_0
-            let umpCount = cb.pointee.output_ump_count(ctx, proto)
-            for i in 0..<umpCount {
-                var ue = AuUmpEvent()
-                cb.pointee.output_ump_at(ctx, proto, i, &ue)
-                let evTime = AUEventSampleTime(bufStart + Int64(ue.sample_offset))
-                var list = MIDIEventList()
-                let pkt = MIDIEventListInit(&list, listProto)
-                // Stack-borrow the C words array; a Swift Array here
-                // would heap-allocate per packet inside the render
-                // block, and a large SysEx is thousands of packets.
-                _ = withUnsafeBytes(of: ue.words) { raw in
-                    MIDIEventListAdd(&list, MemoryLayout<MIDIEventList>.size, pkt, 0,
-                                     Int(ue.word_count),
-                                     raw.baseAddress!.assumingMemoryBound(to: UInt32.self))
-                }
-                _ = listBlock(evTime, ue.cable, &list)
-            }
-        } else if let outputBlock = midiOutputBlock {
-            // MIDI 1.0 byte path. 2-byte messages (Program Change,
-            // Channel Pressure) emit only the bytes that matter; 3-byte
-            // messages emit all three. `ev.port` is the plugin's chosen
-            // output cable, clamped on the Rust side (AU v2 reports 0).
-            let cvCount = cb.pointee.output_event_count(ctx)
-            for i in 0..<cvCount {
-                var ev = AuMidiEvent(
-                    sample_offset: 0, status: 0, data1: 0, data2: 0, port: 0)
-                cb.pointee.output_event_at(ctx, i, &ev)
-                let st = ev.status & 0xF0
-                let len = (st == 0xC0 || st == 0xD0) ? 2 : 3
-                let bytes: [UInt8] = [ev.status, ev.data1, ev.data2]
-                let evTime = AUEventSampleTime(bufStart + Int64(ev.sample_offset))
-                _ = bytes.withUnsafeBufferPointer { buf in
-                    outputBlock(evTime, ev.port, len, buf.baseAddress!)
-                }
-            }
+        guard truceAbiTailVersion(cb) >= 6,
+              let processNative = cb.pointee.process_native,
+              let beginOutput = cb.pointee.begin_output_events,
+              let nextOutput = cb.pointee.next_output_event else {
+            return kAudio_ParamError
         }
+        processNative(ctx, inPtrs, outPtrs, actualIn + UInt32(scActual), actualOut,
+                      frameCount, nativeBuf, numNative, nativeOverflow,
+                      paramBuf, numParam, paramOverflow, transportBuf)
 
-        // SysEx output on the byte path. Skipped when the UMP drain ran
-        // above - there SysEx already went out as SysEx-7 packets inside
-        // the `output_ump_*` stream, and re-sending it here would
-        // double-deliver on hosts that supply both blocks. Each event's
-        // framed payload (`0xF0` + inner + `0xF7`) lands in
-        // `sysexOutScratch` so the pointer stays valid for the
-        // synchronous call; scratch advances per event so concurrent
-        // events don't overwrite each other.
-        if !drainedViaUMP, let outputBlock = midiOutputBlock {
-            let sxCount = cb.pointee.output_sysex_count(ctx)
-            var scratchUsed = 0
-            for i in 0..<sxCount {
-                var delta: UInt32 = 0
-                var bytes: UnsafePointer<UInt8>? = nil
-                var len: UInt32 = 0
-                cb.pointee.output_sysex_at(ctx, i, &delta, &bytes, &len)
-                guard let payload = bytes else { continue }
-                let framedLen = Int(len) + 2 // +0xF0 / +0xF7
-                if scratchUsed + framedLen > sysexOutScratchCap { break }
-                let dst = sysexOutScratch.advanced(by: scratchUsed)
-                dst[0] = 0xF0
-                if len > 0 {
-                    dst.advanced(by: 1).update(from: payload, count: Int(len))
+        var carrierMask: UInt32 = midiOutputBlock == nil ? 0 : UInt32(AU_NATIVE_CARRIER_BYTES)
+        if #available(macOS 12.0, iOS 15.0, *), midiOutputListBlock != nil {
+            carrierMask |= UInt32(AU_NATIVE_CARRIER_UMP)
+        }
+        beginOutput(ctx, carrierMask, frameCount)
+        while true {
+            var out = AuNativeEvent()
+            let result = nextOutput(ctx, &out)
+            if result == UInt32(AU_OUTPUT_END) { break }
+            if result == UInt32(AU_OUTPUT_UNSUPPORTED) {
+                return kAudioUnitErr_FormatNotSupported
+            }
+            if result == UInt32(AU_OUTPUT_INVALID) { return kAudio_ParamError }
+            if result == UInt32(AU_OUTPUT_QUEUE_FULL) {
+                return kAudioUnitErr_MIDIOutputBufferFull
+            }
+            guard result == UInt32(AU_OUTPUT_EMITTED),
+                  out.sample_offset < frameCount,
+                  out.port <= UInt16(UInt8.max) else {
+                return kAudio_ParamError
+            }
+
+            let (absoluteTime, timeOverflow) =
+                bufStart.addingReportingOverflow(Int64(out.sample_offset))
+            guard !timeOverflow else { return kAudio_ParamError }
+            let eventTime = AUEventSampleTime(absoluteTime)
+            let cable = UInt8(out.port)
+            if out.kind == UInt8(AU_NATIVE_EVENT_MIDI1), let outputBlock = midiOutputBlock {
+                guard out.data_len > 0, out.data_len <= 3 else {
+                    return kAudio_ParamError
                 }
-                dst[Int(len) + 1] = 0xF7
-                let evTime = AUEventSampleTime(bufStart + Int64(delta))
-                // SysEx always goes out on cable 0 - `output_sysex_at`
-                // doesn't carry the port yet (multi-port SysEx output is
-                // a follow-up; channel-voice above routes by cable).
-                _ = outputBlock(evTime, 0 /* cable */, framedLen, UnsafePointer(dst))
-                scratchUsed += framedLen
+                let status: OSStatus = withUnsafeBytes(of: out.midi) { raw in
+                    outputBlock(eventTime, cable, Int(out.data_len),
+                                raw.baseAddress!.assumingMemoryBound(to: UInt8.self))
+                }
+                if status != noErr { return status }
+            } else if out.kind == UInt8(AU_NATIVE_EVENT_SYSEX), let outputBlock = midiOutputBlock {
+                guard let bytes = out.sysex else { return kAudio_ParamError }
+                let payloadLen = Int(out.data_len)
+                guard payloadLen <= sysexOutScratchCap - 2 else {
+                    return kAudioUnitErr_MIDIOutputBufferFull
+                }
+                sysexOutScratch[0] = 0xF0
+                sysexOutScratch.advanced(by: 1).update(from: bytes, count: payloadLen)
+                sysexOutScratch[payloadLen + 1] = 0xF7
+                let status = outputBlock(
+                    eventTime, cable, payloadLen + 2, UnsafePointer(sysexOutScratch))
+                if status != noErr { return status }
+            } else if out.kind == UInt8(AU_NATIVE_EVENT_UMP) {
+                guard #available(macOS 12.0, iOS 15.0, *),
+                      let listBlock = midiOutputListBlock as? AUMIDIEventListBlock else {
+                    return kAudioUnitErr_FormatNotSupported
+                }
+                let protocolID: MIDIProtocolID
+                if out.protocol == 1 {
+                    protocolID = ._1_0
+                } else if out.protocol == 2 {
+                    protocolID = ._2_0
+                } else {
+                    return kAudio_ParamError
+                }
+                guard out.data_len > 0, out.data_len <= 4 else {
+                    return kAudio_ParamError
+                }
+                var list = MIDIEventList()
+                let packet = MIDIEventListInit(&list, protocolID)
+                let added: UnsafeMutablePointer<MIDIEventPacket>? =
+                    withUnsafeBytes(of: out.words) { raw in
+                        MIDIEventListAdd(
+                            &list, MemoryLayout<MIDIEventList>.size, packet, 0,
+                            Int(out.data_len),
+                            raw.baseAddress!.assumingMemoryBound(to: UInt32.self))
+                    }
+                guard added != nil else { return kAudioUnitErr_MIDIOutputBufferFull }
+                let status = listBlock(eventTime, cable, &list)
+                if status != noErr { return status }
+            } else {
+                return kAudio_ParamError
             }
         }
         return noErr
@@ -813,28 +809,18 @@ class TruceAUAudioUnit: AUAudioUnit {
             : (g_descriptor?.pointee.num_outputs ?? 2)
         let inPtrs = UnsafeMutablePointer<UnsafePointer<Float>?>.allocate(capacity: 32)
         let outPtrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>?>.allocate(capacity: 32)
-        let midiBuf = UnsafeMutablePointer<AuMidiEvent>.allocate(capacity: 256)
-        let midi2Buf = UnsafeMutablePointer<AuMidi2Event>.allocate(capacity: 256)
+        let nativeBuf = UnsafeMutablePointer<AuNativeEvent>.allocate(capacity: 256)
         // Per-block scratch for host-side parameter automation
         // events. AURenderEvent's `.parameter` / `.parameterRamp`
         // entries land here with a within-block `sample_offset` so
         // the Rust chunker splits the audio block at each
-        // automation point. 256 slots matches the MIDI scratches;
-        // typical hosts emit at most a handful per block.
+        // automation point. This capacity is independent of the native
+        // event lane, so filling one never truncates the other.
         let paramBuf = UnsafeMutablePointer<AuParamEvent>.allocate(capacity: 256)
         let transportBuf = UnsafeMutablePointer<AuTransportSnapshot>.allocate(capacity: 1)
-        // Scratch for output SysEx framing: each plug-in event
-        // becomes `0xF0` + inner + `0xF7` in this buffer before
-        // being handed to `midiOutputEventBlock`. Sized to
-        // `TRUCE_SYSEX_POOL_PREALLOC` (mirrored from
-        // `truce_core::SYSEX_POOL_PREALLOC`, 128 KiB by default -
-        // the worst-case sum of all inner payloads in one block)
-        // plus 512 B of framing headroom (2 bytes × up to 256
-        // events).
-        let sysexOutScratchCap = Int(TRUCE_SYSEX_POOL_PREALLOC) + 512
+        let sysexOutScratchCap = Int(TRUCE_SYSEX_POOL_PREALLOC) + 2
         let sysexOutScratch =
             UnsafeMutablePointer<UInt8>.allocate(capacity: sysexOutScratchCap)
-
         // Sidechain input (bus 1) staging. The main input is pulled in
         // place into the output ABL, so the sidechain needs its own
         // scratch to pull into and append after the main channels. Sized
@@ -880,26 +866,14 @@ class TruceAUAudioUnit: AUAudioUnit {
         } else {
             midiOutputListBlock = nil
         }
-        // Snapshot the host's declared output protocol with the
-        // blocks - hosts set `hostMIDIProtocol` before requesting the
-        // render block. Unset (raw 0) defaults to 2.0, the protocol
-        // CoreMIDI translates natively.
-        let hostWantsMidi1: Bool
-        if #available(macOS 12.0, iOS 15.0, *) {
-            hostWantsMidi1 = self.hostMIDIProtocol == ._1_0
-        } else {
-            hostWantsMidi1 = false
-        }
-
         return { _, timestamp, frameCount, _, outputData, events, pull in
             return TruceAUAudioUnit.render(
                 ctx: ctx, cb: cb, numIn: numIn, numOut: numOut,
                 timestamp: timestamp, frameCount: frameCount,
                 outputData: outputData, events: events, pull: pull,
-                inPtrs: inPtrs, outPtrs: outPtrs, midiBuf: midiBuf,
+                inPtrs: inPtrs, outPtrs: outPtrs, nativeBuf: nativeBuf,
                 scCh: scCh, scScratch: scScratch, scABL: scABL, scMaxFrames: scMaxFrames,
                 mainInScratch: mainInScratch, mainInABL: mainInABL,
-                midi2Buf: midi2Buf,
                 paramBuf: paramBuf,
                 transportBuf: transportBuf,
                 sysexOutScratch: sysexOutScratch,
@@ -907,8 +881,7 @@ class TruceAUAudioUnit: AUAudioUnit {
                 musicalContext: musicalContext,
                 transportState: transportState,
                 midiOutputBlock: midiOutputBlock,
-                midiOutputListBlock: midiOutputListBlock,
-                hostWantsMidi1: hostWantsMidi1)
+                midiOutputListBlock: midiOutputListBlock)
         }
     }
 

@@ -43,9 +43,10 @@
 // change into a pre-v4 binary (the pointer would be past its tail).
 // v5: appended `param_parse_value`; a shim must not call it on a pre-v5
 // binary (the pointer would be past its tail).
+// v6: appended the strict native event process and sequential output lane.
 #define TRUCE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define TRUCE_AU_ABI_MAGIC 0x54417500u
-#define TRUCE_AU_ABI_VERSION 0x54417505u
+#define TRUCE_AU_ABI_VERSION 0x54417506u
 
 typedef struct {
     uint8_t component_type[4];
@@ -70,10 +71,9 @@ typedef struct {
      * the `aumu` component type so an `aumf` MusicEffect (audio effect
      * that opts into MIDI input) is also handed events. */
     int32_t accepts_midi_in;
-    /* Number of MIDI input / output ports. AU v2 is single-stream, so it
-     * ignores these (one port). AU v3 uses `midi_output_ports` to size
-     * `MIDIOutputNames`; multi-port MIDI input is not wired yet, so the
-     * input count is informational for now. */
+    /* Number of MIDI input / output ports. AU v2 is single-stream. AU v3
+     * preserves the input cable in its native lane and uses
+     * `midi_output_ports` to size `MIDIOutputNames`. */
     uint32_t midi_input_ports;
     uint32_t midi_output_ports;
     /* 1 if the plugin's MIDI input port is MIDI 2.0 dialect (`midi2 =
@@ -167,6 +167,36 @@ typedef struct {
     uint8_t _reserved[2];
     uint32_t words[4];
 } AuUmpEvent;
+
+#define AU_NATIVE_EVENT_MIDI1 1u
+#define AU_NATIVE_EVENT_SYSEX 2u
+#define AU_NATIVE_EVENT_UMP 3u
+
+#define AU_NATIVE_CARRIER_BYTES 1u
+#define AU_NATIVE_CARRIER_UMP 2u
+
+#define AU_OUTPUT_END 0u
+#define AU_OUTPUT_EMITTED 1u
+#define AU_OUTPUT_UNSUPPORTED 2u
+#define AU_OUTPUT_INVALID 3u
+#define AU_OUTPUT_QUEUE_FULL 4u
+
+/* One bounded, format-native event record shared by AU v2 and AU v3.
+ * `data_len` is the exact MIDI byte count (1..3), SysEx payload length,
+ * or UMP word count (1..4). `protocol` is 1/2 only for UMP. SysEx bytes
+ * are borrowed for the duration of `process_native` or until the next
+ * process block when returned by `next_output_event`. */
+typedef struct {
+    uint32_t sample_offset;
+    uint16_t port;
+    uint8_t kind;
+    uint8_t protocol;
+    uint32_t data_len;
+    uint8_t midi[3];
+    uint8_t _reserved;
+    uint32_t words[4];
+    const uint8_t *sysex;
+} AuNativeEvent;
 
 /* Host-side parameter automation event. The AU v3 shim decodes
  * AURenderEvent.parameter / .parameterRamp entries into this shape
@@ -349,6 +379,26 @@ typedef struct {
      * (>= v5) before calling. */
     int32_t (*param_parse_value)(void *ctx, uint32_t id, const char *text,
                                  double *out_plain);
+    /* v6 strict event boundary. The two old typed MIDI arrays and indexed
+     * output drains remain above only to preserve append-only ABI offsets;
+     * current shims use this native lane exclusively. */
+    void (*process_native)(void *ctx,
+                           const float **inputs, float **outputs,
+                           uint32_t num_input_channels,
+                           uint32_t num_output_channels,
+                           uint32_t num_frames,
+                           const AuNativeEvent *events,
+                           uint32_t num_events,
+                           uint32_t input_overflow,
+                           const AuParamEvent *param_events,
+                           uint32_t num_param_events,
+                           uint32_t param_overflow,
+                           const AuTransportSnapshot *transport);
+    void (*begin_output_events)(void *ctx, uint32_t carrier_mask,
+                                uint32_t num_frames);
+    uint32_t (*next_output_event)(void *ctx, AuNativeEvent *out);
+    uint32_t (*push_sysex_input_native)(void *ctx, uint32_t sample_offset,
+                                        const uint8_t *bytes, uint32_t len);
 } AuCallbacks;
 
 // Globals shared between v2 and v3 shims.

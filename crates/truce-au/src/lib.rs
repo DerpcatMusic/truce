@@ -42,7 +42,11 @@ use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
 use truce_core::editor::fit_logical_size;
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, TransportInfo};
+use truce_core::events::{
+    AuEventMetadata, EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
+    ExactEventMetadata, ExactEventQualifiers, LosslessEventCursor, LosslessEventRef, PushError,
+    RawMidi1, RawUmp, TransportInfo,
+};
 use truce_core::export::PluginExport;
 use truce_core::info::{MidiDialect, PluginInfo, resolve_name_override};
 // The AU editor (and its meter reads) exist on macOS / iOS only,
@@ -74,8 +78,10 @@ use truce_core::wrapper::{
 use truce_params::{MidiSource, ParamFlags, ParamInfo, Params};
 
 use ffi::{
-    AuCallbacks, AuMidi2Event, AuMidiEvent, AuParamDescriptor, AuParamEvent, AuPluginDescriptor,
-    AuTransportSnapshot, AuUmpEvent,
+    AU_NATIVE_CARRIER_BYTES, AU_NATIVE_CARRIER_UMP, AU_NATIVE_EVENT_MIDI1, AU_NATIVE_EVENT_SYSEX,
+    AU_NATIVE_EVENT_UMP, AU_OUTPUT_EMITTED, AU_OUTPUT_END, AU_OUTPUT_INVALID, AU_OUTPUT_QUEUE_FULL,
+    AU_OUTPUT_UNSUPPORTED, AuCallbacks, AuMidi2Event, AuMidiEvent, AuNativeEvent,
+    AuParamDescriptor, AuParamEvent, AuPluginDescriptor, AuTransportSnapshot, AuUmpEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -93,10 +99,18 @@ type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
 /// Recycled through a free-list (see [`SysExQueue`]) so the audio thread
 /// never allocates or frees: it copies the bytes into the event pool and
 /// returns the buffer.
-#[derive(Default)]
 struct SysExInput {
     sample_offset: u32,
     bytes: Vec<u8>,
+}
+
+impl Default for SysExInput {
+    fn default() -> Self {
+        Self {
+            sample_offset: 0,
+            bytes: Vec::with_capacity(SYSEX_POOL_PREALLOC),
+        }
+    }
 }
 
 /// Lock-free `SysEx` input handoff. `SYSEX_INPUT_SLOTS` buffers cycle
@@ -123,10 +137,19 @@ const SYSEX_INPUT_SLOTS: usize = 64;
 /// building an unbounded backlog. Never touches the audio-thread scratch,
 /// so it is safe to call from whatever thread the host runs
 /// `MusicDeviceSysEx` on.
-fn queue_sysex_input(free: &SysExQueue, ready: &SysExQueue, sample_offset: u32, bytes: &[u8]) {
+fn try_queue_sysex_input(
+    free: &SysExQueue,
+    ready: &SysExQueue,
+    sample_offset: u32,
+    bytes: &[u8],
+) -> bool {
     let Some(mut slot) = free.pop() else {
-        return;
+        return false;
     };
+    if bytes.len() > slot.bytes.capacity() {
+        let _ = free.push(slot);
+        return false;
+    }
     slot.sample_offset = sample_offset;
     slot.bytes.clear();
     slot.bytes.extend_from_slice(bytes);
@@ -134,7 +157,13 @@ fn queue_sysex_input(free: &SysExQueue, ready: &SysExQueue, sample_offset: u32, 
     // recycle-on-error keeps the invariant sound regardless.
     if let Err(slot) = ready.push(slot) {
         let _ = free.push(slot);
+        return false;
     }
+    true
+}
+
+fn queue_sysex_input(free: &SysExQueue, ready: &SysExQueue, sample_offset: u32, bytes: &[u8]) {
+    let _ = try_queue_sysex_input(free, ready, sample_offset, bytes);
 }
 
 /// Audio-thread side: drain every queued `SysEx` into `event_list`,
@@ -143,7 +172,9 @@ fn queue_sysex_input(free: &SysExQueue, ready: &SysExQueue, sample_offset: u32, 
 /// no allocation or free on the audio thread.
 fn drain_sysex_input(ready: &SysExQueue, free: &SysExQueue, event_list: &mut EventList) {
     while let Some(slot) = ready.pop() {
-        let _ = event_list.push_sysex(slot.sample_offset, &slot.bytes);
+        let exact = ExactEvent::new(slot.sample_offset, ExactEventBody::SysEx { port: 0 });
+        let _ =
+            event_list.try_push_sysex_with_exact_on_port(slot.sample_offset, 0, &slot.bytes, exact);
         let _ = free.push(slot);
     }
 }
@@ -350,6 +381,10 @@ struct AuAudio<P: PluginExport> {
     /// Resume point for the appex's sequential `output_ump_at` drain;
     /// reset alongside `output_events` each block.
     ump_drain_cursor: UmpDrainCursor,
+    native_output_cursor: LosslessEventCursor,
+    native_output_carriers: u32,
+    native_output_num_frames: u32,
+    native_output_overflow_pending: bool,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     sub_event_scratch: EventList,
     /// Per-instance UMP `SysEx` reassembler. AU v3 hosts deliver
@@ -458,6 +493,10 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     ump_drain_cursor: UmpDrainCursor::HEAD,
+                    native_output_cursor: LosslessEventCursor::default(),
+                    native_output_carriers: 0,
+                    native_output_num_frames: 0,
+                    native_output_overflow_pending: false,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sysex_assembler: SysExAssembler::with_capacity(SYSEX_POOL_PREALLOC),
                     sample_rate: 44100.0,
@@ -472,8 +511,9 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 sysex_ready: SysExQueue::new(SYSEX_INPUT_SLOTS),
                 sysex_free: {
                     // Prefill the free-list so the host thread has a buffer to
-                    // pop; each grows its Vec on first use (host thread) and
-                    // is reused thereafter.
+                    // pop. Every payload buffer is fully reserved here so a
+                    // host that invokes SysEx on the audio thread cannot make
+                    // the queue allocate.
                     let free = SysExQueue::new(SYSEX_INPUT_SLOTS);
                     for _ in 0..SYSEX_INPUT_SLOTS {
                         let _ = free.push(SysExInput::default());
@@ -579,7 +619,185 @@ unsafe extern "C" fn cb_set_render_mode<P: PluginExport>(ctx: *mut std::ffi::c_v
     }
 }
 
-#[allow(clippy::too_many_lines)] // step-by-step block processing reads top-to-bottom
+#[derive(Clone, Copy)]
+enum AuProcessInput {
+    Legacy {
+        midi: *const AuMidiEvent,
+        midi_len: u32,
+        ump: *const AuMidi2Event,
+        ump_len: u32,
+    },
+    Native {
+        events: *const AuNativeEvent,
+        len: u32,
+        overflow: u32,
+    },
+}
+
+fn push_exact_with_fallback(list: &mut EventList, exact: ExactEvent, fallback: Event) {
+    match list.try_push_with_exact(fallback, exact) {
+        Err(PushError::EventFull) => {
+            let _ = list.try_push_exact(exact);
+        }
+        Ok(())
+        | Err(
+            PushError::ExactEventFull
+            | PushError::PoolFull
+            | PushError::UnknownExactEvent
+            | PushError::VoiceTrackerFull,
+        ) => {}
+    }
+}
+
+fn set_midi1_group(body: &mut EventBody, group: u8) {
+    match body {
+        EventBody::NoteOn { group: value, .. }
+        | EventBody::NoteOff { group: value, .. }
+        | EventBody::ControlChange { group: value, .. }
+        | EventBody::Aftertouch { group: value, .. }
+        | EventBody::ChannelPressure { group: value, .. }
+        | EventBody::PitchBend { group: value, .. }
+        | EventBody::ProgramChange { group: value, .. } => *value = group,
+        _ => {}
+    }
+}
+
+fn declared_input_port<P: PluginExport>(port: u16) -> Option<u8> {
+    (port < u16::from(P::info().midi_input_ports))
+        .then(|| u8::try_from(port).ok())
+        .flatten()
+}
+
+fn push_native_input<P: PluginExport>(
+    list: &mut EventList,
+    assembler: &mut SysExAssembler,
+    ev: &AuNativeEvent,
+    num_frames: u32,
+) {
+    if ev.sample_offset >= num_frames {
+        return;
+    }
+    match ev.kind {
+        AU_NATIVE_EVENT_MIDI1 => {
+            let Ok(len) = u8::try_from(ev.data_len) else {
+                return;
+            };
+            let Some(message) = RawMidi1::new(ev.midi, len) else {
+                return;
+            };
+            let exact = ExactEvent::new(
+                ev.sample_offset,
+                ExactEventBody::Midi1 {
+                    port: ev.port,
+                    message,
+                },
+            );
+            let fallback =
+                decode_short_message(ev.midi[0], ev.midi[1], ev.midi[2]).filter(|body| {
+                    typed_midi1_bytes(body).is_some_and(|(bytes, data_len)| {
+                        let Ok(len) = usize::try_from(data_len) else {
+                            return false;
+                        };
+                        data_len == ev.data_len && bytes[..len] == ev.midi[..len]
+                    })
+                });
+            if let Some((port, body)) = declared_input_port::<P>(ev.port).zip(fallback) {
+                push_exact_with_fallback(list, exact, Event::on_port(ev.sample_offset, port, body));
+            } else {
+                let _ = list.try_push_exact(exact);
+            }
+        }
+        AU_NATIVE_EVENT_SYSEX => {
+            if ev.sysex.is_null() && ev.data_len != 0 {
+                return;
+            }
+            let bytes = if ev.data_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(ev.sysex, ev.data_len as usize) }
+            };
+            let Some(bytes) = bytes.strip_prefix(&[0xF0]) else {
+                return;
+            };
+            let Some(bytes) = bytes.strip_suffix(&[0xF7]) else {
+                return;
+            };
+            let exact = ExactEvent::new(ev.sample_offset, ExactEventBody::SysEx { port: ev.port });
+            let Ok(token) = list.try_push_exact_sysex_token(ev.sample_offset, bytes, exact) else {
+                return;
+            };
+            if let Some(port) = declared_input_port::<P>(ev.port) {
+                let _ = list.try_push_exact_sysex_view_companion(token, ev.sample_offset, port);
+            }
+        }
+        AU_NATIVE_EVENT_UMP => {
+            let Ok(word_count) = u8::try_from(ev.data_len) else {
+                return;
+            };
+            let Some(packet) = RawUmp::new(ev.words, word_count) else {
+                return;
+            };
+            let Some(metadata) = AuEventMetadata::new(ev.protocol) else {
+                return;
+            };
+            let exact = ExactEvent::new(
+                ev.sample_offset,
+                ExactEventBody::Ump {
+                    port: ev.port,
+                    packet,
+                },
+            )
+            .with_metadata(ExactEventMetadata::Au(metadata));
+            let mt = ((ev.words[0] >> 28) & 0x0F) as u8;
+            let group = ((ev.words[0] >> 24) & 0x0F) as u8;
+            let fallback = match mt {
+                0x2 if word_count == 1 => {
+                    let mut body = decode_short_message(
+                        ((ev.words[0] >> 16) & 0xFF) as u8,
+                        ((ev.words[0] >> 8) & 0xFF) as u8,
+                        (ev.words[0] & 0xFF) as u8,
+                    );
+                    if let Some(body) = body.as_mut() {
+                        set_midi1_group(body, group);
+                    }
+                    body.filter(|body| {
+                        encode_ump_channel_voice_1(body)
+                            .is_some_and(|words| words[0] == ev.words[0])
+                    })
+                }
+                0x4 if word_count == 2 => decode_ump_channel_voice_2(ev.words)
+                    .filter(|body| encode_ump_channel_voice_2(body).as_ref() == Some(&ev.words)),
+                _ => None,
+            };
+            if let Some((port, body)) = declared_input_port::<P>(ev.port).zip(fallback) {
+                push_exact_with_fallback(list, exact, Event::on_port(ev.sample_offset, port, body));
+                return;
+            }
+            let Ok(token) = list.try_push_exact_token(exact) else {
+                return;
+            };
+            let feed = match (mt, word_count) {
+                (0x3, 2) => {
+                    assembler.push_sysex7_packet_on_route(ev.port, [ev.words[0], ev.words[1]])
+                }
+                (0x5, 4) => assembler.push_sysex8_packet_on_route(ev.port, ev.words),
+                _ => return,
+            };
+            if let (Some(port), SysExFeed::Complete(payload)) =
+                (declared_input_port::<P>(ev.port), feed)
+            {
+                let _ = list.try_push_sysex_exact_companion(
+                    token,
+                    ev.sample_offset,
+                    port,
+                    payload.bytes,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 unsafe extern "C" fn cb_process<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     inputs: *const *const f32,
@@ -593,6 +811,78 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
     num_events2: u32,
     param_events: *const AuParamEvent,
     num_param_events: u32,
+    transport_ptr: *const AuTransportSnapshot,
+) {
+    unsafe {
+        cb_process_impl::<P>(
+            ctx,
+            inputs,
+            outputs,
+            num_input_channels,
+            num_output_channels,
+            num_frames,
+            AuProcessInput::Legacy {
+                midi: events,
+                midi_len: num_events,
+                ump: events2,
+                ump_len: num_events2,
+            },
+            param_events,
+            num_param_events,
+            0,
+            transport_ptr,
+        );
+    }
+}
+
+unsafe extern "C" fn cb_process_native<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    inputs: *const *const f32,
+    outputs: *mut *mut f32,
+    num_input_channels: u32,
+    num_output_channels: u32,
+    num_frames: u32,
+    events: *const AuNativeEvent,
+    num_events: u32,
+    input_overflow: u32,
+    param_events: *const AuParamEvent,
+    num_param_events: u32,
+    param_overflow: u32,
+    transport_ptr: *const AuTransportSnapshot,
+) {
+    unsafe {
+        cb_process_impl::<P>(
+            ctx,
+            inputs,
+            outputs,
+            num_input_channels,
+            num_output_channels,
+            num_frames,
+            AuProcessInput::Native {
+                events,
+                len: num_events,
+                overflow: input_overflow,
+            },
+            param_events,
+            num_param_events,
+            param_overflow,
+            transport_ptr,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+unsafe fn cb_process_impl<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    inputs: *const *const f32,
+    outputs: *mut *mut f32,
+    num_input_channels: u32,
+    num_output_channels: u32,
+    num_frames: u32,
+    input: AuProcessInput,
+    param_events: *const AuParamEvent,
+    num_param_events: u32,
+    param_overflow: u32,
     transport_ptr: *const AuTransportSnapshot,
 ) {
     let nf = num_frames as usize;
@@ -666,34 +956,29 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
         // free on the audio thread. AU v3 `SysEx` arrives in-line via
         // `events2` below instead.
         scr.event_list.clear();
+        scr.event_list.clear_overflow();
         drain_sysex_input(&inst.sysex_ready, &inst.sysex_free, &mut scr.event_list);
-        if !events.is_null() && num_events > 0 {
-            let event_slice = slice::from_raw_parts(events, num_events as usize);
-            for ev in event_slice {
-                if let Some(body) = decode_short_message(ev.status, ev.data1, ev.data2) {
-                    scr.event_list.push(Event {
-                        sample_offset: ev.sample_offset,
-                        port: 0,
-                        body,
-                    });
-                }
-            }
-        }
-        // MIDI 2.0 UMP decode. AU v3 hosts on iOS 17+ / macOS 14+
-        // deliver per-note expression + 32-bit-resolution channel
-        // voice messages through `AURenderEvent.MIDIEventList`; the
-        // Swift shim hands them here as 64-bit UMPs (MIDI 2.0 CV
-        // message type 0x4) plus the SysEx-7 (mt 0x3) / SysEx-8
-        // (mt 0x5) variable-length streams that the assembler
-        // reconstitutes into one `EventBody::SysEx` per logical
-        // message. Utility / system / data UMPs are still skipped.
         scr.sysex_assembler.reset();
-        if !events2.is_null() && num_events2 > 0 {
-            let slice2 = slice::from_raw_parts(events2, num_events2 as usize);
-            for ev in slice2 {
-                let mt = ((ev.words[0] >> 28) & 0xF) as u8;
-                match mt {
-                    0x4 => {
+        match input {
+            AuProcessInput::Legacy {
+                midi,
+                midi_len,
+                ump,
+                ump_len,
+            } => {
+                if !midi.is_null() && midi_len > 0 {
+                    for ev in slice::from_raw_parts(midi, midi_len as usize) {
+                        if let Some(body) = decode_short_message(ev.status, ev.data1, ev.data2) {
+                            scr.event_list.push(Event {
+                                sample_offset: ev.sample_offset,
+                                port: 0,
+                                body,
+                            });
+                        }
+                    }
+                }
+                if !ump.is_null() && ump_len > 0 {
+                    for ev in slice::from_raw_parts(ump, ump_len as usize) {
                         if let Some(body) = decode_ump_channel_voice_2(ev.words) {
                             scr.event_list.push(Event {
                                 sample_offset: ev.sample_offset,
@@ -702,28 +987,24 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
                             });
                         }
                     }
-                    0x3 => {
-                        let feed = scr
-                            .sysex_assembler
-                            .push_sysex7_packet([ev.words[0], ev.words[1]]);
-                        if let SysExFeed::Complete(p) = feed {
-                            // `push_sysex` failure here would mean the
-                            // pool is full mid-block; drop the
-                            // message rather than corrupt-splitting it.
-                            let _ = scr.event_list.push_sysex(ev.sample_offset, p.bytes);
-                        }
-                    }
-                    0x5 => {
-                        let feed = scr.sysex_assembler.push_sysex8_packet(ev.words);
-                        if let SysExFeed::Complete(p) = feed {
-                            let _ = scr.event_list.push_sysex(ev.sample_offset, p.bytes);
-                        }
-                    }
-                    _ => {
-                        // mt 0x0 (utility), 0x1 (system real-time),
-                        // 0x2 (MIDI 1 CV, already arrived via the
-                        // legacy `events` slice above), 0xD / 0xF
-                        // (flex / stream): not decoded.
+                }
+            }
+            AuProcessInput::Native {
+                events,
+                len,
+                overflow,
+            } => {
+                if overflow != 0 {
+                    scr.event_list.record_overflow(PushError::EventFull);
+                }
+                if !events.is_null() && len > 0 {
+                    for event in slice::from_raw_parts(events, len as usize) {
+                        push_native_input::<P>(
+                            &mut scr.event_list,
+                            &mut scr.sysex_assembler,
+                            event,
+                            len_u32(num_frames),
+                        );
                     }
                 }
             }
@@ -753,6 +1034,9 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
                     },
                 });
             }
+        }
+        if param_overflow != 0 {
+            scr.event_list.record_overflow(PushError::EventFull);
         }
 
         scr.event_list.ensure_sorted_by_offset();
@@ -825,6 +1109,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             TransportInfo::default()
         };
         scr.output_events.clear();
+        scr.output_events.clear_overflow();
         scr.ump_drain_cursor = UmpDrainCursor::HEAD;
         inst.transport_slot.write(&transport);
 
@@ -855,6 +1140,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
         // No-op for `f32` plugins.
         scr.scratch
             .finish_widening(outputs, num_output_channels, len_u32(num_frames));
+        scr.output_events.ensure_sorted_by_offset();
 
         // AU v2 (macOS): hand process-emitted parameter changes to the
         // notifier thread so the host's UI / automation reflect values
@@ -1667,6 +1953,31 @@ unsafe extern "C" fn cb_au_push_sysex_input<P: PluginExport>(
     });
 }
 
+unsafe extern "C" fn cb_au_push_sysex_input_native<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    sample_offset: u32,
+    bytes: *const u8,
+    len: u32,
+) -> u32 {
+    run_extern_callback_with::<P, u32>("au", "sysex_input_native", 0, || unsafe {
+        if ctx.is_null() || (bytes.is_null() && len != 0) {
+            return 0;
+        }
+        let inst = &*ctx.cast::<AuInstance<P>>();
+        let payload = if len == 0 {
+            &[][..]
+        } else {
+            slice::from_raw_parts(bytes, len as usize)
+        };
+        u32::from(try_queue_sysex_input(
+            &inst.sysex_free,
+            &inst.sysex_ready,
+            sample_offset,
+            payload,
+        ))
+    })
+}
+
 unsafe extern "C" fn cb_output_sysex_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
@@ -1701,6 +2012,278 @@ unsafe extern "C" fn cb_output_sysex_at<P: PluginExport>(
             *out_delta_frames = event.sample_offset;
             *out_bytes = bytes.as_ptr();
             *out_len = len_u32(bytes.len());
+        }
+    }
+}
+
+enum NativeEncodeResult {
+    Emitted(AuNativeEvent),
+    Unsupported,
+    Invalid,
+}
+
+fn typed_midi1_bytes(body: &EventBody) -> Option<([u8; 3], u32)> {
+    let (bytes, len) = match *body {
+        EventBody::NoteOn {
+            group: 0,
+            channel,
+            note,
+            velocity,
+        } if channel < 16 && note < 128 && velocity < 128 => ([0x90 | channel, note, velocity], 3),
+        EventBody::NoteOff {
+            group: 0,
+            channel,
+            note,
+            velocity,
+        } if channel < 16 && note < 128 && velocity < 128 => ([0x80 | channel, note, velocity], 3),
+        EventBody::ControlChange {
+            group: 0,
+            channel,
+            cc,
+            value,
+        } if channel < 16 && cc < 128 && value < 128 => ([0xB0 | channel, cc, value], 3),
+        EventBody::Aftertouch {
+            group: 0,
+            channel,
+            note,
+            pressure,
+        } if channel < 16 && note < 128 && pressure < 128 => ([0xA0 | channel, note, pressure], 3),
+        EventBody::ChannelPressure {
+            group: 0,
+            channel,
+            pressure,
+        } if channel < 16 && pressure < 128 => ([0xD0 | channel, pressure, 0], 2),
+        EventBody::ProgramChange {
+            group: 0,
+            channel,
+            program,
+        } if channel < 16 && program < 128 => ([0xC0 | channel, program, 0], 2),
+        EventBody::PitchBend {
+            group: 0,
+            channel,
+            value,
+        } if channel < 16 && value <= 0x3FFF => {
+            let (lsb, msb) = pitch_bend_to_bytes(value);
+            ([0xE0 | channel, lsb, msb], 3)
+        }
+        _ => return None,
+    };
+    Some((bytes, len))
+}
+
+fn output_port<P: PluginExport>(port: u16) -> Option<u16> {
+    (port < u16::from(P::info().midi_output_ports)).then_some(port)
+}
+
+fn default_protocol<P: PluginExport>() -> u8 {
+    if P::info().midi_output_dialect == MidiDialect::Midi2 {
+        2
+    } else {
+        1
+    }
+}
+
+fn raw_ump_protocol<P: PluginExport>(exact: truce_core::ExactEventRef<'_>) -> Option<u8> {
+    match exact.metadata() {
+        ExactEventMetadata::Au(metadata) => Some(metadata.protocol()),
+        ExactEventMetadata::None => match exact.body() {
+            ExactEventBody::Ump { packet, .. } => match packet.words()[0] >> 28 {
+                0x2 => Some(1),
+                0x4 | 0x5 | 0xD | 0xE | 0xF => Some(2),
+                0x0 | 0x1 | 0x3 => Some(default_protocol::<P>()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn encode_native_output<P: PluginExport>(
+    event: LosslessEventRef<'_>,
+    list: &EventList,
+    carrier_mask: u32,
+    num_frames: u32,
+) -> NativeEncodeResult {
+    let sample_offset = match event {
+        LosslessEventRef::Typed(event) => event.sample_offset,
+        LosslessEventRef::Exact(exact) => exact.sample_offset(),
+    };
+    if sample_offset >= num_frames {
+        return NativeEncodeResult::Invalid;
+    }
+
+    match event {
+        LosslessEventRef::Typed(event) => {
+            let Some(port) = output_port::<P>(u16::from(event.port)) else {
+                return NativeEncodeResult::Invalid;
+            };
+            if let Some((midi, data_len)) = typed_midi1_bytes(&event.body) {
+                if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
+                    return NativeEncodeResult::Unsupported;
+                }
+                return NativeEncodeResult::Emitted(AuNativeEvent {
+                    sample_offset,
+                    port,
+                    kind: AU_NATIVE_EVENT_MIDI1,
+                    data_len,
+                    midi,
+                    ..AuNativeEvent::default()
+                });
+            }
+            if let EventBody::SysEx { .. } = event.body {
+                if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
+                    return NativeEncodeResult::Unsupported;
+                }
+                let bytes = list.sysex_bytes(&event.body);
+                return NativeEncodeResult::Emitted(AuNativeEvent {
+                    sample_offset,
+                    port,
+                    kind: AU_NATIVE_EVENT_SYSEX,
+                    data_len: len_u32(bytes.len()),
+                    sysex: bytes.as_ptr(),
+                    ..AuNativeEvent::default()
+                });
+            }
+            if let Some(words) = encode_ump_channel_voice_2(&event.body) {
+                if decode_ump_channel_voice_2(words).as_ref() != Some(&event.body) {
+                    return NativeEncodeResult::Invalid;
+                }
+                if carrier_mask & AU_NATIVE_CARRIER_UMP == 0 {
+                    return NativeEncodeResult::Unsupported;
+                }
+                return NativeEncodeResult::Emitted(AuNativeEvent {
+                    sample_offset,
+                    port,
+                    kind: AU_NATIVE_EVENT_UMP,
+                    protocol: 2,
+                    data_len: 2,
+                    words,
+                    ..AuNativeEvent::default()
+                });
+            }
+            NativeEncodeResult::Unsupported
+        }
+        LosslessEventRef::Exact(exact) => {
+            if exact.qualifiers() != ExactEventQualifiers::default() {
+                return NativeEncodeResult::Unsupported;
+            }
+            match *exact.body() {
+                ExactEventBody::Midi1 { port, message } => {
+                    if !exact.metadata().is_none() {
+                        return NativeEncodeResult::Unsupported;
+                    }
+                    let Some(port) = output_port::<P>(port) else {
+                        return NativeEncodeResult::Invalid;
+                    };
+                    if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
+                        return NativeEncodeResult::Unsupported;
+                    }
+                    NativeEncodeResult::Emitted(AuNativeEvent {
+                        sample_offset,
+                        port,
+                        kind: AU_NATIVE_EVENT_MIDI1,
+                        data_len: u32::try_from(message.len()).unwrap_or(0),
+                        midi: *message.storage(),
+                        ..AuNativeEvent::default()
+                    })
+                }
+                ExactEventBody::SysEx { port } => {
+                    if !exact.metadata().is_none() {
+                        return NativeEncodeResult::Unsupported;
+                    }
+                    let Some(port) = output_port::<P>(port) else {
+                        return NativeEncodeResult::Invalid;
+                    };
+                    let Some(bytes) = exact.sysex_bytes_checked() else {
+                        return NativeEncodeResult::Invalid;
+                    };
+                    if carrier_mask & AU_NATIVE_CARRIER_BYTES == 0 {
+                        return NativeEncodeResult::Unsupported;
+                    }
+                    NativeEncodeResult::Emitted(AuNativeEvent {
+                        sample_offset,
+                        port,
+                        kind: AU_NATIVE_EVENT_SYSEX,
+                        data_len: len_u32(bytes.len()),
+                        sysex: bytes.as_ptr(),
+                        ..AuNativeEvent::default()
+                    })
+                }
+                ExactEventBody::Ump { port, packet } => {
+                    let Some(port) = output_port::<P>(port) else {
+                        return NativeEncodeResult::Invalid;
+                    };
+                    let Some(protocol) = raw_ump_protocol::<P>(exact) else {
+                        return NativeEncodeResult::Unsupported;
+                    };
+                    if carrier_mask & AU_NATIVE_CARRIER_UMP == 0 {
+                        return NativeEncodeResult::Unsupported;
+                    }
+                    NativeEncodeResult::Emitted(AuNativeEvent {
+                        sample_offset,
+                        port,
+                        kind: AU_NATIVE_EVENT_UMP,
+                        protocol,
+                        data_len: u32::try_from(packet.word_count()).unwrap_or(0),
+                        words: *packet.storage(),
+                        ..AuNativeEvent::default()
+                    })
+                }
+                _ => NativeEncodeResult::Unsupported,
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    carrier_mask: u32,
+    num_frames: u32,
+) {
+    unsafe {
+        let inst = &*ctx.cast::<AuInstance<P>>();
+        let mut audio = inst.audio.enter();
+        audio.native_output_cursor = LosslessEventCursor::default();
+        audio.native_output_carriers =
+            carrier_mask & (AU_NATIVE_CARRIER_BYTES | AU_NATIVE_CARRIER_UMP);
+        audio.native_output_num_frames = num_frames;
+        audio.native_output_overflow_pending = audio.output_events.overflow().is_some();
+    }
+}
+
+unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    out: *mut AuNativeEvent,
+) -> u32 {
+    unsafe {
+        if out.is_null() {
+            return AU_OUTPUT_INVALID;
+        }
+        let inst = &*ctx.cast::<AuInstance<P>>();
+        let mut audio = inst.audio.enter();
+        let scr = &mut *audio;
+        let Some(event) = scr
+            .output_events
+            .lossless_next(&mut scr.native_output_cursor)
+        else {
+            if std::mem::take(&mut scr.native_output_overflow_pending) {
+                return AU_OUTPUT_QUEUE_FULL;
+            }
+            return AU_OUTPUT_END;
+        };
+        match encode_native_output::<P>(
+            event,
+            &scr.output_events,
+            scr.native_output_carriers,
+            scr.native_output_num_frames,
+        ) {
+            NativeEncodeResult::Emitted(event) => {
+                out.write(event);
+                AU_OUTPUT_EMITTED
+            }
+            NativeEncodeResult::Unsupported => AU_OUTPUT_UNSUPPORTED,
+            NativeEncodeResult::Invalid => AU_OUTPUT_INVALID,
         }
     }
 }
@@ -2337,6 +2920,10 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         tail_samples: cb_tail_samples::<P>,
         set_render_mode: cb_set_render_mode::<P>,
         param_parse_value: cb_param_parse_value::<P>,
+        process_native: cb_process_native::<P>,
+        begin_output_events: cb_begin_output_events::<P>,
+        next_output_event: cb_next_output_event::<P>,
+        push_sysex_input_native: cb_au_push_sysex_input_native::<P>,
     }));
 
     let param_descs = param_descs.leak();

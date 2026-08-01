@@ -18,7 +18,9 @@ use truce_params::{ParamFlags, ParamInfo, Params};
 
 use crate::buffer::AudioBuffer;
 use crate::config::ProcessMode;
-use crate::events::{Event, EventBody, EventList, ExactEvent, LosslessEventRef, TransportInfo};
+use crate::events::{
+    Event, EventBody, EventList, ExactEvent, ExactEventBody, LosslessEventRef, TransportInfo,
+};
 use crate::plugin::PluginRuntime;
 use crate::process::{ProcessContext, ProcessStatus};
 use crate::sample::Sample;
@@ -387,7 +389,14 @@ fn rebase_events_into(
                 let rebased_exact = ExactEvent::new(rebased_offset, *exact.body())
                     .with_qualifiers(exact.qualifiers())
                     .with_metadata(exact.metadata());
-                let token = if let Some(fallback) = exact.fallback() {
+                let exact_is_sysex = matches!(exact.body(), ExactEventBody::SysEx { .. });
+                let exact_owns_sysex = exact_is_sysex && exact.fallback().is_none();
+                let token = if exact_owns_sysex {
+                    let Some(bytes) = exact.sysex_bytes_checked() else {
+                        continue;
+                    };
+                    scratch.try_push_exact_sysex_token(rebased_offset, bytes, rebased_exact)
+                } else if let Some(fallback) = exact.fallback() {
                     match fallback.body {
                         EventBody::SysEx { .. } => scratch.try_push_sysex_with_exact_on_port_token(
                             rebased_offset,
@@ -409,12 +418,20 @@ fn rebase_events_into(
                 for companion in exact.companions() {
                     match companion.body {
                         EventBody::SysEx { .. } => {
-                            let _ = scratch.try_push_sysex_exact_companion(
-                                token,
-                                rebased_offset,
-                                companion.port,
-                                events.sysex_bytes(&companion.body),
-                            );
+                            if exact_owns_sysex {
+                                let _ = scratch.try_push_exact_sysex_view_companion(
+                                    token,
+                                    rebased_offset,
+                                    companion.port,
+                                );
+                            } else {
+                                let _ = scratch.try_push_sysex_exact_companion(
+                                    token,
+                                    rebased_offset,
+                                    companion.port,
+                                    events.sysex_bytes(&companion.body),
+                                );
+                            }
                         }
                         body => {
                             let _ = scratch.try_push_exact_companion(

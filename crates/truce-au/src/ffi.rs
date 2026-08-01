@@ -104,8 +104,9 @@ pub struct AuParamDescriptor {
 /// unreleased tail callback's signature); a test asserts they match.
 /// v2: `output_ump_count` / `output_ump_at` gained the `protocol`
 /// argument. v3: appended `latency_samples` / `tail_samples`. v4:
-/// appended `set_render_mode`. v5: appended `param_parse_value`.
-pub const TRUCE_AU_ABI_VERSION: u32 = 0x5441_7505;
+/// appended `set_render_mode`. v5: appended `param_parse_value`. v6:
+/// appended the strict native event process and sequential output lane.
+pub const TRUCE_AU_ABI_VERSION: u32 = 0x5441_7506;
 
 /// Callbacks from the `ObjC` shim into Rust.
 #[repr(C)]
@@ -300,6 +301,30 @@ pub struct AuCallbacks {
         text: *const c_char,
         out_plain: *mut f64,
     ) -> i32,
+    pub process_native: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        inputs: *const *const f32,
+        outputs: *mut *mut f32,
+        num_input_channels: u32,
+        num_output_channels: u32,
+        num_frames: u32,
+        events: *const AuNativeEvent,
+        num_events: u32,
+        input_overflow: u32,
+        param_events: *const AuParamEvent,
+        num_param_events: u32,
+        param_overflow: u32,
+        transport: *const AuTransportSnapshot,
+    ),
+    pub begin_output_events:
+        unsafe extern "C" fn(ctx: *mut c_void, carrier_mask: u32, num_frames: u32),
+    pub next_output_event: unsafe extern "C" fn(ctx: *mut c_void, out: *mut AuNativeEvent) -> u32,
+    pub push_sysex_input_native: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        sample_offset: u32,
+        bytes: *const u8,
+        len: u32,
+    ) -> u32,
 }
 
 /// A MIDI event passed across the Rust ↔ `ObjC` boundary in both
@@ -361,6 +386,49 @@ pub struct AuUmpEvent {
     /// `au_shim_types.h` by position.
     pub reserved: [u8; 2],
     pub words: [u32; 4],
+}
+
+pub const AU_NATIVE_EVENT_MIDI1: u8 = 1;
+pub const AU_NATIVE_EVENT_SYSEX: u8 = 2;
+pub const AU_NATIVE_EVENT_UMP: u8 = 3;
+
+pub const AU_NATIVE_CARRIER_BYTES: u32 = 1;
+pub const AU_NATIVE_CARRIER_UMP: u32 = 2;
+
+pub const AU_OUTPUT_END: u32 = 0;
+pub const AU_OUTPUT_EMITTED: u32 = 1;
+pub const AU_OUTPUT_UNSUPPORTED: u32 = 2;
+pub const AU_OUTPUT_INVALID: u32 = 3;
+pub const AU_OUTPUT_QUEUE_FULL: u32 = 4;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct AuNativeEvent {
+    pub sample_offset: u32,
+    pub port: u16,
+    pub kind: u8,
+    pub protocol: u8,
+    pub data_len: u32,
+    pub midi: [u8; 3],
+    pub reserved: u8,
+    pub words: [u32; 4],
+    pub sysex: *const u8,
+}
+
+impl Default for AuNativeEvent {
+    fn default() -> Self {
+        Self {
+            sample_offset: 0,
+            port: 0,
+            kind: 0,
+            protocol: 0,
+            data_len: 0,
+            midi: [0; 3],
+            reserved: 0,
+            words: [0; 4],
+            sysex: std::ptr::null(),
+        }
+    }
 }
 
 /// Host-side parameter automation event. The AU v3 Swift shim

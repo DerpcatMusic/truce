@@ -348,6 +348,27 @@ pub struct Vst3EventMetadata {
     raw_flags: u16,
 }
 
+/// Audio Unit UMP stream provenance needed to replay a native packet without
+/// changing the self-described `MIDIEventList` protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuEventMetadata {
+    protocol: u8,
+}
+
+impl AuEventMetadata {
+    /// Construct metadata for `CoreMIDI` protocol 1 (MIDI 1.0 UMP) or 2
+    /// (MIDI 2.0 UMP). Other values are not valid `MIDIProtocolID`s here.
+    #[must_use]
+    pub fn new(protocol: u8) -> Option<Self> {
+        matches!(protocol, 1 | 2).then_some(Self { protocol })
+    }
+
+    #[must_use]
+    pub fn protocol(self) -> u8 {
+        self.protocol
+    }
+}
+
 impl Vst3EventMetadata {
     #[must_use]
     pub fn new(ppq_position: f64, raw_flags: u16) -> Option<Self> {
@@ -378,6 +399,7 @@ pub enum ExactEventMetadata {
     #[default]
     None,
     Vst3(Vst3EventMetadata),
+    Au(AuEventMetadata),
 }
 
 impl ExactEventMetadata {
@@ -441,6 +463,7 @@ impl ExactEvent {
 pub struct ExactEventRef<'a> {
     exact: &'a ExactEvent,
     fallback: Option<&'a Event>,
+    sysex_range: Option<(u32, u32)>,
     events: &'a [Event],
     companion_next: &'a [Option<usize>],
     first_companion: Option<usize>,
@@ -504,18 +527,20 @@ impl<'a> ExactEventRef<'a> {
     }
 
     /// Checked form of [`Self::sysex_bytes`]. `None` means the exact `SysEx`
-    /// event has no valid pooled primary payload.
+    /// event has no valid payload in the owning list's bounded pool.
     #[must_use]
     pub fn sysex_bytes_checked(self) -> Option<&'a [u8]> {
-        let Some(Event {
-            body: EventBody::SysEx { pool_offset, len },
-            ..
-        }) = self.fallback
-        else {
+        if !matches!(self.exact.body, ExactEventBody::SysEx { .. }) {
             return None;
-        };
-        let start = *pool_offset as usize;
-        let end = start.checked_add(*len as usize)?;
+        }
+        let range = self.sysex_range.or_else(|| {
+            let EventBody::SysEx { pool_offset, len } = self.fallback?.body else {
+                return None;
+            };
+            Some((pool_offset, len))
+        })?;
+        let start = range.0 as usize;
+        let end = start.checked_add(range.1 as usize)?;
         self.sysex_pool.get(start..end)
     }
 
@@ -833,7 +858,7 @@ impl std::error::Error for PushError {}
 /// Ordered list of events within a process block.
 ///
 /// `events` and `exact_events` are the per-block event lanes; `sysex_pool`
-/// is the variable-byte arena that [`EventBody::SysEx`] entries index into.
+/// is the variable-byte arena that typed and exact `SysEx` entries index into.
 /// All are pre-allocated by [`EventList::with_capacity`] and reset
 /// (length only - backing memory preserved) by [`Self::clear`], so
 /// steady-state operation is allocation-free.
@@ -857,6 +882,7 @@ struct StoredExactEvent {
     event: ExactEvent,
     token: ExactEventToken,
     primary_index: Option<usize>,
+    sysex_range: Option<(u32, u32)>,
     first_companion: Option<usize>,
     last_companion: Option<usize>,
 }
@@ -991,11 +1017,84 @@ impl EventList {
             event,
             token,
             primary_index: None,
+            sysex_range: None,
             first_companion: None,
             last_companion: None,
         });
         self.exact_order.push(exact_index);
         Ok(token)
+    }
+
+    /// Copy a `SysEx` payload into the bounded pool and append an exact-only
+    /// event which owns that payload independently of any typed companion.
+    ///
+    /// # Errors
+    /// [`PushError::ExactEventFull`] or [`PushError::PoolFull`] when the
+    /// corresponding bounded storage rejects the append.
+    pub fn try_push_exact_sysex_token(
+        &mut self,
+        sample_offset: u32,
+        data: &[u8],
+        mut exact: ExactEvent,
+    ) -> Result<ExactEventToken, PushError> {
+        if !matches!(exact.body, ExactEventBody::SysEx { .. }) {
+            return self.fail(PushError::UnknownExactEvent);
+        }
+        self.reserve_exact_slot()?;
+        let pool_offset = self.sysex_pool.len();
+        let Some(pool_end) = pool_offset.checked_add(data.len()) else {
+            return self.fail(PushError::PoolFull);
+        };
+        if pool_end > self.sysex_pool.capacity() {
+            return self.fail(PushError::PoolFull);
+        }
+
+        exact.sample_offset = sample_offset;
+        let exact_index = self.exact_events.len();
+        let token = self.take_exact_token(exact_index);
+        self.sysex_pool.extend_from_slice(data);
+        #[allow(clippy::cast_possible_truncation)]
+        let sysex_range = Some((pool_offset as u32, data.len() as u32));
+        self.exact_events.push(StoredExactEvent {
+            event: exact,
+            token,
+            primary_index: None,
+            sysex_range,
+            first_companion: None,
+            last_companion: None,
+        });
+        self.exact_order.push(exact_index);
+        Ok(token)
+    }
+
+    /// Attach a typed `SysEx` view to an exact `SysEx` event without copying its
+    /// payload a second time. The companion remains suppressed by lossless
+    /// replay while typed plugin code can resolve it through this list's pool.
+    ///
+    /// # Errors
+    /// [`PushError::UnknownExactEvent`] when the token is foreign or does not
+    /// own an exact `SysEx` payload, or [`PushError::EventFull`] when the typed
+    /// lane is full.
+    pub fn try_push_exact_sysex_view_companion(
+        &mut self,
+        token: ExactEventToken,
+        sample_offset: u32,
+        port: u8,
+    ) -> Result<(), PushError> {
+        let Some(exact_index) = self.exact_index_for_token(token) else {
+            return self.fail(PushError::UnknownExactEvent);
+        };
+        let Some((pool_offset, len)) = self
+            .exact_events
+            .get(exact_index)
+            .and_then(|stored| stored.sysex_range)
+        else {
+            return self.fail(PushError::UnknownExactEvent);
+        };
+        self.try_push_exact_companion(
+            token,
+            Event::on_port(sample_offset, port, EventBody::SysEx { pool_offset, len }),
+        )
     }
 
     /// Atomically append a typed convenience event and its exact payload.
@@ -1040,6 +1139,7 @@ impl EventList {
             event: exact,
             token,
             primary_index: Some(event_index),
+            sysex_range: None,
             first_companion: None,
             last_companion: None,
         });
@@ -1283,6 +1383,7 @@ impl EventList {
                     sequence,
                 }),
                 primary_index: Some(event_index),
+                sysex_range: None,
                 first_companion: None,
                 last_companion: None,
             });
@@ -1592,6 +1693,7 @@ impl EventList {
             fallback: stored
                 .primary_index
                 .and_then(|index| self.events.get(index)),
+            sysex_range: stored.sysex_range,
             events: &self.events,
             companion_next: &self.companion_next,
             first_companion: stored.first_companion,

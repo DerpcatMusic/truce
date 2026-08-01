@@ -82,8 +82,9 @@ typedef struct {
     UInt32 sidechainSourceOutputBus;
 
     // MIDI buffer (for instruments)
-    AuMidiEvent midiBuffer[256];
+    AuNativeEvent midiBuffer[256];
     uint32_t midiCount;
+    uint32_t midiOverflow;
 
     // Host parameter-automation events, drained each render block into
     // cb_process as EventBody::ParamChange rows so the editor follows
@@ -93,6 +94,7 @@ typedef struct {
     // (see audioThreadId), so the queue needs no lock.
     AuParamEvent paramEvents[AU_PARAM_EVENT_CAP];
     uint32_t paramEventCount;
+    uint32_t paramOverflow;
     // Kernel id of the audio (render) thread, captured at the top of
     // every render / schedule call. Lets au_v2_set_parameter - which
     // the host may call from any thread - tell whether it is on the
@@ -333,38 +335,6 @@ static int accepts_midi_input(void) {
     return g_descriptor && g_descriptor->accepts_midi_in;
 }
 
-/* Append one packet to the in-progress `MIDIPacketList`, flushing
- * to the host and retrying on overflow.
- *
- * Returns the next free `MIDIPacket *` for further appends, or NULL
- * when even an empty list can't hold this packet (the event is
- * dropped - truncating MIDI / `SysEx` is corrupt). On flush the
- * callsite's `*pkt` is replaced with a fresh init pointer.
- *
- * Centralised here so the channel-voice and `SysEx` drains share
- * one overflow policy. The audio thread does the work, so all
- * inputs are stack / pool memory the helper never owns. */
-static MIDIPacket *append_or_flush_retry(MIDIPacketList *pktList,
-                                         MIDIPacket *pkt,
-                                         TruceAUv2 *inst,
-                                         const AudioTimeStamp *inTimeStamp,
-                                         MIDITimeStamp ts,
-                                         ByteCount len,
-                                         const Byte *data) {
-    if (!pkt) return NULL;
-    MIDIPacket *next = MIDIPacketListAdd(
-        pktList, inst->sysexPacketBufSize, pkt, ts, len, data);
-    if (!next) {
-        inst->midiOutputCallback(inst->midiOutputUserData,
-                                 inTimeStamp, 0 /* outputIndex */,
-                                 pktList);
-        pkt = MIDIPacketListInit(pktList);
-        next = MIDIPacketListAdd(
-            pktList, inst->sysexPacketBufSize, pkt, ts, len, data);
-    }
-    return next;
-}
-
 // ---------------------------------------------------------------------------
 // Factory presets
 // ---------------------------------------------------------------------------
@@ -508,6 +478,9 @@ static OSStatus au_v2_reset(void *self_, AudioUnitScope scope, AudioUnitElement 
     if (g_callbacks && inst->rustCtx)
         g_callbacks->reset(inst->rustCtx, inst->sampleRate, inst->maxFramesPerSlice);
     inst->midiCount = 0;
+    inst->midiOverflow = 0;
+    inst->paramEventCount = 0;
+    inst->paramOverflow = 0;
     return noErr;
 }
 
@@ -976,18 +949,26 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
         }
 
         case kAudioUnitProperty_MIDIOutputCallbackInfo: {
-            /* Hosts that read this expect a CFArray of CFString port
-             * names - one entry per logical MIDI output port. truce
-             * exposes a single port; "Truce MIDI Out" is the visible
-             * label in the host's MIDI routing UI. The CFArray
-             * ownership transfers to the caller. */
+            /* Hosts that read this expect one name per logical MIDI output;
+             * `midiOutNum` on the callback carries the matching index. */
             if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
             if (*ioSize < sizeof(CFArrayRef))
                 return kAudioUnitErr_InvalidPropertyValue;
-            CFStringRef portName = CFSTR("Truce MIDI Out");
-            CFArrayRef arr = CFArrayCreate(kCFAllocatorDefault,
-                                           (const void **)&portName, 1,
-                                           &kCFTypeArrayCallBacks);
+            uint32_t count = g_descriptor && g_descriptor->midi_output_ports
+                                 ? g_descriptor->midi_output_ports : 1;
+            CFMutableArrayRef arr = CFArrayCreateMutable(
+                kCFAllocatorDefault, count, &kCFTypeArrayCallBacks);
+            if (!arr) return kAudioUnitErr_FailedInitialization;
+            for (uint32_t i = 0; i < count; i++) {
+                CFStringRef name = CFStringCreateWithFormat(
+                    kCFAllocatorDefault, NULL, CFSTR("Truce MIDI Out %u"), i + 1);
+                if (!name) {
+                    CFRelease(arr);
+                    return kAudioUnitErr_FailedInitialization;
+                }
+                CFArrayAppendValue(arr, name);
+                CFRelease(name);
+            }
             *(CFArrayRef *)outData = arr;
             *ioSize = sizeof(CFArrayRef);
             return noErr;
@@ -1513,6 +1494,7 @@ static void enqueue_param_event(TruceAUv2 *inst, AudioUnitParameterID id,
                                 AudioUnitParameterValue value,
                                 UInt32 sampleOffset) {
     if (inst->paramEventCount >= AU_PARAM_EVENT_CAP) {
+        inst->paramOverflow = 1;
         for (uint32_t i = inst->paramEventCount; i > 0; i--) {
             if (inst->paramEvents[i - 1].param_id == id) {
                 inst->paramEvents[i - 1].sample_offset = sampleOffset;
@@ -1805,16 +1787,22 @@ static OSStatus au_v2_render(void *self_,
     AuTransportSnapshot transport;
     fill_transport_snapshot(inst, inTimeStamp, &transport);
 
-    /* Clamp queued param-event offsets to this block. ScheduleParameters
-     * offsets are block-relative, but SetParameter carries none (we pass
-     * its bufferOffset, which some hosts leave at a stale value); an
-     * out-of-range offset confuses the Rust chunker, so pin it to the
-     * last frame - the event still lands in this block. */
+    /* Reject out-of-block timestamps instead of changing their meaning. */
+    int invalidEventTime = 0;
+    for (uint32_t i = 0; i < inst->midiCount; i++) {
+        if (inst->midiBuffer[i].sample_offset >= inFrameCount)
+            invalidEventTime = 1;
+    }
     for (uint32_t i = 0; i < inst->paramEventCount; i++) {
-        if (inst->paramEvents[i].sample_offset >= inFrameCount) {
-            inst->paramEvents[i].sample_offset =
-                inFrameCount > 0 ? (inFrameCount - 1) : 0;
-        }
+        if (inst->paramEvents[i].sample_offset >= inFrameCount)
+            invalidEventTime = 1;
+    }
+    if (invalidEventTime) {
+        inst->midiCount = 0;
+        inst->midiOverflow = 0;
+        inst->paramEventCount = 0;
+        inst->paramOverflow = 0;
+        return kAudioUnitErr_InvalidParameter;
     }
 
     /* AU v2 hosts deliver MIDI exclusively through the legacy
@@ -1825,98 +1813,76 @@ static OSStatus au_v2_render(void *self_,
      * ScheduleParameters, or audio-thread SetParameter) so it enters
      * cb_process as EventBody::ParamChange rows, matching VST3 / AU v3
      * and driving the editor's automation follow. */
-    g_callbacks->process(inst->rustCtx, inPtrs, outPtrs,
-                         numIn + scCh, numOut, inFrameCount,
-                         inst->midiBuffer, inst->midiCount,
-                         NULL, 0,
-                         inst->paramEvents, inst->paramEventCount,
-                         &transport);
+    g_callbacks->process_native(inst->rustCtx, inPtrs, outPtrs,
+                                numIn + scCh, numOut, inFrameCount,
+                                inst->midiBuffer, inst->midiCount,
+                                inst->midiOverflow,
+                                inst->paramEvents, inst->paramEventCount,
+                                inst->paramOverflow,
+                                &transport);
     inst->midiCount = 0;
+    inst->midiOverflow = 0;
     inst->paramEventCount = 0;
+    inst->paramOverflow = 0;
 
-    /* Drain plugin → host MIDI. Channel-voice events go through
-     * `output_event_at` (filtered to fit in 3-byte MIDI 1.0
-     * packets); SysEx events go through `output_sysex_at` with
-     * inner bytes the shim wraps in `0xF0` / `0xF7` framing before
-     * the MIDIPacketListAdd call. Both end up in the same
-     * MIDIPacketList so the host callback fires once per render
-     * block. Events with `sample_offset >= inFrameCount`
-     * (out-of-block) are clamped rather than dropped; AU hosts
-     * schedule these for the boundary sample. */
+    /* Drain the single sorted native lane. AU v2 accepts byte MIDI and
+     * SysEx only; UMP stays unsupported rather than being converted. */
+    OSStatus midiOutputStatus = noErr;
     if (inst->midiOutputCallback) {
-        uint32_t cv_count = g_callbacks->output_event_count(inst->rustCtx);
-        uint32_t sx_count = g_callbacks->output_sysex_count(inst->rustCtx);
-        if (cv_count > 256) cv_count = 256;
-        if (sx_count > 256) sx_count = 256;
-        if (cv_count > 0 || sx_count > 0) {
-            MIDIPacketList *pktList =
-                (MIDIPacketList *)inst->sysexPacketBuf;
-            MIDIPacket *pkt = MIDIPacketListInit(pktList);
-
-            /* Channel-voice drain. `append_or_flush_retry` handles
-             * the overflow path: on `MIDIPacketListAdd` failure it
-             * sends the partial list to the host, reinits, and
-             * retries the current event. Both drains share the
-             * helper so the overflow policy stays in one place. */
-            for (uint32_t i = 0; pkt && i < cv_count; i++) {
-                AuMidiEvent ev = {0};
-                g_callbacks->output_event_at(inst->rustCtx, i, &ev);
-                Byte data[3] = { ev.status, ev.data1, ev.data2 };
-                /* CC / channel pressure / program change are 2-byte
-                 * messages; emit only the bytes that matter. */
-                ByteCount byteCount = 3;
-                if ((ev.status & 0xF0) == 0xC0 || (ev.status & 0xF0) == 0xD0) {
-                    byteCount = 2;
-                }
-                MIDITimeStamp ts = ev.sample_offset;
-                if (ev.sample_offset >= inFrameCount) {
-                    ts = inFrameCount > 0 ? (inFrameCount - 1) : 0;
-                }
-                pkt = append_or_flush_retry(
-                    pktList, pkt, inst, inTimeStamp, ts, byteCount, data);
+        g_callbacks->begin_output_events(inst->rustCtx,
+                                         AU_NATIVE_CARRIER_BYTES,
+                                         inFrameCount);
+        for (;;) {
+            AuNativeEvent ev = {0};
+            uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
+            if (status == AU_OUTPUT_END) break;
+            if (status == AU_OUTPUT_QUEUE_FULL) {
+                midiOutputStatus = kAudioUnitErr_MIDIOutputBufferFull;
+                break;
             }
-            /* SysEx drain. MIDIPacketListAdd accepts the framed
-             * (`0xF0` + inner + `0xF7`) byte stream as a single
-             * packet of length `2 + len`; CoreMIDI carries SysEx
-             * payloads of arbitrary size through one packet (no
-             * 4-byte cap like AAX's `AAX_CMidiPacket`). We build
-             * the framed bytes in `sysexFrameScratch` per event;
-             * `MIDIPacketListAdd` copies them into the list
-             * synchronously so reusing the scratch for the next
-             * event is sound. If a single event exceeds the
-             * packet-list size even on a freshly-flushed buffer,
-             * skip it - truncating SysEx is corrupt. */
-            for (uint32_t i = 0; pkt && i < sx_count; i++) {
-                uint32_t delta = 0;
-                const uint8_t *bytes = NULL;
-                uint32_t len = 0;
-                g_callbacks->output_sysex_at(inst->rustCtx, i,
-                                              &delta, &bytes, &len);
-                if (!bytes && len > 0) continue;
-                uint32_t framedLen = len + 2;
-                if (framedLen > inst->sysexFrameScratchSize) continue;
+            if (status == AU_OUTPUT_UNSUPPORTED) {
+                midiOutputStatus = kAudioUnitErr_FormatNotSupported;
+                break;
+            }
+            if (status != AU_OUTPUT_EMITTED) {
+                midiOutputStatus = kAudioUnitErr_InvalidParameter;
+                break;
+            }
+
+            const Byte *data = NULL;
+            ByteCount len = 0;
+            if (ev.kind == AU_NATIVE_EVENT_MIDI1 &&
+                ev.data_len >= 1 && ev.data_len <= 3) {
+                data = ev.midi;
+                len = ev.data_len;
+            } else if (ev.kind == AU_NATIVE_EVENT_SYSEX &&
+                       ev.data_len <= inst->sysexFrameScratchSize - 2 &&
+                       (ev.sysex || ev.data_len == 0)) {
                 inst->sysexFrameScratch[0] = 0xF0;
-                if (len > 0) {
-                    memcpy(inst->sysexFrameScratch + 1, bytes, len);
+                if (ev.data_len > 0) {
+                    memcpy(inst->sysexFrameScratch + 1, ev.sysex, ev.data_len);
                 }
-                inst->sysexFrameScratch[1 + len] = 0xF7;
-                MIDITimeStamp ts = delta;
-                if (delta >= inFrameCount) {
-                    ts = inFrameCount > 0 ? (inFrameCount - 1) : 0;
-                }
-                pkt = append_or_flush_retry(
-                    pktList, pkt, inst, inTimeStamp, ts, framedLen,
-                    inst->sysexFrameScratch);
+                inst->sysexFrameScratch[ev.data_len + 1] = 0xF7;
+                data = inst->sysexFrameScratch;
+                len = ev.data_len + 2;
+            } else {
+                midiOutputStatus = kAudioUnitErr_InvalidParameter;
+                break;
             }
 
-            /* Flush whatever's left in the list. The loop above
-             * already flushed once per `add` failure, so the final
-             * `pktList` may be empty - `numPackets == 0` is the
-             * documented signal not to call the host callback. */
-            if (pktList->numPackets > 0) {
-                inst->midiOutputCallback(inst->midiOutputUserData,
-                                         inTimeStamp, 0 /* outputIndex */,
-                                         pktList);
+            MIDIPacketList *pktList = (MIDIPacketList *)inst->sysexPacketBuf;
+            MIDIPacket *pkt = MIDIPacketListInit(pktList);
+            if (!MIDIPacketListAdd(pktList, inst->sysexPacketBufSize, pkt,
+                                   ev.sample_offset, len, data)) {
+                midiOutputStatus = kAudioUnitErr_MIDIOutputBufferFull;
+                break;
+            }
+            OSStatus sent = inst->midiOutputCallback(inst->midiOutputUserData,
+                                                     inTimeStamp, ev.port,
+                                                     pktList);
+            if (sent != noErr) {
+                midiOutputStatus = sent;
+                break;
             }
         }
     }
@@ -1937,7 +1903,7 @@ static OSStatus au_v2_render(void *self_,
     au_v2_fire_render_notifies(inst, kAudioUnitRenderAction_PostRender,
                                ioFlags, inTimeStamp, inBusNumber, inFrameCount, ioData);
 
-    return noErr;
+    return midiOutputStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -1949,13 +1915,28 @@ static OSStatus au_v2_midi_event(void *self_, UInt32 status,
                                   UInt32 sampleOffset) {
     TruceAUv2 *inst = (TruceAUv2 *)self_;
 
-    if (inst->midiCount >= 256) return noErr;
+    if (status > UINT8_MAX || data1 > UINT8_MAX || data2 > UINT8_MAX) {
+        return kAudioUnitErr_InvalidParameter;
+    }
+    if (inst->midiCount >= 256) {
+        inst->midiOverflow = 1;
+        return kAudioUnitErr_TooManyFramesToProcess;
+    }
 
-    AuMidiEvent *ev = &inst->midiBuffer[inst->midiCount++];
+    AuNativeEvent *ev = &inst->midiBuffer[inst->midiCount++];
+    memset(ev, 0, sizeof(*ev));
     ev->sample_offset = sampleOffset;
-    ev->status = (uint8_t)status;
-    ev->data1 = (uint8_t)data1;
-    ev->data2 = (uint8_t)data2;
+    ev->kind = AU_NATIVE_EVENT_MIDI1;
+    ev->data_len = 3;
+    if ((status & 0xF0) == 0xC0 || (status & 0xF0) == 0xD0 ||
+        status == 0xF1 || status == 0xF3) {
+        ev->data_len = 2;
+    } else if (status >= 0xF0 && status != 0xF2) {
+        ev->data_len = 1;
+    }
+    ev->midi[0] = (uint8_t)status;
+    ev->midi[1] = (uint8_t)data1;
+    ev->midi[2] = (uint8_t)data2;
     ev->port = 0; /* AU v2 is single-stream MIDI input */
     return noErr;
 }
@@ -1967,15 +1948,17 @@ static OSStatus au_v2_midi_event(void *self_, UInt32 status,
  * timestamp, so the message lands at block start (sample_offset 0). */
 static OSStatus au_v2_sysex(void *self_, const UInt8 *inData, UInt32 inLength) {
     TruceAUv2 *inst = (TruceAUv2 *)self_;
-    if (!g_callbacks || !g_callbacks->push_sysex_input || !inData || inLength == 0) {
-        return noErr;
-    }
+    if (!g_callbacks || !g_callbacks->push_sysex_input_native || !inst->rustCtx)
+        return kAudioUnitErr_Uninitialized;
+    if (!inData || inLength < 2 || inData[0] != 0xF0 ||
+        inData[inLength - 1] != 0xF7)
+        return kAudioUnitErr_InvalidParameter;
     const uint8_t *p = (const uint8_t *)inData;
     uint32_t n = inLength;
-    if (p[0] == 0xF0) { p++; n--; }
-    if (n > 0 && p[n - 1] == 0xF7) { n--; }
-    if (n > 0) {
-        g_callbacks->push_sysex_input(inst->rustCtx, 0, p, n);
+    p++;
+    n -= 2;
+    if (!g_callbacks->push_sysex_input_native(inst->rustCtx, 0, p, n)) {
+        return kAudioUnitErr_TooManyFramesToProcess;
     }
     return noErr;
 }
