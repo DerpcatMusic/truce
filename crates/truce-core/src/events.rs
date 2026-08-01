@@ -136,14 +136,104 @@ impl RawUmp {
     }
 }
 
-/// Format-neutral note addressing. `None` means the host wildcard for that
-/// component; `Some` preserves a concrete address exactly.
+/// One component of a host-native event address.
+///
+/// Hosts commonly use `-1` as a wildcard while carrying concrete values in
+/// signed fields. [`Self::InvalidRaw`] keeps every other out-of-domain value
+/// observable instead of accidentally turning hostile input into a wildcard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExactAddress<T> {
+    #[default]
+    Wildcard,
+    Value(T),
+    InvalidRaw(i32),
+}
+
+impl<T> ExactAddress<T>
+where
+    T: Copy + Into<i32>,
+{
+    #[must_use]
+    pub fn is_wildcard(self) -> bool {
+        matches!(self, Self::Wildcard)
+    }
+
+    #[must_use]
+    pub fn value(self) -> Option<T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Wildcard | Self::InvalidRaw(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_raw(self) -> Option<i32> {
+        match self {
+            Self::InvalidRaw(raw) => Some(raw),
+            Self::Wildcard | Self::Value(_) => None,
+        }
+    }
+
+    /// Reconstruct the signed host value without erasing invalid input.
+    #[must_use]
+    pub fn raw_i32(self) -> i32 {
+        match self {
+            Self::Wildcard => -1,
+            Self::Value(value) => value.into(),
+            Self::InvalidRaw(raw) => raw,
+        }
+    }
+}
+
+/// Format-neutral note addressing with lossless signed-host classification.
+/// Concrete channels are `0..=15`, keys are `0..=127`, and `-1` is the
+/// wildcard on every axis. Other raw signed values remain distinguishable as
+/// [`ExactAddress::InvalidRaw`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExactNoteAddress {
-    pub port: Option<u16>,
-    pub channel: Option<u8>,
-    pub key: Option<u8>,
-    pub note_id: Option<i32>,
+    pub port: ExactAddress<u16>,
+    pub channel: ExactAddress<u8>,
+    pub key: ExactAddress<u8>,
+    pub note_id: ExactAddress<i32>,
+}
+
+impl ExactNoteAddress {
+    /// Classify raw signed host fields without narrowing invalid values.
+    #[must_use]
+    pub fn from_raw_signed(port: i16, channel: i16, key: i16, note_id: i32) -> Self {
+        Self {
+            port: classify_port(port),
+            channel: classify_u8_axis(channel, 15),
+            key: classify_u8_axis(key, 127),
+            note_id: match note_id {
+                -1 => ExactAddress::Wildcard,
+                0.. => ExactAddress::Value(note_id),
+                invalid => ExactAddress::InvalidRaw(invalid),
+            },
+        }
+    }
+}
+
+fn classify_port(raw: i16) -> ExactAddress<u16> {
+    if raw == -1 {
+        ExactAddress::Wildcard
+    } else if let Ok(value) = u16::try_from(raw) {
+        ExactAddress::Value(value)
+    } else {
+        ExactAddress::InvalidRaw(i32::from(raw))
+    }
+}
+
+fn classify_u8_axis(raw: i16, max: u8) -> ExactAddress<u8> {
+    if raw == -1 {
+        ExactAddress::Wildcard
+    } else if let Ok(value) = u8::try_from(raw)
+        && value <= max
+    {
+        ExactAddress::Value(value)
+    } else {
+        ExactAddress::InvalidRaw(i32::from(raw))
+    }
 }
 
 /// A note lifecycle operation which may not have a MIDI byte equivalent.

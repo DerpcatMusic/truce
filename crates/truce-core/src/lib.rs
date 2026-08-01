@@ -29,9 +29,9 @@ pub use bus::{BusConfig, BusKind, BusLayout, ChannelConfig};
 pub use config::{AudioConfig, ProcessMode};
 pub use editor::{Editor, EditorBuilder, IntoEditor, PluginContext};
 pub use events::{
-    Event, EventBody, EventList, ExactEvent, ExactEventBody, ExactEventRef, ExactNoteAddress,
-    ExactNoteKind, LosslessEventRef, PushError, RawMidi1, RawUmp, SYSEX_POOL_PREALLOC,
-    TransportInfo,
+    Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody, ExactEventRef,
+    ExactNoteAddress, ExactNoteKind, LosslessEventRef, PushError, RawMidi1, RawUmp,
+    SYSEX_POOL_PREALLOC, TransportInfo,
 };
 pub use export::PluginExport;
 pub use info::{AutomationConfig, MidiDialect, PluginCategory, PluginInfo};
