@@ -34,8 +34,8 @@ impl BusActivation {
 /// One declared bus's range in Truce's flattened channel array.
 ///
 /// A dynamic format such as CLAP may omit a disabled bus from the flattened
-/// host buffer. That bus remains present in the snapshot as an inactive,
-/// zero-width range so bus indices stay aligned with the selected layout.
+/// host buffer. That bus remains present as a zero-width range so indices stay
+/// aligned; its activation is `Unknown` without separate host route metadata.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BusRoute {
     channel_start: u32,

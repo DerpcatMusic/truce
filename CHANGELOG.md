@@ -10,7 +10,7 @@ Breaking: move every direct `truce*` dependency in a plugin to 7.0 together. `tr
 - Plug-ins can inspect whether the preceding output-event block succeeded, overflowed staging, met a full host queue, used an unsupported carrier, or contained invalid data; MIDI and process-emitted parameter feedback reject known incomplete, failed, or unavailable blocks before delivery across CLAP, VST3, Audio Unit, AAX, LV2, VST2, standalone, and the offline driver.
 - CLAP descriptors keep fractional fixed-step parameters loadable by exposing them as continuous host ranges while Truce still applies the plug-in's requested quantization.
 - Managed background tasks now work in hot-reload shells as well as release builds; each logic build warms its own workers before audio starts, editor work stays bound to the build that created it, and reloads cancel queued work without blocking the audio thread. Reloads stop and join retired workers instead of accumulating threads, abort cleanly when a handler cannot retire in time, and keep activated code mapped so open editors and saved state callbacks remain valid.
-- `ProcessContext::bus_routing` exposes bounded, allocation-free per-bus channel ranges and live activation for CLAP, VST3, AU, AAX, LV2, standalone, and the driver. VST2 reports `Unknown` because its API has no truthful per-bus activation signal; LV2 remains main-I/O-only.
+- `ProcessContext::bus_routing` exposes bounded, allocation-free per-bus channel ranges and live activation for VST3, AU, AAX, LV2, standalone, and the driver. CLAP and VST2 report `Unknown` because their process APIs expose no truthful per-bus connection signal; LV2 remains main-I/O-only.
 
 ## 6.3.0
 

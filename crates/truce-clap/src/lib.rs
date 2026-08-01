@@ -365,7 +365,7 @@ struct ClapAudio<P: PluginExport> {
     /// tagged with the wire precision the host picked for its port.
     host_out_ptrs: Vec<HostOutPtr>,
     /// Selected layout's structural bus order and flattened ranges. Built at
-    /// activate; `process` only stamps live host connection state.
+    /// activate; CLAP exposes no truthful per-block connection state.
     bus_routing: BusRouting,
 }
 
@@ -717,11 +717,7 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
                     } else {
                         0
                     },
-                    if bus.enabled {
-                        BusActivation::Unknown
-                    } else {
-                        BusActivation::Inactive
-                    },
+                    BusActivation::Unknown,
                 );
             }
             for bus in &layout.outputs {
@@ -731,11 +727,7 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
                     } else {
                         0
                     },
-                    if bus.enabled {
-                        BusActivation::Unknown
-                    } else {
-                        BusActivation::Inactive
-                    },
+                    BusActivation::Unknown,
                 );
             }
         }
@@ -2605,33 +2597,10 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // `Vec::new()` keeps the fallback allocation-free; the inner
         // scratch only allocates if that channel actually converts.
         let mut flat_in_idx = 0usize;
-        let mut bus_routing = scr.bus_routing;
-        let mut declared_input_bus = 0usize;
+        let bus_routing = scr.bus_routing;
         for bus_idx in 0..proc.audio_inputs_count {
             let buf = &*proc.audio_inputs.add(bus_idx as usize);
             let bus_is_f64 = !buf.data64.is_null();
-            let active = if bus_is_f64 {
-                (0..buf.channel_count).any(|ch| !(*buf.data64.add(ch as usize)).is_null())
-            } else if buf.data32.is_null() {
-                false
-            } else {
-                (0..buf.channel_count).any(|ch| !(*buf.data32.add(ch as usize)).is_null())
-            };
-            while bus_routing
-                .input(declared_input_bus)
-                .is_some_and(|route| route.channel_count() == 0)
-            {
-                declared_input_bus += 1;
-            }
-            bus_routing.set_input_activation(
-                declared_input_bus,
-                if active {
-                    BusActivation::Active
-                } else {
-                    BusActivation::Inactive
-                },
-            );
-            declared_input_bus += 1;
             for ch in 0..buf.channel_count {
                 while scr.input_widen.len() <= flat_in_idx {
                     scr.input_widen.push(Vec::new());
@@ -2661,32 +2630,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         }
         scr.host_out_ptrs.clear();
         let mut flat_out_idx = 0usize;
-        let mut declared_output_bus = 0usize;
         for bus_idx in 0..proc.audio_outputs_count {
             let buf = &mut *proc.audio_outputs.add(bus_idx as usize);
             let bus_is_f64 = !buf.data64.is_null();
-            let active = if bus_is_f64 {
-                (0..buf.channel_count).any(|ch| !(*buf.data64.add(ch as usize)).is_null())
-            } else if buf.data32.is_null() {
-                false
-            } else {
-                (0..buf.channel_count).any(|ch| !(*buf.data32.add(ch as usize)).is_null())
-            };
-            while bus_routing
-                .output(declared_output_bus)
-                .is_some_and(|route| route.channel_count() == 0)
-            {
-                declared_output_bus += 1;
-            }
-            bus_routing.set_output_activation(
-                declared_output_bus,
-                if active {
-                    BusActivation::Active
-                } else {
-                    BusActivation::Inactive
-                },
-            );
-            declared_output_bus += 1;
             for ch in 0..buf.channel_count {
                 while scr.output_narrow.len() <= flat_out_idx {
                     scr.output_narrow.push(Vec::new());
