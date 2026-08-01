@@ -323,15 +323,10 @@ impl EguiRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         {
-            // `egui_wgpu::Renderer::render` (egui 0.31) takes
-            // `&mut RenderPass<'static>`, but `begin_render_pass` returns a
-            // pass borrowing `encoder` and `frame_view` lifetimes. wgpu 24
-            // exposes `forget_lifetime()` specifically to bridge this -
-            // discharging the borrow checker's view without changing the
-            // GPU contract (the inner scope still ends before `encoder`
-            // is consumed by `submit`). The egui-wgpu API is the
-            // constraint here; nothing on our side to fix until egui
-            // drops the `'static` requirement.
+            // `egui_wgpu::Renderer::render` requires `RenderPass<'static>`.
+            // `forget_lifetime` erases the compile-time encoder borrow while
+            // keeping the encoder locked at runtime; this scope drops the pass
+            // before `encoder` is consumed by `submit`.
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("egui"),
