@@ -58,6 +58,188 @@ impl Event {
     }
 }
 
+/// A validated raw MIDI 1.0 short message.
+///
+/// The length is part of the value because system-common messages may use
+/// fewer than three bytes. SysEx remains in [`EventBody::SysEx`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawMidi1 {
+    bytes: [u8; 3],
+    len: u8,
+}
+
+impl RawMidi1 {
+    /// Construct a one-, two-, or three-byte MIDI 1.0 message.
+    #[must_use]
+    pub fn new(bytes: [u8; 3], len: u8) -> Option<Self> {
+        (1..=3).contains(&len).then_some(Self { bytes, len })
+    }
+
+    /// The meaningful bytes in this message.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// Original three-byte storage, including trailing bytes outside the
+    /// semantic message length. Useful for fixed-width host transports.
+    #[must_use]
+    pub fn storage(&self) -> &[u8; 3] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// A validated Universal MIDI Packet containing one to four 32-bit words.
+///
+/// No message-type filtering is performed: utility, system, data, flex-data,
+/// stream, and future packets remain byte-for-byte observable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawUmp {
+    words: [u32; 4],
+    word_count: u8,
+}
+
+impl RawUmp {
+    /// Construct a UMP with its original packet length.
+    #[must_use]
+    pub fn new(words: [u32; 4], word_count: u8) -> Option<Self> {
+        (1..=4)
+            .contains(&word_count)
+            .then_some(Self { words, word_count })
+    }
+
+    /// The meaningful words in this packet.
+    #[must_use]
+    pub fn words(&self) -> &[u32] {
+        &self.words[..usize::from(self.word_count)]
+    }
+
+    /// Original four-word storage, including words outside the packet length.
+    #[must_use]
+    pub fn storage(&self) -> &[u32; 4] {
+        &self.words
+    }
+
+    #[must_use]
+    pub fn word_count(&self) -> usize {
+        usize::from(self.word_count)
+    }
+}
+
+/// Format-neutral note addressing. `None` means the host wildcard for that
+/// component; `Some` preserves a concrete address exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExactNoteAddress {
+    pub port: Option<u16>,
+    pub channel: Option<u8>,
+    pub key: Option<u8>,
+    pub note_id: Option<i32>,
+}
+
+/// A note lifecycle operation which may not have a MIDI byte equivalent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExactNoteKind {
+    On,
+    Off,
+    Choke,
+    End,
+}
+
+/// Lossless, format-neutral event payloads kept alongside the convenient
+/// [`EventBody`] representation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ExactEventBody {
+    Midi1 {
+        port: u16,
+        message: RawMidi1,
+    },
+    Ump {
+        port: u16,
+        packet: RawUmp,
+    },
+    Note {
+        kind: ExactNoteKind,
+        address: ExactNoteAddress,
+        velocity: f64,
+    },
+    NoteExpression {
+        expression_id: i32,
+        address: ExactNoteAddress,
+        value: f64,
+    },
+}
+
+/// A timestamped lossless event. Exact-only events have no [`EventBody`]
+/// fallback; linked events expose one through [`ExactEventRef::fallback`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExactEvent {
+    sample_offset: u32,
+    pub body: ExactEventBody,
+}
+
+impl ExactEvent {
+    #[must_use]
+    pub fn new(sample_offset: u32, body: ExactEventBody) -> Self {
+        Self {
+            sample_offset,
+            body,
+        }
+    }
+
+    #[must_use]
+    pub fn sample_offset(&self) -> u32 {
+        self.sample_offset
+    }
+}
+
+/// Borrowed view of an exact event and its optional typed fallback.
+#[derive(Clone, Copy, Debug)]
+pub struct ExactEventRef<'a> {
+    exact: &'a ExactEvent,
+    fallback: Option<&'a Event>,
+}
+
+/// Allocation-free merged view of exact events and typed events which do not
+/// have an exact payload. Linked typed fallbacks appear only as [`Self::Exact`]
+/// so an adapter can replay the lossless payload without emitting a duplicate.
+#[derive(Clone, Copy, Debug)]
+pub enum LosslessEventRef<'a> {
+    Typed(&'a Event),
+    Exact(ExactEventRef<'a>),
+}
+
+impl<'a> ExactEventRef<'a> {
+    #[must_use]
+    pub fn body(self) -> &'a ExactEventBody {
+        &self.exact.body
+    }
+
+    #[must_use]
+    pub fn fallback(self) -> Option<&'a Event> {
+        self.fallback
+    }
+
+    /// Effective timestamp. A linked exact payload follows the fallback's
+    /// timestamp, including mutations made through [`EventList::events_mut`].
+    #[must_use]
+    pub fn sample_offset(self) -> u32 {
+        self.fallback
+            .map_or(self.exact.sample_offset, |event| event.sample_offset)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EventBody {
     // -- MIDI 1.0 channel voice (wire-native 7-bit / 14-bit) --
@@ -329,13 +511,13 @@ pub const EVENT_LIST_PREALLOC: usize = 256;
 /// match.
 pub const SYSEX_POOL_PREALLOC: usize = 128 * 1024;
 
-/// Why a push into the [`EventList`] failed. Today only `SysEx`
-/// payloads can fail to land (the channel-voice [`EventList::push`]
-/// path grows the backing `Vec` instead, since the audio-thread
-/// contract there is "stay under [`EVENT_LIST_PREALLOC`]" rather
-/// than "fail closed").
+/// Why a push into the bounded [`EventList`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushError {
+    /// The typed event lane is full.
+    EventFull,
+    /// The exact event lane is full.
+    ExactEventFull,
     /// The `SysEx` byte pool is full. The message wasn't appended.
     /// Callers either drop it, surface it via a meter, or bump the
     /// pool size via [`EventList::with_capacity`] at construction.
@@ -345,6 +527,8 @@ pub enum PushError {
 impl core::fmt::Display for PushError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::EventFull => f.write_str("event lane is full"),
+            Self::ExactEventFull => f.write_str("exact event lane is full"),
             Self::PoolFull => f.write_str("SysEx byte pool is full"),
         }
     }
@@ -354,35 +538,75 @@ impl std::error::Error for PushError {}
 
 /// Ordered list of events within a process block.
 ///
-/// `events` is the per-block event ring; `sysex_pool` is the
-/// variable-byte arena that [`EventBody::SysEx`] entries index into.
-/// Both are pre-allocated by [`EventList::with_capacity`] and reset
+/// `events` and `exact_events` are the per-block event lanes; `sysex_pool`
+/// is the variable-byte arena that [`EventBody::SysEx`] entries index into.
+/// All are pre-allocated by [`EventList::with_capacity`] and reset
 /// (length only - backing memory preserved) by [`Self::clear`], so
 /// steady-state operation is allocation-free.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct EventList {
     events: Vec<Event>,
+    event_exact: Vec<Option<usize>>,
+    event_sequence: Vec<u64>,
+    exact_events: Vec<StoredExactEvent>,
     sysex_pool: Vec<u8>,
+    overflow: Option<PushError>,
+    next_sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+struct StoredExactEvent {
+    event: ExactEvent,
+    fallback_index: Option<usize>,
+    sequence: u64,
+}
+
+impl Clone for EventList {
+    fn clone(&self) -> Self {
+        Self {
+            events: clone_vec_preserving_capacity(&self.events),
+            event_exact: clone_vec_preserving_capacity(&self.event_exact),
+            event_sequence: clone_vec_preserving_capacity(&self.event_sequence),
+            exact_events: clone_vec_preserving_capacity(&self.exact_events),
+            sysex_pool: clone_vec_preserving_capacity(&self.sysex_pool),
+            overflow: self.overflow,
+            next_sequence: self.next_sequence,
+        }
+    }
+}
+
+fn clone_vec_preserving_capacity<T: Clone>(source: &Vec<T>) -> Vec<T> {
+    let mut cloned = Vec::with_capacity(source.capacity());
+    cloned.extend_from_slice(source);
+    cloned
+}
+
+impl Default for EventList {
+    fn default() -> Self {
+        Self::with_capacity(EVENT_LIST_PREALLOC)
+    }
 }
 
 impl EventList {
     /// Construct an `EventList` with backing capacity already reserved.
     ///
-    /// Format wrappers build their per-instance event lists at
-    /// construction time and reuse them across blocks via `clear()`.
-    /// Without this, the first `push` after `EventList::default()` hits
-    /// the global allocator on the audio thread; pre-allocating with
-    /// the max event count an audio block is likely to carry keeps
-    /// the first block alloc-free.
+    /// Format wrappers build their per-instance event lists at construction
+    /// time and reuse them across blocks via `clear()`. [`Self::default`]
+    /// reserves [`EVENT_LIST_PREALLOC`]; use this constructor when the host's
+    /// maximum event count is known.
     ///
     /// The `SysEx` byte pool is sized to [`SYSEX_POOL_PREALLOC`]
-    /// regardless of `capacity` - `capacity` controls the event ring
-    /// only.
+    /// regardless of `capacity` - `capacity` controls both event lanes.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             events: Vec::with_capacity(capacity),
+            event_exact: Vec::with_capacity(capacity),
+            event_sequence: Vec::with_capacity(capacity),
+            exact_events: Vec::with_capacity(capacity),
             sysex_pool: Vec::with_capacity(SYSEX_POOL_PREALLOC),
+            overflow: None,
+            next_sequence: 0,
         }
     }
 
@@ -392,7 +616,66 @@ impl EventList {
     /// (the audio thread can't recover from an out-of-range offset, so
     /// we treat that as a contract violation rather than panicking).
     pub fn push(&mut self, event: Event) {
+        let _ = self.try_push(event);
+    }
+
+    /// Fallible form of [`Self::push`]. No lane grows beyond the capacity
+    /// reserved at construction.
+    ///
+    /// # Errors
+    /// [`PushError::EventFull`] when the typed lane is full.
+    pub fn try_push(&mut self, event: Event) -> Result<(), PushError> {
+        self.reserve_event_slot()?;
+        let sequence = self.take_sequence();
         self.events.push(event);
+        self.event_exact.push(None);
+        self.event_sequence.push(sequence);
+        Ok(())
+    }
+
+    /// Append an exact-only event which has no typed fallback.
+    ///
+    /// # Errors
+    /// [`PushError::ExactEventFull`] when the exact lane is full.
+    pub fn try_push_exact(&mut self, event: ExactEvent) -> Result<(), PushError> {
+        self.reserve_exact_slot()?;
+        let sequence = self.take_sequence();
+        self.exact_events.push(StoredExactEvent {
+            event,
+            fallback_index: None,
+            sequence,
+        });
+        Ok(())
+    }
+
+    /// Atomically append a typed convenience event and its exact payload.
+    /// The exact timestamp is anchored to the typed event so subsequent
+    /// offset mutation cannot split the pair.
+    ///
+    /// # Errors
+    /// [`PushError::EventFull`] or [`PushError::ExactEventFull`] when the
+    /// corresponding lane is full. Neither lane changes on failure.
+    pub fn try_push_with_exact(
+        &mut self,
+        event: Event,
+        mut exact: ExactEvent,
+    ) -> Result<(), PushError> {
+        self.reserve_event_slot()?;
+        self.reserve_exact_slot()?;
+
+        exact.sample_offset = event.sample_offset;
+        let event_index = self.events.len();
+        let exact_index = self.exact_events.len();
+        let sequence = self.take_sequence();
+        self.events.push(event);
+        self.event_exact.push(Some(exact_index));
+        self.event_sequence.push(sequence);
+        self.exact_events.push(StoredExactEvent {
+            event: exact,
+            fallback_index: Some(event_index),
+            sequence,
+        });
+        Ok(())
     }
 
     /// Sort the list by `sample_offset` if it isn't already, keeping
@@ -407,17 +690,50 @@ impl EventList {
     /// is a std stable sort that allocates past ~20 elements;
     /// `sort_unstable` would reorder equal offsets, and stability is
     /// load-bearing: "note-on then CC on the same sample" must stay
-    /// in push order). Reorders [`Event`] entries only; `SysEx` pool
-    /// offsets stay valid because the pool's bytes aren't moved.
+    /// in push order). Linked exact payloads follow their fallback while
+    /// exact-only events are sorted in their own lane. `SysEx` pool offsets
+    /// stay valid because the pool's bytes aren't moved.
     pub fn ensure_sorted_by_offset(&mut self) {
-        if self.events.is_sorted_by_key(|event| event.sample_offset) {
-            return;
+        if !self.events.is_sorted_by_key(|event| event.sample_offset) {
+            for i in 1..self.events.len() {
+                let mut j = i;
+                while j > 0 && self.events[j - 1].sample_offset > self.events[j].sample_offset {
+                    self.events.swap(j - 1, j);
+                    self.event_exact.swap(j - 1, j);
+                    self.event_sequence.swap(j - 1, j);
+                    j -= 1;
+                }
+            }
         }
-        for i in 1..self.events.len() {
+
+        for (event_index, exact_index) in self.event_exact.iter().copied().enumerate() {
+            if let Some(stored) = exact_index.and_then(|index| self.exact_events.get_mut(index)) {
+                stored.fallback_index = Some(event_index);
+            }
+        }
+
+        for i in 1..self.exact_events.len() {
             let mut j = i;
-            while j > 0 && self.events[j - 1].sample_offset > self.events[j].sample_offset {
-                self.events.swap(j - 1, j);
+            while j > 0
+                && Self::exact_offset(&self.exact_events[j - 1], &self.events)
+                    > Self::exact_offset(&self.exact_events[j], &self.events)
+            {
+                self.exact_events.swap(j - 1, j);
                 j -= 1;
+            }
+        }
+
+        for link in &mut self.event_exact {
+            if link.is_some() {
+                *link = None;
+            }
+        }
+        for (exact_index, stored) in self.exact_events.iter().enumerate() {
+            if let Some(link) = stored
+                .fallback_index
+                .and_then(|event_index| self.event_exact.get_mut(event_index))
+            {
+                *link = Some(exact_index);
             }
         }
     }
@@ -435,7 +751,8 @@ impl EventList {
     /// message and is never the right answer.
     ///
     /// # Errors
-    /// [`PushError::PoolFull`] when the pool is at capacity.
+    /// [`PushError::EventFull`] when the event lane is full, or
+    /// [`PushError::PoolFull`] when the byte pool is at capacity.
     pub fn push_sysex(&mut self, sample_offset: u32, data: &[u8]) -> Result<(), PushError> {
         self.push_sysex_on_port(sample_offset, 0, data)
     }
@@ -446,16 +763,50 @@ impl EventList {
     /// arrived on.
     ///
     /// # Errors
-    /// [`PushError::PoolFull`] when the pool is at capacity.
+    /// [`PushError::EventFull`] when the event lane is full, or
+    /// [`PushError::PoolFull`] when the byte pool is at capacity.
     pub fn push_sysex_on_port(
         &mut self,
         sample_offset: u32,
         port: u8,
         data: &[u8],
     ) -> Result<(), PushError> {
+        self.push_sysex_on_port_impl(sample_offset, port, data, None)
+    }
+
+    /// Atomically copy a `SysEx` payload and link its typed event to an exact
+    /// payload. This is primarily used when rebasing a lossless event list.
+    ///
+    /// # Errors
+    /// [`PushError::EventFull`], [`PushError::ExactEventFull`], or
+    /// [`PushError::PoolFull`] when the corresponding bounded storage is full.
+    pub fn try_push_sysex_with_exact_on_port(
+        &mut self,
+        sample_offset: u32,
+        port: u8,
+        data: &[u8],
+        exact: ExactEvent,
+    ) -> Result<(), PushError> {
+        self.push_sysex_on_port_impl(sample_offset, port, data, Some(exact))
+    }
+
+    fn push_sysex_on_port_impl(
+        &mut self,
+        sample_offset: u32,
+        port: u8,
+        data: &[u8],
+        exact: Option<ExactEvent>,
+    ) -> Result<(), PushError> {
         let pool_offset = self.sysex_pool.len();
-        if pool_offset + data.len() > self.sysex_pool.capacity() {
-            return Err(PushError::PoolFull);
+        self.reserve_event_slot()?;
+        if exact.is_some() {
+            self.reserve_exact_slot()?;
+        }
+        let Some(pool_end) = pool_offset.checked_add(data.len()) else {
+            return self.fail(PushError::PoolFull);
+        };
+        if pool_end > self.sysex_pool.capacity() {
+            return self.fail(PushError::PoolFull);
         }
         self.sysex_pool.extend_from_slice(data);
         // `as u32` casts are bounded: pool capacity is sized in the
@@ -464,28 +815,44 @@ impl EventList {
         // fits in `u32` by construction (`SYSEX_POOL_PREALLOC` ==
         // 128 KiB).
         #[allow(clippy::cast_possible_truncation)]
-        self.events.push(Event {
+        let event = Event {
             sample_offset,
             port,
             body: EventBody::SysEx {
                 pool_offset: pool_offset as u32,
                 len: data.len() as u32,
             },
-        });
+        };
+        let event_index = self.events.len();
+        let sequence = self.take_sequence();
+        let exact_index = exact.as_ref().map(|_| self.exact_events.len());
+        self.events.push(event);
+        self.event_exact.push(exact_index);
+        self.event_sequence.push(sequence);
+        if let Some(mut exact) = exact {
+            exact.sample_offset = sample_offset;
+            self.exact_events.push(StoredExactEvent {
+                event: exact,
+                fallback_index: Some(event_index),
+                sequence,
+            });
+        }
         Ok(())
     }
 
     /// Resolve a [`EventBody::SysEx`] entry to its payload bytes.
-    /// Returns an empty slice for any other variant - the slice is
-    /// indexed against the internal byte pool, so a non-`SysEx`
-    /// body has nothing to point at.
+    /// Returns an empty slice for any other variant or an invalid range. The
+    /// latter can only come from a manually constructed `EventBody::SysEx`;
+    /// fail closed rather than panicking on the audio thread.
     #[must_use]
     pub fn sysex_bytes(&self, body: &EventBody) -> &[u8] {
         match body {
             EventBody::SysEx { pool_offset, len } => {
                 let start = *pool_offset as usize;
-                let end = start + (*len as usize);
-                &self.sysex_pool[start..end]
+                let Some(end) = start.checked_add(*len as usize) else {
+                    return &[];
+                };
+                self.sysex_pool.get(start..end).unwrap_or(&[])
             }
             _ => &[],
         }
@@ -493,13 +860,104 @@ impl EventList {
 
     pub fn clear(&mut self) {
         self.events.clear();
+        self.event_exact.clear();
+        self.event_sequence.clear();
+        self.exact_events.clear();
         // `Vec::clear` preserves capacity; the pool stays
         // pre-allocated for the next block.
         self.sysex_pool.clear();
+        self.next_sequence = 0;
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Event> {
         self.events.iter()
+    }
+
+    /// Exact events in stable timestamp order after
+    /// [`Self::ensure_sorted_by_offset`]. Linked entries expose their typed
+    /// fallback; exact-only entries return `None` from
+    /// [`ExactEventRef::fallback`].
+    pub fn exact_iter(&self) -> impl Iterator<Item = ExactEventRef<'_>> {
+        self.exact_events.iter().map(|stored| ExactEventRef {
+            exact: &stored.event,
+            fallback: stored
+                .fallback_index
+                .and_then(|index| self.events.get(index)),
+        })
+    }
+
+    #[must_use]
+    pub fn exact_get(&self, index: usize) -> Option<ExactEventRef<'_>> {
+        let stored = self.exact_events.get(index)?;
+        Some(ExactEventRef {
+            exact: &stored.event,
+            fallback: stored
+                .fallback_index
+                .and_then(|fallback| self.events.get(fallback)),
+        })
+    }
+
+    /// Return the exact payload linked to a typed event index, if any.
+    /// Adapters which keep their existing typed loop can use this to suppress
+    /// the fallback when they emit the exact payload separately.
+    #[must_use]
+    pub fn exact_for_event(&self, event_index: usize) -> Option<ExactEventRef<'_>> {
+        let exact_index = self.event_exact.get(event_index).copied().flatten()?;
+        self.exact_get(exact_index)
+    }
+
+    /// Merge exact events with typed events lacking an exact payload without
+    /// allocation. Call [`Self::ensure_sorted_by_offset`] first. Ties retain
+    /// the original cross-lane insertion order.
+    pub fn lossless_iter(&self) -> impl Iterator<Item = LosslessEventRef<'_>> {
+        let mut event_index = 0;
+        let mut exact_index = 0;
+
+        core::iter::from_fn(move || {
+            while self
+                .event_exact
+                .get(event_index)
+                .copied()
+                .flatten()
+                .is_some()
+            {
+                event_index += 1;
+            }
+
+            let typed_key = self.events.get(event_index).and_then(|event| {
+                self.event_sequence
+                    .get(event_index)
+                    .map(|sequence| (event.sample_offset, *sequence))
+            });
+            let exact_key = self
+                .exact_events
+                .get(exact_index)
+                .map(|stored| (Self::exact_offset(stored, &self.events), stored.sequence));
+
+            match (typed_key, exact_key) {
+                (None, None) => None,
+                (Some(_), None) => {
+                    let event = self.events.get(event_index)?;
+                    event_index += 1;
+                    Some(LosslessEventRef::Typed(event))
+                }
+                (None, Some(_)) => {
+                    let event = self.exact_get(exact_index)?;
+                    exact_index += 1;
+                    Some(LosslessEventRef::Exact(event))
+                }
+                (Some(typed), Some(exact)) if typed <= exact => {
+                    let event = self.events.get(event_index)?;
+                    event_index += 1;
+                    Some(LosslessEventRef::Typed(event))
+                }
+                (Some(_), Some(_)) => {
+                    let event = self.exact_get(exact_index)?;
+                    exact_index += 1;
+                    Some(LosslessEventRef::Exact(event))
+                }
+            }
+        })
     }
 
     #[must_use]
@@ -514,14 +972,51 @@ impl EventList {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
+        self.events.is_empty() && self.exact_events.is_empty()
     }
 
-    /// Mutable access to the underlying event slice. Used by
-    /// `chunked_process` to shift the `sample_offset` of outbound
-    /// events back to host-block-relative coordinates after a
-    /// sub-block; should not be needed by plugin or wrapper code
-    /// outside the chunker.
+    #[must_use]
+    pub fn exact_len(&self) -> usize {
+        self.exact_events.len()
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.events.capacity()
+    }
+
+    #[must_use]
+    pub fn exact_capacity(&self) -> usize {
+        self.exact_events.capacity()
+    }
+
+    /// The most recent capacity failure, including failures ignored by the
+    /// source-compatible [`Self::push`] API. This signal remains set across
+    /// [`Self::clear`] until explicitly acknowledged.
+    #[must_use]
+    pub fn overflow(&self) -> Option<PushError> {
+        self.overflow
+    }
+
+    pub fn clear_overflow(&mut self) {
+        self.overflow = None;
+    }
+
+    /// Add `shift` to typed and exact timestamps appended at or after the
+    /// supplied lane cursors. Saturation matches chunked processing's
+    /// existing output-offset behaviour and never panics.
+    pub fn shift_offsets_from(&mut self, event_from: usize, exact_from: usize, shift: u32) {
+        for event in self.events.iter_mut().skip(event_from) {
+            event.sample_offset = event.sample_offset.saturating_add(shift);
+        }
+        for stored in self.exact_events.iter_mut().skip(exact_from) {
+            stored.event.sample_offset = stored.event.sample_offset.saturating_add(shift);
+        }
+    }
+
+    /// Mutable access to the underlying typed event slice. Linked exact
+    /// payloads inherit their fallback timestamp when observed, but callers
+    /// shifting both lanes should use [`Self::shift_offsets_from`].
     #[doc(hidden)]
     pub fn events_mut(&mut self) -> &mut [Event] {
         &mut self.events
@@ -540,6 +1035,41 @@ impl EventList {
     #[must_use]
     pub fn sysex_pool_capacity(&self) -> usize {
         self.sysex_pool.capacity()
+    }
+
+    fn reserve_event_slot(&mut self) -> Result<(), PushError> {
+        if self.events.len() >= self.events.capacity()
+            || self.event_exact.len() >= self.event_exact.capacity()
+            || self.event_sequence.len() >= self.event_sequence.capacity()
+        {
+            return self.fail(PushError::EventFull);
+        }
+        Ok(())
+    }
+
+    fn reserve_exact_slot(&mut self) -> Result<(), PushError> {
+        if self.exact_events.len() >= self.exact_events.capacity() {
+            return self.fail(PushError::ExactEventFull);
+        }
+        Ok(())
+    }
+
+    fn fail<T>(&mut self, error: PushError) -> Result<T, PushError> {
+        self.overflow = Some(error);
+        Err(error)
+    }
+
+    fn take_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        sequence
+    }
+
+    fn exact_offset(stored: &StoredExactEvent, events: &[Event]) -> u32 {
+        stored
+            .fallback_index
+            .and_then(|index| events.get(index))
+            .map_or(stored.event.sample_offset, |event| event.sample_offset)
     }
 }
 

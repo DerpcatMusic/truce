@@ -856,6 +856,10 @@ impl<P: PluginExport> PluginDriver<P> {
 
         let (script_events, script_sysex) =
             prepare_script_events(&mut self.script, self.sample_rate, total_frames);
+        let scripted_event_capacity = script_events
+            .len()
+            .checked_add(script_sysex.len())
+            .expect("combined script event count exceeds addressable capacity");
 
         // Transport tracker.
         let mut transport_pos_beats = self.transport.position_beats;
@@ -899,18 +903,17 @@ impl<P: PluginExport> PluginDriver<P> {
         };
 
         let mut cursor = 0usize;
-        let mut event_list = EventList::with_capacity(script_events.len().min(256));
+        let mut event_list = EventList::with_capacity(scripted_event_capacity);
         // Hoisted out of the loop and reused. `with_capacity` reserves
-        // both the event ring and the `SysEx` byte pool (`default()`
-        // reserves neither), so the plugin's `push_sysex` into
-        // `output_events` and the chunker's rebase into the scratch
-        // stay allocation-free and don't silently drop `SysEx`.
+        // both event lanes and the `SysEx` byte pool, so the plugin's
+        // `push_sysex` into `output_events` and the chunker's rebase into
+        // the scratch stay allocation-free and don't silently drop `SysEx`.
         let mut output_events_block = EventList::with_capacity(EVENT_LIST_PREALLOC);
         // Per-sub-block scratch + cached static info so the offline
         // render routes through the same `chunked_process` helper the
         // format wrappers use. Tests scripting `set_param` at known
         // offsets get the same deferred-apply behavior live hosts see.
-        let mut sub_event_scratch = EventList::with_capacity(EVENT_LIST_PREALLOC);
+        let mut sub_event_scratch = EventList::with_capacity(scripted_event_capacity);
         let param_infos = plugin.params().param_infos();
         let params_arc = plugin.params_arc();
         let min_subblock_samples = P::info().automation.min_subblock_samples;
