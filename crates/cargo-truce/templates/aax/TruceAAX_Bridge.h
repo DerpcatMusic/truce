@@ -16,7 +16,8 @@ typedef void  (*fn_reset)(void*, double, uint32_t);
 typedef void  (*fn_set_render_mode)(void*, uint32_t);
 typedef uint32_t (*fn_latency)(void*);
 typedef uint32_t (*fn_process_native)(void*, const float**, float**, uint32_t, uint32_t,
-                                      uint32_t, const TruceAaxNativeEvent*, uint32_t,
+                                      uint32_t, uint32_t, uint32_t,
+                                      const TruceAaxNativeEvent*, uint32_t,
                                       uint32_t, const TruceAaxTransportSnapshot*);
 typedef void     (*fn_begin_output_events)(void*, uint32_t);
 typedef uint32_t (*fn_next_output_event)(void*, TruceAaxNativeEvent*);

@@ -466,7 +466,9 @@ class TruceAUAudioUnit: AUAudioUnit {
         outPtrs: UnsafeMutablePointer<UnsafeMutablePointer<Float>?>,
         nativeBuf: UnsafeMutablePointer<AuNativeEvent>,
         scCh: Int,
+        mainInputEnabled: Bool,
         sidechainEnabled: Bool,
+        mainOutputEnabled: Bool,
         scScratch: UnsafeMutablePointer<Float>?,
         scABL: UnsafeMutableAudioBufferListPointer?,
         scMaxFrames: Int,
@@ -720,8 +722,8 @@ class TruceAUAudioUnit: AUAudioUnit {
             }
         }
 
-        guard truceAbiTailVersion(cb) >= 10,
-              let processNative = cb.pointee.process_native,
+        guard truceAbiTailVersion(cb) >= 11,
+              let processNative = cb.pointee.process_native_v11,
               let beginOutput = cb.pointee.begin_output_events_v10,
               let nextOutput = cb.pointee.next_output_event,
               let finishOutput = cb.pointee.finish_output_events,
@@ -733,6 +735,8 @@ class TruceAUAudioUnit: AUAudioUnit {
         }
         let processResult = processNative(
             ctx, inPtrs, outPtrs, actualIn + UInt32(scActual), actualOut,
+            (mainInputEnabled ? 1 : 0) | (sidechainEnabled ? 2 : 0),
+            mainOutputEnabled ? 1 : 0,
             frameCount, nativeBuf, numNative, nativeOverflow,
             paramBuf, numParam, paramOverflow, transportBuf)
         if processResult != UInt32(AU_PROCESS_OK) {
@@ -926,7 +930,9 @@ class TruceAUAudioUnit: AUAudioUnit {
         // AUAudioUnitBus.isEnabled is the format's connection/activation
         // contract. Snapshot it while the host builds the render graph; the
         // realtime block must not query Objective-C state.
+        let mainInputEnabled = !_inputBusArray.isEmpty && _inputBusArray[0].isEnabled
         let sidechainEnabled = _inputBusArray.count > 1 && _inputBusArray[1].isEnabled
+        let mainOutputEnabled = !_outputBusArray.isEmpty && _outputBusArray[0].isEnabled
         // Size to the authoritative max captured in allocateRenderResources
         // (`_maxFrames`), not `maximumFramesToRender` sampled now: the host
         // may have finalized the max after a smaller default, and this
@@ -976,7 +982,9 @@ class TruceAUAudioUnit: AUAudioUnit {
                 timestamp: timestamp, frameCount: frameCount,
                 outputData: outputData, events: events, pull: pull,
                 inPtrs: inPtrs, outPtrs: outPtrs, nativeBuf: nativeBuf,
-                scCh: scCh, sidechainEnabled: sidechainEnabled,
+                scCh: scCh, mainInputEnabled: mainInputEnabled,
+                sidechainEnabled: sidechainEnabled,
+                mainOutputEnabled: mainOutputEnabled,
                 scScratch: scScratch, scABL: scABL, scMaxFrames: scMaxFrames,
                 mainInScratch: mainInScratch, mainInABL: mainInABL,
                 paramBuf: paramBuf,

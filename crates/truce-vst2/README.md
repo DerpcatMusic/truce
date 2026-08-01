@@ -18,6 +18,11 @@ plugin logic is delegated to Rust via C FFI callbacks.
 - State (chunk) save and restore
 - Plugin category and I/O configuration reporting
 
+VST2 has one flat input and output pin list, not runtime audio buses. Truce
+preserves declared main/sidechain channel ranges in
+`ProcessContext::bus_routing`, but reports their activation as `Unknown`
+instead of guessing from samples or host-provided storage.
+
 ## Architecture
 
 The C shim (compiled via `cc`) implements the `AEffect` dispatcher and

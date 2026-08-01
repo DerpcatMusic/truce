@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use truce_core::buffer::RawBufferScratch;
+use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::{sample_count_usize, sample_rate_u32};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -839,6 +840,7 @@ pub fn start_audio<P: PluginExport>(opts: &Options) -> Result<AudioHandles<P>, B
                 num_in,
                 num_out,
                 num_main_in,
+                layout_index,
                 is_effect,
                 res,
             );
@@ -1077,6 +1079,7 @@ fn output_worker<P: PluginExport>(
     // reassigned - not re-derived from ambiguous totals - on a runtime
     // `SetLayout` switch below.
     mut num_main_in: usize,
+    mut layout_index: usize,
     is_effect: bool,
     res: OutputResources<P>,
 ) {
@@ -1091,6 +1094,7 @@ fn output_worker<P: PluginExport>(
         num_in,
         num_out,
         num_main_in,
+        layout_index,
         is_effect,
         false,
         &res,
@@ -1119,6 +1123,7 @@ fn output_worker<P: PluginExport>(
                     num_in,
                     num_out,
                     num_main_in,
+                    layout_index,
                     is_effect,
                     false,
                     &res,
@@ -1136,6 +1141,7 @@ fn output_worker<P: PluginExport>(
                         num_in,
                         num_out,
                         num_main_in,
+                        layout_index,
                         is_effect,
                         false,
                         &res,
@@ -1175,6 +1181,7 @@ fn output_worker<P: PluginExport>(
                 num_in = new_in;
                 num_out = new_out;
                 num_main_in = new_main_in;
+                layout_index = index;
                 stream = None;
                 if let Err(e) = open_output_stream::<P>(
                     name.as_deref(),
@@ -1185,6 +1192,7 @@ fn output_worker<P: PluginExport>(
                     num_in,
                     num_out,
                     num_main_in,
+                    layout_index,
                     is_effect,
                     true,
                     &res,
@@ -1197,6 +1205,7 @@ fn output_worker<P: PluginExport>(
                     num_in = old_in;
                     num_out = old_out;
                     num_main_in = old_main_in;
+                    layout_index = res.layout.load(Ordering::Relaxed);
                     config.channels = old_channels;
                     if let Err(e2) = reopen_output_or_default::<P>(
                         name.as_deref(),
@@ -1206,6 +1215,7 @@ fn output_worker<P: PluginExport>(
                         num_in,
                         num_out,
                         num_main_in,
+                        layout_index,
                         is_effect,
                         true,
                         &res,
@@ -1238,6 +1248,7 @@ fn reopen_output_or_default<P: PluginExport>(
     num_in: usize,
     num_out: usize,
     num_main_in: usize,
+    layout_index: usize,
     is_effect: bool,
     force_reset: bool,
     res: &OutputResources<P>,
@@ -1252,6 +1263,7 @@ fn reopen_output_or_default<P: PluginExport>(
         num_in,
         num_out,
         num_main_in,
+        layout_index,
         is_effect,
         force_reset,
         res,
@@ -1269,6 +1281,7 @@ fn reopen_output_or_default<P: PluginExport>(
         num_in,
         num_out,
         num_main_in,
+        layout_index,
         is_effect,
         force_reset,
         res,
@@ -1291,6 +1304,7 @@ fn open_output_stream<P: PluginExport>(
     // num_in) are the sidechain bus. Resolved by the caller from the
     // selected layout index (see `layout_at_index`).
     num_main_in: usize,
+    layout_index: usize,
     is_effect: bool,
     // Force a `reset()` even when the frame bound didn't grow. A bus-layout
     // switch changes the channel arrangement, so the plugin has to re-prepare
@@ -1394,6 +1408,15 @@ fn open_output_stream<P: PluginExport>(
         p.reset(&AudioConfig::new(sample_rate, frame_bound));
     }
     scratch.ensure_capacity(num_in, num_out, frame_bound);
+    let mut bus_routing = BusRouting::new();
+    if let Some(layout) = P::bus_layouts().into_iter().nth(layout_index) {
+        for bus in layout.inputs.into_iter().filter(|bus| bus.enabled) {
+            let _ = bus_routing.push_input(bus.channels.channel_count(), BusActivation::Active);
+        }
+        for bus in layout.outputs.into_iter().filter(|bus| bus.enabled) {
+            let _ = bus_routing.push_output(bus.channels.channel_count(), BusActivation::Active);
+        }
+    }
     // `num_main_in` (the main/sidechain split of the selected layout) is
     // resolved by the caller and passed in - the layout is fixed for the
     // stream's lifetime.
@@ -1411,6 +1434,7 @@ fn open_output_stream<P: PluginExport>(
                         num_out,
                         sample_rate,
                         is_effect,
+                        bus_routing,
                         &plugin_a,
                         &pending_a,
                         &pending_state_a,
@@ -1857,6 +1881,7 @@ fn audio_callback<P: PluginExport>(
     num_out: usize,
     sample_rate: f64,
     is_effect: bool,
+    bus_routing: BusRouting,
     plugin: &Arc<Mutex<P>>,
     pending: &Arc<ArrayQueue<MidiEvent>>,
     pending_state: &Arc<ArrayQueue<Vec<u8>>>,
@@ -2064,6 +2089,7 @@ fn audio_callback<P: PluginExport>(
         // The standalone is a live host; offline render goes through
         // `offline.rs` + the driver, not this realtime path.
         process_mode: ProcessMode::Realtime,
+        bus_routing,
         output_events,
         params_fn: None,
         meters_fn: None,

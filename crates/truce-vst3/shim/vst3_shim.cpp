@@ -452,11 +452,15 @@ struct Vst3Callbacks {
     void* (*create)();
     void (*destroy)(void*);
     void (*reset)(void*, double, uint32_t, int32_t);
-    uint32_t (*process)(void*, const float**, float**, uint32_t, uint32_t, uint32_t,
+    uint32_t (*process)(void*, const float**, float**, uint32_t, uint32_t,
+                        const uint32_t*, uint32_t, uint32_t,
+                        const uint32_t*, uint32_t, uint32_t, uint32_t,
                         const Vst3Transport*, const Vst3ParamChange*, uint32_t, int32_t);
     /* 64-bit twin of process. Exactly one of the two runs per block,
      * chosen by the sample size negotiated in setupProcessing. */
-    uint32_t (*process_f64)(void*, const double**, double**, uint32_t, uint32_t, uint32_t,
+    uint32_t (*process_f64)(void*, const double**, double**, uint32_t, uint32_t,
+                            const uint32_t*, uint32_t, uint32_t,
+                            const uint32_t*, uint32_t, uint32_t, uint32_t,
                             const Vst3Transport*, const Vst3ParamChange*, uint32_t, int32_t);
     uint32_t (*param_count)(void*);
     double (*param_get_value)(void*, uint32_t);
@@ -1643,14 +1647,18 @@ public:
         uint32_t processOk = 0;
         if (use64)
             processOk = g_cb->process_f64(ctx, (const double**)inPtrs, (double**)outPtrs,
-                              numIn, numOut, numFrames,
-                              transportPtr, paramChanges, numParamChanges,
-                              data->processMode);
+                                          numIn, numOut,
+                                          inputBusChannels, g_desc->num_input_buses, activeInputs,
+                                          outputBusChannels, g_desc->num_output_buses, activeOutputs,
+                                          numFrames, transportPtr, paramChanges,
+                                          numParamChanges, data->processMode);
         else
             processOk = g_cb->process(ctx, (const float**)inPtrs, (float**)outPtrs,
-                          numIn, numOut, numFrames,
-                          transportPtr, paramChanges, numParamChanges,
-                          data->processMode);
+                                      numIn, numOut,
+                                      inputBusChannels, g_desc->num_input_buses, activeInputs,
+                                      outputBusChannels, g_desc->num_output_buses, activeOutputs,
+                                      numFrames, transportPtr, paramChanges,
+                                      numParamChanges, data->processMode);
 
         if (!processOk) {
             if (g_cb->finish_output_events)

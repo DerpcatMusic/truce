@@ -197,6 +197,7 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
             &mut *context.output_events,
         )
         .with_process_mode(context.process_mode)
+        .with_bus_routing(context.bus_routing)
         .with_params(&param_fn)
         .with_meters(&meter_fn);
         // Stamp the background-task spawner so `ctx.tasks::<T>()` works.

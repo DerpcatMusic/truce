@@ -17,6 +17,7 @@
 use truce_params::{ParamFlags, ParamInfo, Params};
 
 use crate::buffer::AudioBuffer;
+use crate::bus_routing::BusRouting;
 use crate::config::ProcessMode;
 use crate::events::{
     Event, EventBody, EventList, ExactEvent, ExactEventBody, LosslessEventRef, TransportInfo,
@@ -55,6 +56,8 @@ pub struct ChunkedProcess<'a> {
     /// each block (VST3 `processMode`, LV2 freewheel port) or cache it
     /// from a set-once callback (CLAP / AU).
     pub process_mode: ProcessMode,
+    /// Host bus routing snapshot, copied into every sub-block context.
+    pub bus_routing: BusRouting,
     /// Plugin's outbound event queue. The chunker re-bases outbound
     /// events back to block-relative coordinates before the wrapper
     /// hands them to the host: the plugin pushes events with
@@ -110,6 +113,7 @@ where
         transport,
         sample_rate,
         process_mode,
+        bus_routing,
         output_events,
         params_fn,
         meters_fn,
@@ -184,7 +188,8 @@ where
             block_end - block_start,
             output_events,
         )
-        .with_process_mode(process_mode);
+        .with_process_mode(process_mode)
+        .with_bus_routing(bus_routing);
         if let Some(f) = params_fn {
             ctx = ctx.with_params(f);
         }

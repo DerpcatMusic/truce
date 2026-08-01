@@ -1,6 +1,7 @@
 pub mod audio_tap;
 pub mod buffer;
 pub mod bus;
+pub mod bus_routing;
 pub mod chunked_process;
 pub mod config;
 pub mod custom_state;
@@ -26,6 +27,7 @@ pub mod wrapper;
 
 pub use buffer::{AudioBuffer, RawBufferScratch};
 pub use bus::{BusConfig, BusKind, BusLayout, ChannelConfig};
+pub use bus_routing::{BusActivation, BusRoute, BusRouting, MAX_AUDIO_BUSES};
 pub use config::{AudioConfig, ProcessMode};
 pub use editor::{Editor, EditorBuilder, IntoEditor, PluginContext};
 pub use events::{

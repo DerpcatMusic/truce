@@ -1,3 +1,4 @@
+use crate::bus_routing::BusRouting;
 use crate::config::ProcessMode;
 use crate::events::{EventList, TransportInfo};
 use crate::tasks::{AnyTaskSpawner, TaskSpawner};
@@ -18,6 +19,9 @@ pub struct ProcessContext<'a> {
     pub sample_rate: f64,
     pub block_size: usize,
     pub output_events: &'a mut EventList,
+    /// Per-bus ranges and host activation state for this block. Channel
+    /// ranges index the flattened `AudioBuffer` passed beside this context.
+    pub bus_routing: BusRouting,
     params_fn: Option<&'a dyn Fn(u32) -> f64>,
     meters_fn: Option<&'a dyn Fn(u32, f32)>,
     /// Type-erased handle to this instance's background-task spawner,
@@ -39,10 +43,18 @@ impl<'a> ProcessContext<'a> {
             sample_rate,
             block_size,
             output_events,
+            bus_routing: BusRouting::new(),
             params_fn: None,
             meters_fn: None,
             tasks: None,
         }
+    }
+
+    /// Stamp the current block's allocation-free bus routing snapshot.
+    #[must_use]
+    pub fn with_bus_routing(mut self, bus_routing: BusRouting) -> Self {
+        self.bus_routing = bus_routing;
+        self
     }
 
     /// Set the processing mode for this block. Defaults to

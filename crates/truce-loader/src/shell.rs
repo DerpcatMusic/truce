@@ -409,6 +409,7 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
             &mut *context.output_events,
         )
         .with_process_mode(context.process_mode)
+        .with_bus_routing(context.bus_routing)
         .with_params(&param_fn)
         .with_meters(&meter_fn);
         if let Some(tasks) = loader.task_spawner() {

@@ -47,6 +47,7 @@ use std::time::Duration;
 
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
+use truce_core::bus_routing::{BusActivation, BusRouting};
 #[cfg(feature = "wav")]
 use truce_core::cast::sample_rate_u32;
 use truce_core::cast::{len_u32, sample_count_usize};
@@ -913,6 +914,35 @@ impl<P: PluginExport> PluginDriver<P> {
             0
         };
         let num_in = channels + sidechain_channels;
+        let mut bus_routing = BusRouting::new();
+        if let Some(layout) = P::bus_layouts().into_iter().find(|layout| {
+            layout.inputs.first().map_or(!is_effect, |bus| {
+                bus.channels.channel_count() as usize == channels
+            })
+        }) {
+            let declared_inputs = layout
+                .inputs
+                .iter()
+                .map(|bus| bus.channels.channel_count() as usize)
+                .sum::<usize>();
+            let declared_outputs = layout
+                .outputs
+                .iter()
+                .map(|bus| bus.channels.channel_count() as usize)
+                .sum::<usize>();
+            if declared_inputs == num_in {
+                for bus in layout.inputs {
+                    let _ =
+                        bus_routing.push_input(bus.channels.channel_count(), BusActivation::Active);
+                }
+            }
+            if declared_outputs == channels {
+                for bus in layout.outputs {
+                    let _ = bus_routing
+                        .push_output(bus.channels.channel_count(), BusActivation::Active);
+                }
+            }
+        }
         if sidechain_channels == 0 && !matches!(self.sidechain, InputSource::Silence) {
             eprintln!("truce-driver: sidechain source ignored - plugin declares no sidechain bus");
         }
@@ -1130,6 +1160,7 @@ impl<P: PluginExport> PluginDriver<P> {
                 transport: &mut transport_snap,
                 sample_rate: self.sample_rate,
                 process_mode: self.process_mode,
+                bus_routing,
                 output_events: &mut output_events_block,
                 params_fn: None,
                 meters_fn: None,

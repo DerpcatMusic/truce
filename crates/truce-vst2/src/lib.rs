@@ -13,6 +13,7 @@ use std::slice;
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
+use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::{len_u32, sample_pos_i64};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -101,6 +102,9 @@ struct Vst2Instance<P: PluginExport> {
     param_infos: Vec<ParamInfo>,
     /// `min_subblock_samples` from `truce.toml`'s `[automation]`.
     min_subblock_samples: u32,
+    /// Fixed first-layout channel ranges. VST2 exposes no per-bus
+    /// process-time activation signal, so every route is `Unknown`.
+    bus_routing: BusRouting,
     plugin_id_hash: u64,
     /// `AEffect` pointer, set by the C shim after creation. Used for host
     /// callbacks. Atomic so the audio thread (transport / automation
@@ -324,6 +328,17 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let mut plugin = P::create();
             plugin.init();
             let info = P::info();
+            let mut bus_routing = BusRouting::new();
+            if let Some(layout) = P::bus_layouts().into_iter().next() {
+                for bus in layout.inputs.into_iter().filter(|bus| bus.enabled) {
+                    let _ = bus_routing
+                        .push_input(bus.channels.channel_count(), BusActivation::Unknown);
+                }
+                for bus in layout.outputs.into_iter().filter(|bus| bus.enabled) {
+                    let _ = bus_routing
+                        .push_output(bus.channels.channel_count(), BusActivation::Unknown);
+                }
+            }
             let param_infos = plugin.params().param_infos();
             let params_arc = plugin.params_arc();
             let meter_store = plugin.meter_store();
@@ -343,6 +358,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 tail_cache,
                 param_infos,
                 min_subblock_samples: info.automation.min_subblock_samples,
+                bus_routing,
                 plugin_id_hash: state::shared_plugin_state_hash(&info),
                 aeffect_ptr: AtomicPtr::new(std::ptr::null_mut()),
                 transport_slot: TransportSlot::new(),
@@ -643,6 +659,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             transport: &mut transport_snap,
             sample_rate: scr.sample_rate,
             process_mode: vst2_process_mode(process_level),
+            bus_routing: inst.bus_routing,
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,

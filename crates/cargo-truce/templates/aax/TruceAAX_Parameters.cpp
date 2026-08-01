@@ -383,11 +383,13 @@ void TruceAAX_Parameters::RenderAudio(
     // declared topology stable, but feed silence until the host supplies a
     // positive index. The `!mSilence.empty()` guard keeps a null out of
     // `inputs` if EffectInit never sized the buffer.
+    bool sidechainActive = false;
     if (g_descriptor.sidechain_in_channels > 0 && !mSilence.empty()) {
         auto* extInfo = reinterpret_cast<TruceAaxExtendedRenderInfo*>(ioRenderInfo);
         const float* scBuf = nullptr;
         if (ioRenderInfo->mAudioInputs && extInfo->mSideChainP && *extInfo->mSideChainP != 0)
             scBuf = ioRenderInfo->mAudioInputs[*extInfo->mSideChainP];
+        sidechainActive = scBuf != nullptr;
         for (uint32_t c = 0;
              c < g_descriptor.sidechain_in_channels && numIn < kMaxInputs;
              c++) {
@@ -584,6 +586,8 @@ void TruceAAX_Parameters::RenderAudio(
     uint32_t processStatus = g_bridge.process_native(mRustCtx,
         inputs, outputs,
         numIn, numOut,
+        (ioRenderInfo->mAudioInputs ? 1u : 0u) | (sidechainActive ? 2u : 0u),
+        ioRenderInfo->mAudioOutputs ? 1u : 0u,
         (uint32_t)bufferSize,
         mNativeEvents.data(), (uint32_t)mNativeEvents.size(), inputStatus,
         transport.valid ? &transport : nullptr);

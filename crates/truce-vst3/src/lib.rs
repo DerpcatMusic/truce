@@ -14,6 +14,7 @@ use std::slice;
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::{BusConfig, BusKind, BusLayout};
+use truce_core::bus_routing::{BusActivation, BusRouting, MAX_AUDIO_BUSES};
 use truce_core::cast::{len_u32, sample_pos_i64};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -1102,6 +1103,12 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
     outputs: *mut *mut f32,
     num_input_channels: u32,
     num_output_channels: u32,
+    input_bus_channels: *const u32,
+    num_input_buses: u32,
+    input_bus_active: u32,
+    output_bus_channels: *const u32,
+    num_output_buses: u32,
+    output_bus_active: u32,
     num_frames: u32,
     transport_ptr: *const ffi::Vst3Transport,
     param_changes: *const ffi::Vst3ParamChange,
@@ -1116,6 +1123,12 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             outputs,
             num_input_channels,
             num_output_channels,
+            input_bus_channels,
+            num_input_buses,
+            input_bus_active,
+            output_bus_channels,
+            num_output_buses,
+            output_bus_active,
             num_frames,
             transport_ptr,
             param_changes,
@@ -1135,6 +1148,12 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
     outputs: *mut *mut f64,
     num_input_channels: u32,
     num_output_channels: u32,
+    input_bus_channels: *const u32,
+    num_input_buses: u32,
+    input_bus_active: u32,
+    output_bus_channels: *const u32,
+    num_output_buses: u32,
+    output_bus_active: u32,
     num_frames: u32,
     transport_ptr: *const ffi::Vst3Transport,
     param_changes: *const ffi::Vst3ParamChange,
@@ -1149,6 +1168,12 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
             outputs,
             num_input_channels,
             num_output_channels,
+            input_bus_channels,
+            num_input_buses,
+            input_bus_active,
+            output_bus_channels,
+            num_output_buses,
+            output_bus_active,
             num_frames,
             transport_ptr,
             param_changes,
@@ -1170,6 +1195,12 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
     outputs: *mut *mut H,
     num_input_channels: u32,
     num_output_channels: u32,
+    input_bus_channels: *const u32,
+    num_input_buses: u32,
+    input_bus_active: u32,
+    output_bus_channels: *const u32,
+    num_output_buses: u32,
+    output_bus_active: u32,
     num_frames: u32,
     transport_ptr: *const ffi::Vst3Transport,
     param_changes: *const ffi::Vst3ParamChange,
@@ -1246,6 +1277,43 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             len_u32(num_frames),
             P::supports_in_place(),
         );
+        let mut bus_routing = BusRouting::new();
+        if !input_bus_channels.is_null() {
+            for (index, &channels) in slice::from_raw_parts(
+                input_bus_channels,
+                (num_input_buses as usize).min(MAX_AUDIO_BUSES),
+            )
+            .iter()
+            .enumerate()
+            {
+                let _ = bus_routing.push_input(
+                    channels,
+                    if input_bus_active & (1_u32 << index) == 0 {
+                        BusActivation::Inactive
+                    } else {
+                        BusActivation::Active
+                    },
+                );
+            }
+        }
+        if !output_bus_channels.is_null() {
+            for (index, &channels) in slice::from_raw_parts(
+                output_bus_channels,
+                (num_output_buses as usize).min(MAX_AUDIO_BUSES),
+            )
+            .iter()
+            .enumerate()
+            {
+                let _ = bus_routing.push_output(
+                    channels,
+                    if output_bus_active & (1_u32 << index) == 0 {
+                        BusActivation::Inactive
+                    } else {
+                        BusActivation::Active
+                    },
+                );
+            }
+        }
 
         // Queue sample-accurate parameter changes. `set_plain` is
         // deferred to the chunker's per-sub-block apply pass so
@@ -1354,6 +1422,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             transport: &mut transport_snap,
             sample_rate: scr.sample_rate,
             process_mode: vst3_process_mode(process_mode),
+            bus_routing,
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
@@ -1433,6 +1502,7 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
         let mut out_right = vec![0f32; frames];
         let in_ptrs: [*const f32; 2] = [in_left.as_ptr(), in_right.as_ptr()];
         let mut out_ptrs: [*mut f32; 2] = [out_left.as_mut_ptr(), out_right.as_mut_ptr()];
+        let bus_channels = [CH];
 
         let mut count = 0;
         for _ in 0..3 {
@@ -1444,6 +1514,12 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
                     out_ptrs.as_mut_ptr(),
                     CH,
                     CH,
+                    bus_channels.as_ptr(),
+                    1,
+                    1,
+                    bus_channels.as_ptr(),
+                    1,
+                    1,
                     FRAMES,
                     std::ptr::null(),
                     std::ptr::null(),

@@ -35,6 +35,7 @@ use std::sync::Arc;
 use truce_core::Float;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusKind;
+use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::len_u32;
 use truce_core::chunked_process::{ChunkedProcess, process_chunked};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -711,6 +712,32 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                 n_samples,
                 P::supports_in_place(),
             );
+            // LV2's generated RDF currently exposes only one flattened main
+            // input and output bus. Port connection is the only truthful
+            // process-time activation signal available here.
+            let mut bus_routing = BusRouting::new();
+            if num_in > 0 {
+                let active = s.audio_inputs.iter().any(|ptr| !ptr.is_null());
+                let _ = bus_routing.push_input(
+                    num_in,
+                    if active {
+                        BusActivation::Active
+                    } else {
+                        BusActivation::Inactive
+                    },
+                );
+            }
+            if num_out > 0 {
+                let active = s.audio_outputs.iter().any(|ptr| !ptr.is_null());
+                let _ = bus_routing.push_output(
+                    num_out,
+                    if active {
+                        BusActivation::Active
+                    } else {
+                        BusActivation::Inactive
+                    },
+                );
+            }
             inst.transport_slot.write(&transport);
             // Read the `lv2:freeWheeling` port: >= 0.5 means the host is
             // exporting offline. Null (host never connected it) or 0 is
@@ -727,6 +754,7 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                 transport: &mut transport_snap,
                 sample_rate: inst.sample_rate,
                 process_mode,
+                bus_routing,
                 output_events: &mut inst.output_events,
                 params_fn: None,
                 meters_fn: None,

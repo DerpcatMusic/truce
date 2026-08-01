@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
+use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::{len_u32, sample_pos_i64};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -319,6 +320,7 @@ struct AaxInstance<P: PluginExport> {
     min_subblock_samples: u32,
     midi_input_ports: u8,
     midi_output_ports: u8,
+    sidechain_channels: u32,
     plugin_id_hash: u64,
     /// Audio + lifecycle-owned per-block scratch. Behind a `PluginCell` so
     /// every callback reaches it through a shared `&AaxInstance` - never a
@@ -801,6 +803,8 @@ macro_rules! export_aax {
                 outputs: *mut *mut f32,
                 num_in: u32,
                 num_out: u32,
+                input_bus_active: u32,
+                output_bus_active: u32,
                 num_frames: u32,
                 events: *const ::truce_aax::TruceAaxNativeEvent,
                 num_events: u32,
@@ -813,6 +817,8 @@ macro_rules! export_aax {
                     outputs,
                     num_in,
                     num_out,
+                    input_bus_active,
+                    output_bus_active,
                     num_frames,
                     events,
                     num_events,
@@ -1031,6 +1037,14 @@ pub unsafe fn _create<P: PluginExport>() -> *mut std::ffi::c_void {
             let mut plugin = P::create();
             plugin.init();
             let info = P::info();
+            let sidechain_channels = P::bus_layouts().first().map_or(0, |layout| {
+                layout
+                    .inputs
+                    .iter()
+                    .skip(1)
+                    .map(|bus| bus.channels.channel_count())
+                    .sum()
+            });
             let param_infos = plugin.params().param_infos();
             let params_arc = plugin.params_arc();
             let meter_store = plugin.meter_store();
@@ -1053,6 +1067,7 @@ pub unsafe fn _create<P: PluginExport>() -> *mut std::ffi::c_void {
                 min_subblock_samples: info.automation.min_subblock_samples,
                 midi_input_ports: info.midi_input_ports,
                 midi_output_ports: info.midi_output_ports,
+                sidechain_channels,
                 plugin_id_hash: state::shared_plugin_state_hash(&info),
                 audio: PluginCell::new(AaxAudio {
                     event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
@@ -1258,13 +1273,15 @@ fn ingest_native_input(
     TRUCE_AAX_EVENT_END
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub unsafe fn _process_native<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     inputs: *const *const f32,
     outputs: *mut *mut f32,
     num_in: u32,
     num_out: u32,
+    input_bus_active: u32,
+    output_bus_active: u32,
     num_frames: u32,
     events: *const TruceAaxNativeEvent,
     num_events: u32,
@@ -1372,6 +1389,39 @@ pub unsafe fn _process_native<P: PluginExport>(
                 len_u32(num_frames),
                 P::supports_in_place(),
             );
+            let sidechain_channels = inst.sidechain_channels.min(num_in);
+            let main_input_channels = num_in.saturating_sub(sidechain_channels);
+            let mut bus_routing = BusRouting::new();
+            if main_input_channels > 0 {
+                let _ = bus_routing.push_input(
+                    main_input_channels,
+                    if input_bus_active & 1 == 0 {
+                        BusActivation::Inactive
+                    } else {
+                        BusActivation::Active
+                    },
+                );
+            }
+            if sidechain_channels > 0 {
+                let _ = bus_routing.push_input(
+                    sidechain_channels,
+                    if input_bus_active & 2 == 0 {
+                        BusActivation::Inactive
+                    } else {
+                        BusActivation::Active
+                    },
+                );
+            }
+            if num_out > 0 {
+                let _ = bus_routing.push_output(
+                    num_out,
+                    if output_bus_active & 1 == 0 {
+                        BusActivation::Inactive
+                    } else {
+                        BusActivation::Active
+                    },
+                );
+            }
             let transport = if !transport_ptr.is_null() && (*transport_ptr).valid != 0 {
                 let t = &*transport_ptr;
                 TransportInfo {
@@ -1414,6 +1464,7 @@ pub unsafe fn _process_native<P: PluginExport>(
                 // Offline-bounce state from the host notifications; read
                 // per block so a mid-session toggle applies immediately.
                 process_mode: ProcessMode::from_u8(inst.render_mode.load(Ordering::Relaxed)),
+                bus_routing,
                 output_events: &mut scr.output_events,
                 params_fn: None,
                 meters_fn: None,
@@ -1492,6 +1543,8 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
                     out_ptrs.as_mut_ptr(),
                     CH,
                     CH,
+                    1,
+                    1,
                     FRAMES,
                     std::ptr::null(),
                     0,

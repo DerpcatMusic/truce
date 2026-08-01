@@ -34,6 +34,8 @@ callback. The format can make a declared port optional with
 `lv2:connectionOptional`, but Truce's compile-time TTL currently knows only the
 category-derived main I/O, not runtime `bus_layouts()`. Sidechains therefore
 remain unavailable in LV2 instead of being advertised with fake activation.
+`ProcessContext::bus_routing` consequently reports only the generated main
+input/output ranges and whether their port pointers are connected.
 
 ## Key macro
 

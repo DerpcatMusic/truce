@@ -1775,6 +1775,10 @@ static OSStatus au_v2_render(void *self_,
     uint32_t base = numIn > numOut ? numIn : numOut;
     uint32_t scCh = g_descriptor->sidechain_in_channels;
     if (base + scCh > 32) scCh = base < 32 ? 32 - base : 0;
+    const bool mainInputActive = numIn > 0 &&
+        (inst->inputCallback != NULL || inst->sourceUnit != NULL);
+    const bool sidechainActive = scCh > 0 &&
+        (inst->sidechainInputCallback != NULL || inst->sidechainSourceUnit != NULL);
 
     if (numIn > 0) {
         // Build a temporary ABL pointing to our buffers for the input pull.
@@ -1909,8 +1913,11 @@ static OSStatus au_v2_render(void *self_,
     /* MIDI 1 byte events and native UMP event-list input share the same
      * bounded lane. Rust returns a boundary status before DSP runs if exact
      * storage cannot retain the complete block. */
-    uint32_t processStatus = g_callbacks->process_native(
-        inst->rustCtx, inPtrs, outPtrs, numIn + scCh, numOut, inFrameCount,
+    uint32_t processStatus = g_callbacks->process_native_v11(
+        inst->rustCtx, inPtrs, outPtrs, numIn + scCh, numOut,
+        (mainInputActive ? 1u : 0u) | (sidechainActive ? 2u : 0u),
+        numOut > 0 ? 1u : 0u,
+        inFrameCount,
         inst->midiBuffer, inst->midiCount, inst->midiOverflow,
         inst->paramEvents, inst->paramEventCount, inst->paramOverflow,
         &transport);

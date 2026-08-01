@@ -43,8 +43,9 @@ extern "C" {
  *           plugin's ParamRange (AAX has no native skew taper).
  *   10 → 11: one strict native MIDI 1.0 / SysEx event lane with explicit
  *            loss status and a sequential output cursor.
- *   11 → 12: completed output-event delivery status. */
-#define TRUCE_AAX_ABI_VERSION 12u
+ *   11 → 12: completed output-event delivery status.
+ *   12 → 13: process-time audio-bus activation masks. */
+#define TRUCE_AAX_ABI_VERSION 13u
 
 /* Capacity of TruceAaxDescriptor::legacy_chunk_ids. */
 #define TRUCE_AAX_MAX_LEGACY_CHUNKS 8u
@@ -221,6 +222,7 @@ uint32_t truce_aax_latency(void* ctx);
 uint32_t truce_aax_process_native(void* ctx,
     const float** inputs, float** outputs,
     uint32_t num_input_channels, uint32_t num_output_channels,
+    uint32_t input_bus_active, uint32_t output_bus_active,
     uint32_t num_frames,
     const TruceAaxNativeEvent* events, uint32_t num_events,
     uint32_t input_status,

@@ -41,6 +41,7 @@ use truce_core::editor::{ClosureBridge, PluginContext, RawWindowHandle, SendPtr}
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
+use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::editor::fit_logical_size;
 use truce_core::events::{
     AuEventMetadata, EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
@@ -333,6 +334,8 @@ struct AuInstance<P: PluginExport> {
     param_infos: Vec<ParamInfo>,
     /// `min_subblock_samples` from `truce.toml`'s `[automation]`.
     min_subblock_samples: u32,
+    /// AU exposes one main input plus one combined sidechain element.
+    sidechain_channels: u32,
     plugin_id_hash: u64,
     /// Audio + lifecycle-owned per-block scratch. Behind a `PluginCell` so
     /// every callback reaches it through a shared `&AuInstance` - never a
@@ -473,6 +476,14 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let mut plugin = P::create();
             plugin.init();
             let info = P::info();
+            let sidechain_channels = P::bus_layouts().first().map_or(0, |layout| {
+                layout
+                    .inputs
+                    .iter()
+                    .skip(1)
+                    .map(|bus| bus.channels.channel_count())
+                    .sum()
+            });
             let param_infos = plugin.params().param_infos();
             let params_arc = plugin.params_arc();
             let latency_cache = AtomicU32::new(plugin.latency());
@@ -493,6 +504,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 param_notify: None,
                 param_infos,
                 min_subblock_samples: info.automation.min_subblock_samples,
+                sidechain_channels,
                 plugin_id_hash: state::shared_plugin_state_hash(&info),
                 audio: PluginCell::new(AuAudio {
                     event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
@@ -890,6 +902,7 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             param_events,
             num_param_events,
             0,
+            None,
             transport_ptr,
         );
     }
@@ -926,6 +939,46 @@ unsafe extern "C" fn cb_process_native<P: PluginExport>(
             param_events,
             num_param_events,
             param_overflow,
+            None,
+            transport_ptr,
+        )
+    }
+}
+
+unsafe extern "C" fn cb_process_native_v11<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    inputs: *const *const f32,
+    outputs: *mut *mut f32,
+    num_input_channels: u32,
+    num_output_channels: u32,
+    input_bus_active: u32,
+    output_bus_active: u32,
+    num_frames: u32,
+    events: *const AuNativeEvent,
+    num_events: u32,
+    input_overflow: u32,
+    param_events: *const AuParamEvent,
+    num_param_events: u32,
+    param_overflow: u32,
+    transport_ptr: *const AuTransportSnapshot,
+) -> u32 {
+    unsafe {
+        cb_process_impl::<P>(
+            ctx,
+            inputs,
+            outputs,
+            num_input_channels,
+            num_output_channels,
+            num_frames,
+            AuProcessInput::Native {
+                events,
+                len: num_events,
+                overflow: input_overflow,
+            },
+            param_events,
+            num_param_events,
+            param_overflow,
+            Some((input_bus_active, output_bus_active)),
             transport_ptr,
         )
     }
@@ -943,6 +996,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
     param_events: *const AuParamEvent,
     num_param_events: u32,
     param_overflow: u32,
+    bus_active: Option<(u32, u32)>,
     transport_ptr: *const AuTransportSnapshot,
 ) -> u32 {
     let nf = num_frames as usize;
@@ -1171,6 +1225,26 @@ unsafe fn cb_process_impl<P: PluginExport>(
             len_u32(num_frames),
             P::supports_in_place(),
         );
+        let sidechain_channels = inst.sidechain_channels.min(num_input_channels);
+        let main_input_channels = num_input_channels.saturating_sub(sidechain_channels);
+        let activation = |direction_mask: Option<u32>, bus: usize| match direction_mask {
+            Some(mask) if mask & (1_u32 << bus) == 0 => BusActivation::Inactive,
+            Some(_) => BusActivation::Active,
+            None => BusActivation::Unknown,
+        };
+        let mut bus_routing = BusRouting::new();
+        if main_input_channels > 0 {
+            let _ =
+                bus_routing.push_input(main_input_channels, activation(bus_active.map(|m| m.0), 0));
+        }
+        if sidechain_channels > 0 {
+            let _ =
+                bus_routing.push_input(sidechain_channels, activation(bus_active.map(|m| m.0), 1));
+        }
+        if num_output_channels > 0 {
+            let _ = bus_routing
+                .push_output(num_output_channels, activation(bus_active.map(|m| m.1), 0));
+        }
 
         let transport = if !transport_ptr.is_null() && (*transport_ptr).valid != 0 {
             let t = &*transport_ptr;
@@ -1212,6 +1286,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
             // mode`); read per block so a mid-session toggle applies to
             // the next block without waiting on a re-prep.
             process_mode: ProcessMode::from_u8(inst.render_mode.load(Ordering::Relaxed)),
+            bus_routing,
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
@@ -3326,6 +3401,7 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         begin_output_events_v9: cb_begin_output_events_v9::<P>,
         commit_output_params: cb_commit_output_params::<P>,
         begin_output_events_v10: cb_begin_output_events_v10::<P>,
+        process_native_v11: cb_process_native_v11::<P>,
     }));
 
     let param_descs = param_descs.leak();

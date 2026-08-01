@@ -50,9 +50,10 @@
 // v9: appended wrapper-time output preflight and transactional parameter
 // feedback publication.
 // v10: appended explicit parameter-feedback carrier negotiation.
+// v11: appended process-time audio-bus activation metadata.
 #define TRUCE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define TRUCE_AU_ABI_MAGIC 0x54417500u
-#define TRUCE_AU_ABI_VERSION 0x5441750Au
+#define TRUCE_AU_ABI_VERSION 0x5441750Bu
 
 typedef struct {
     uint8_t component_type[4];
@@ -424,6 +425,22 @@ typedef struct {
                                     uint32_t max_absolute_offset,
                                     uint32_t ump_time_valid,
                                     uint32_t param_feedback_available);
+    /* v11 keeps the v7 process callback ABI-stable and appends bus
+     * activation metadata in a new entry. */
+    uint32_t (*process_native_v11)(void *ctx,
+                                   const float **inputs, float **outputs,
+                                   uint32_t num_input_channels,
+                                   uint32_t num_output_channels,
+                                   uint32_t input_bus_active,
+                                   uint32_t output_bus_active,
+                                   uint32_t num_frames,
+                                   const AuNativeEvent *events,
+                                   uint32_t num_events,
+                                   uint32_t input_overflow,
+                                   const AuParamEvent *param_events,
+                                   uint32_t num_param_events,
+                                   uint32_t param_overflow,
+                                   const AuTransportSnapshot *transport);
 } AuCallbacks;
 
 // Globals shared between v2 and v3 shims.
