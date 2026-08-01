@@ -2621,7 +2621,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         url: url.into_raw(),
         email: std::ptr::null(),
         version: version.into_raw(),
-        cid: state::vst3_cid(info.vst3_id),
+        cid: state::resolve_vst3_cid(P::vst3_class_id(), info.vst3_id),
         category: category.into_raw(),
         subcategories: subcategories.into_raw(),
         num_inputs,

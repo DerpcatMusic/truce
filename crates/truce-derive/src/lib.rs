@@ -334,6 +334,32 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Generate the optional exact VST3 class ID for the current plugin.
+#[doc(hidden)]
+#[proc_macro]
+pub fn plugin_vst3_class_id(_input: TokenStream) -> TokenStream {
+    let (_config, pkg_name, truce_toml_path) = match try_resolve_plugin() {
+        Ok(value) => value,
+        Err(msg) => {
+            return syn::Error::new(proc_macro2::Span::call_site(), msg)
+                .to_compile_error()
+                .into();
+        }
+    };
+    match truce_build::load_vst3_class_ids(&truce_toml_path) {
+        Ok(ids) => match ids
+            .into_iter()
+            .find(|(crate_name, _)| crate_name == &pkg_name)
+        {
+            Some((_, bytes)) => quote! { Some([#(#bytes),*]) }.into(),
+            None => quote! { None }.into(),
+        },
+        Err(msg) => syn::Error::new(proc_macro2::Span::call_site(), msg)
+            .to_compile_error()
+            .into(),
+    }
+}
+
 /// Emit `manifest.ttl` + `plugin.ttl` for the plugin whose root params
 /// type is `<input>`. Invoked by `truce::plugin!`'s expansion. See
 /// [`lv2_emit::emit_root_impl`] for the gory details.

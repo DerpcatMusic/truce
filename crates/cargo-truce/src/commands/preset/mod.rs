@@ -32,7 +32,7 @@ use truce_build::presets::{
 };
 use truce_utils::preset::PresetMeta;
 use truce_utils::presets::{PresetStore, mint_uuid};
-use truce_utils::state::{deserialize_state, hash_plugin_id, serialize_state, vst3_cid};
+use truce_utils::state::{deserialize_state, hash_plugin_id, serialize_state};
 use truce_utils::{safe_filename, slugify};
 
 /// `(meta, params, extra)` for one decoded preset.
@@ -369,10 +369,7 @@ fn encode_native(
 
     Ok(match format {
         PresetFormat::TrucePreset => truce_utils::preset::write_preset_file(&meta, &blob),
-        PresetFormat::Vst3 => {
-            let clap_id = truce_build::plugin_id(&ctx.config.vendor.id, &ctx.p.bundle_id);
-            vstpreset_bytes(&vst3_cid(&clap_id), &blob)
-        }
+        PresetFormat::Vst3 => vstpreset_bytes(&ctx.config.vst3_cid(ctx.p), &blob),
         PresetFormat::Au => {
             let au_type = fourcc_int(ctx.p.resolved_au_type())?;
             let subtype = fourcc_int(ctx.p.resolved_fourcc())?;
@@ -652,8 +649,7 @@ fn cmd_export(args: &[String]) -> Res {
 
         zip.start_file(format!("vstpreset/{dir}{display}.vstpreset"), options)
             .map_err(zip_err)?;
-        let clap_id = truce_build::plugin_id(&ctx.config.vendor.id, &ctx.p.bundle_id);
-        zip.write_all(&vstpreset_bytes(&vst3_cid(&clap_id), &blob))?;
+        zip.write_all(&vstpreset_bytes(&ctx.config.vst3_cid(ctx.p), &blob))?;
 
         zip.start_file(format!("aupreset/{dir}{display}.aupreset"), options)
             .map_err(zip_err)?;

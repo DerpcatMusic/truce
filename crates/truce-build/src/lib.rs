@@ -7,7 +7,7 @@
 //! reads `truce.toml` directly at compile time and tracks it via
 //! `include_bytes!`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
 pub mod lv2;
@@ -384,6 +384,76 @@ pub struct PluginDef {
     /// declaration: the wrapper already holds the foreign bytes.
     #[serde(default)]
     pub legacy_state: Option<LegacyStateConfig>,
+}
+
+#[derive(Deserialize)]
+struct Vst3ClassIdConfig {
+    plugin: Vec<Vst3ClassIdPlugin>,
+}
+
+#[derive(Deserialize)]
+struct Vst3ClassIdPlugin {
+    #[serde(rename = "crate")]
+    crate_name: String,
+    #[serde(
+        default,
+        rename = "vst3_class_id",
+        deserialize_with = "deserialize_vst3_class_id"
+    )]
+    class_id: Option<[u8; 16]>,
+}
+
+fn deserialize_vst3_class_id<'de, D>(deserializer: D) -> Result<Option<[u8; 16]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if value.len() != 32 {
+        return Err(serde::de::Error::custom(format!(
+            "`vst3_class_id` must be exactly 32 hexadecimal characters (16 bytes); got {}",
+            value.len()
+        )));
+    }
+    if !value.is_ascii() || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(serde::de::Error::custom(
+            "`vst3_class_id` must contain only hexadecimal characters",
+        ));
+    }
+
+    let mut bytes = [0; 16];
+    for (byte, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).expect("validated ASCII"), 16)
+            .expect("validated hexadecimal digits");
+    }
+    Ok(Some(bytes))
+}
+
+/// Read every explicit VST3 class ID from `truce.toml`.
+///
+/// This is intentionally a sidecar lookup rather than a field on
+/// [`PluginDef`], so adding the configuration key does not break code
+/// that constructs the public schema with a struct literal.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or a class ID is not
+/// exactly 32 hexadecimal characters.
+pub fn load_vst3_class_ids(path: &Path) -> Result<Vec<(String, [u8; 16])>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let config: Vst3ClassIdConfig =
+        toml::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    Ok(config
+        .plugin
+        .into_iter()
+        .filter_map(|plugin| {
+            plugin
+                .class_id
+                .map(|class_id| (plugin.crate_name, class_id))
+        })
+        .collect())
 }
 
 /// `[plugin.legacy_state]` - foreign-state probe declarations for the

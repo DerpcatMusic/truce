@@ -118,6 +118,7 @@ macro_rules! __plugin_impl {
             $crate::__reexport::export_static! {
                 params: $params,
                 info: $crate::prelude::plugin_info!(),
+                vst3_class_id: $crate::prelude::plugin_vst3_class_id!(),
                 logic: $logic,
                 $(tasks: [$($task),+],)?
             }
@@ -347,6 +348,13 @@ macro_rules! __plugin_hot_reload {
                 Self: Sized,
             {
                 $crate::prelude::plugin_info!()
+            }
+
+            fn vst3_class_id() -> Option<[u8; 16]>
+            where
+                Self: Sized,
+            {
+                $crate::prelude::plugin_vst3_class_id!()
             }
 
             fn bus_layouts() -> Vec<$crate::core::bus::BusLayout>
