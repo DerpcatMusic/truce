@@ -14,6 +14,18 @@
 //! that don't expose the group field (legacy MIDI 1.0 byte streams)
 //! emit `0`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_EVENT_LIST_OWNER: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_event_list_owner() -> u64 {
+    NEXT_EVENT_LIST_OWNER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owner| {
+            owner.checked_add(1)
+        })
+        .expect("EventList owner space exhausted")
+}
+
 /// A timestamped event within a process block.
 ///
 /// `Copy` because every [`EventBody`] variant is POD - lets the
@@ -61,7 +73,7 @@ impl Event {
 /// A validated raw MIDI 1.0 short message.
 ///
 /// The length is part of the value because system-common messages may use
-/// fewer than three bytes. SysEx remains in [`EventBody::SysEx`].
+/// fewer than three bytes. `SysEx` remains in [`EventBody::SysEx`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawMidi1 {
     bytes: [u8; 3],
@@ -259,6 +271,11 @@ pub enum ExactEventBody {
         port: u16,
         packet: RawUmp,
     },
+    /// System Exclusive payload. Bytes remain in the owning [`EventList`]'s
+    /// bounded pool and are exposed through [`ExactEventRef::sysex_bytes`].
+    SysEx {
+        port: u16,
+    },
     Note {
         kind: ExactNoteKind,
         address: ExactNoteAddress,
@@ -271,11 +288,24 @@ pub enum ExactEventBody {
     },
 }
 
+/// Format-neutral provenance hints attached to an exact event.
+///
+/// These are semantic qualifiers shared by host formats, not opaque wrapper
+/// flag bits. Unknown format-specific bits stay at their boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExactEventQualifiers {
+    /// The event came directly from a live performer or controller.
+    pub is_live: bool,
+    /// The host should not write the event into recorded automation/MIDI.
+    pub dont_record: bool,
+}
+
 /// A timestamped lossless event. Exact-only events have no [`EventBody`]
 /// fallback; linked events expose one through [`ExactEventRef::fallback`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExactEvent {
     sample_offset: u32,
+    qualifiers: ExactEventQualifiers,
     pub body: ExactEventBody,
 }
 
@@ -284,13 +314,25 @@ impl ExactEvent {
     pub fn new(sample_offset: u32, body: ExactEventBody) -> Self {
         Self {
             sample_offset,
+            qualifiers: ExactEventQualifiers::default(),
             body,
         }
     }
 
     #[must_use]
+    pub fn with_qualifiers(mut self, qualifiers: ExactEventQualifiers) -> Self {
+        self.qualifiers = qualifiers;
+        self
+    }
+
+    #[must_use]
     pub fn sample_offset(&self) -> u32 {
         self.sample_offset
+    }
+
+    #[must_use]
+    pub fn qualifiers(&self) -> ExactEventQualifiers {
+        self.qualifiers
     }
 }
 
@@ -299,6 +341,10 @@ impl ExactEvent {
 pub struct ExactEventRef<'a> {
     exact: &'a ExactEvent,
     fallback: Option<&'a Event>,
+    events: &'a [Event],
+    companion_next: &'a [Option<usize>],
+    first_companion: Option<usize>,
+    sysex_pool: &'a [u8],
 }
 
 /// Allocation-free merged view of exact events and typed events which do not
@@ -319,6 +365,44 @@ impl<'a> ExactEventRef<'a> {
     #[must_use]
     pub fn fallback(self) -> Option<&'a Event> {
         self.fallback
+    }
+
+    #[must_use]
+    pub fn qualifiers(self) -> ExactEventQualifiers {
+        self.exact.qualifiers
+    }
+
+    /// Semantic-only typed companions suppressed by [`EventList::lossless_iter`].
+    /// These remain visible through [`EventList::iter`] for typed plugins.
+    pub fn companions(self) -> impl Iterator<Item = &'a Event> {
+        let mut next = self.first_companion;
+        core::iter::from_fn(move || {
+            let index = next?;
+            next = self.companion_next.get(index).copied().flatten();
+            self.events.get(index)
+        })
+    }
+
+    /// Resolve an exact [`ExactEventBody::SysEx`] against the owning pool.
+    #[must_use]
+    pub fn sysex_bytes(self) -> &'a [u8] {
+        self.sysex_bytes_checked().unwrap_or(&[])
+    }
+
+    /// Checked form of [`Self::sysex_bytes`]. `None` means the exact `SysEx`
+    /// event has no valid pooled primary payload.
+    #[must_use]
+    pub fn sysex_bytes_checked(self) -> Option<&'a [u8]> {
+        let Some(Event {
+            body: EventBody::SysEx { pool_offset, len },
+            ..
+        }) = self.fallback
+        else {
+            return None;
+        };
+        let start = *pool_offset as usize;
+        let end = start.checked_add(*len as usize)?;
+        self.sysex_pool.get(start..end)
     }
 
     /// Effective timestamp. A linked exact payload follows the fallback's
@@ -608,6 +692,10 @@ pub enum PushError {
     EventFull,
     /// The exact event lane is full.
     ExactEventFull,
+    /// A companion referred to an exact event owned by another/cleared list.
+    UnknownExactEvent,
+    /// A host note arrived after the bounded voice tracker became full.
+    VoiceTrackerFull,
     /// The `SysEx` byte pool is full. The message wasn't appended.
     /// Callers either drop it, surface it via a meter, or bump the
     /// pool size via [`EventList::with_capacity`] at construction.
@@ -619,6 +707,8 @@ impl core::fmt::Display for PushError {
         match self {
             Self::EventFull => f.write_str("event lane is full"),
             Self::ExactEventFull => f.write_str("exact event lane is full"),
+            Self::UnknownExactEvent => f.write_str("exact event token is not in this list"),
+            Self::VoiceTrackerFull => f.write_str("note voice tracker is full"),
             Self::PoolFull => f.write_str("SysEx byte pool is full"),
         }
     }
@@ -636,30 +726,64 @@ impl std::error::Error for PushError {}
 #[derive(Debug)]
 pub struct EventList {
     events: Vec<Event>,
-    event_exact: Vec<Option<usize>>,
+    event_order: Vec<usize>,
+    event_exact: Vec<EventExactLink>,
+    companion_next: Vec<Option<usize>>,
     event_sequence: Vec<u64>,
     exact_events: Vec<StoredExactEvent>,
+    exact_order: Vec<usize>,
     sysex_pool: Vec<u8>,
     overflow: Option<PushError>,
+    token_owner: u64,
     next_sequence: u64,
 }
 
 #[derive(Clone, Debug)]
 struct StoredExactEvent {
     event: ExactEvent,
-    fallback_index: Option<usize>,
+    token: ExactEventToken,
+    primary_index: Option<usize>,
+    first_companion: Option<usize>,
+    last_companion: Option<usize>,
+}
+
+/// Stable association token for one exact event and its typed semantic views.
+/// Tokens are scoped to an [`EventList`] block and invalidated by `clear()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExactEventToken {
+    owner: u64,
+    exact_index: usize,
     sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum EventExactLink {
+    #[default]
+    None,
+    /// The sole typed event allowed as a destination fallback.
+    Primary(usize),
+    /// Typed semantic fanout visible to plugins but never replayed separately.
+    Companion(usize),
 }
 
 impl Clone for EventList {
     fn clone(&self) -> Self {
+        let token_owner = allocate_event_list_owner();
+        let mut exact_events = clone_vec_preserving_capacity(&self.exact_events);
+        for stored in &mut exact_events {
+            stored.token.owner = token_owner;
+        }
         Self {
             events: clone_vec_preserving_capacity(&self.events),
+            event_order: clone_vec_preserving_capacity(&self.event_order),
             event_exact: clone_vec_preserving_capacity(&self.event_exact),
+            companion_next: clone_vec_preserving_capacity(&self.companion_next),
             event_sequence: clone_vec_preserving_capacity(&self.event_sequence),
-            exact_events: clone_vec_preserving_capacity(&self.exact_events),
+            exact_events,
+            exact_order: clone_vec_preserving_capacity(&self.exact_order),
             sysex_pool: clone_vec_preserving_capacity(&self.sysex_pool),
             overflow: self.overflow,
+            token_owner,
             next_sequence: self.next_sequence,
         }
     }
@@ -691,11 +815,15 @@ impl EventList {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             events: Vec::with_capacity(capacity),
+            event_order: Vec::with_capacity(capacity),
             event_exact: Vec::with_capacity(capacity),
+            companion_next: Vec::with_capacity(capacity),
             event_sequence: Vec::with_capacity(capacity),
             exact_events: Vec::with_capacity(capacity),
+            exact_order: Vec::with_capacity(capacity),
             sysex_pool: Vec::with_capacity(SYSEX_POOL_PREALLOC),
             overflow: None,
+            token_owner: allocate_event_list_owner(),
             next_sequence: 0,
         }
     }
@@ -717,8 +845,11 @@ impl EventList {
     pub fn try_push(&mut self, event: Event) -> Result<(), PushError> {
         self.reserve_event_slot()?;
         let sequence = self.take_sequence();
+        let event_index = self.events.len();
         self.events.push(event);
-        self.event_exact.push(None);
+        self.event_order.push(event_index);
+        self.event_exact.push(EventExactLink::None);
+        self.companion_next.push(None);
         self.event_sequence.push(sequence);
         Ok(())
     }
@@ -728,14 +859,29 @@ impl EventList {
     /// # Errors
     /// [`PushError::ExactEventFull`] when the exact lane is full.
     pub fn try_push_exact(&mut self, event: ExactEvent) -> Result<(), PushError> {
+        self.try_push_exact_token(event).map(|_| ())
+    }
+
+    /// Append an exact-only event and return its stable companion token.
+    ///
+    /// # Errors
+    /// [`PushError::ExactEventFull`] when the exact lane is full.
+    pub fn try_push_exact_token(
+        &mut self,
+        event: ExactEvent,
+    ) -> Result<ExactEventToken, PushError> {
         self.reserve_exact_slot()?;
-        let sequence = self.take_sequence();
+        let exact_index = self.exact_events.len();
+        let token = self.take_exact_token(exact_index);
         self.exact_events.push(StoredExactEvent {
             event,
-            fallback_index: None,
-            sequence,
+            token,
+            primary_index: None,
+            first_companion: None,
+            last_companion: None,
         });
-        Ok(())
+        self.exact_order.push(exact_index);
+        Ok(token)
     }
 
     /// Atomically append a typed convenience event and its exact payload.
@@ -748,23 +894,117 @@ impl EventList {
     pub fn try_push_with_exact(
         &mut self,
         event: Event,
-        mut exact: ExactEvent,
+        exact: ExactEvent,
     ) -> Result<(), PushError> {
+        self.try_push_with_exact_token(event, exact).map(|_| ())
+    }
+
+    /// Atomically append a primary typed fallback and its exact event, returning
+    /// a token which can own additional semantic-only companions.
+    ///
+    /// # Errors
+    /// [`PushError::EventFull`] or [`PushError::ExactEventFull`] when the
+    /// corresponding lane is full. Neither lane changes on failure.
+    pub fn try_push_with_exact_token(
+        &mut self,
+        event: Event,
+        mut exact: ExactEvent,
+    ) -> Result<ExactEventToken, PushError> {
         self.reserve_event_slot()?;
         self.reserve_exact_slot()?;
 
         exact.sample_offset = event.sample_offset;
         let event_index = self.events.len();
         let exact_index = self.exact_events.len();
-        let sequence = self.take_sequence();
+        let token = self.take_exact_token(exact_index);
         self.events.push(event);
-        self.event_exact.push(Some(exact_index));
-        self.event_sequence.push(sequence);
+        self.event_order.push(event_index);
+        self.event_exact.push(EventExactLink::Primary(exact_index));
+        self.companion_next.push(None);
+        self.event_sequence.push(token.sequence);
         self.exact_events.push(StoredExactEvent {
             event: exact,
-            fallback_index: Some(event_index),
-            sequence,
+            token,
+            primary_index: Some(event_index),
+            first_companion: None,
+            last_companion: None,
         });
+        self.exact_order.push(exact_index);
+        Ok(token)
+    }
+
+    /// Append a semantic-only typed companion owned by `token`. Companions are
+    /// visible through [`Self::iter`] but suppressed by [`Self::lossless_iter`].
+    ///
+    /// # Errors
+    /// [`PushError::UnknownExactEvent`] when the token is not owned by this
+    /// list, or [`PushError::EventFull`] when the typed lane is full.
+    pub fn try_push_exact_companion(
+        &mut self,
+        token: ExactEventToken,
+        event: Event,
+    ) -> Result<(), PushError> {
+        let Some(exact_index) = self.exact_index_for_token(token) else {
+            return self.fail(PushError::UnknownExactEvent);
+        };
+        self.reserve_event_slot()?;
+        let sequence = self.take_sequence();
+        let event_index = self.events.len();
+        self.events.push(event);
+        self.event_order.push(event_index);
+        self.event_exact
+            .push(EventExactLink::Companion(exact_index));
+        self.companion_next.push(None);
+        self.event_sequence.push(sequence);
+        self.link_companion(exact_index, event_index);
+        Ok(())
+    }
+
+    /// Copy a `SysEx` payload into the pool as a semantic companion of an
+    /// existing exact event.
+    ///
+    /// # Errors
+    /// [`PushError::UnknownExactEvent`], [`PushError::EventFull`], or
+    /// [`PushError::PoolFull`] when the corresponding bounded storage rejects
+    /// the append. No storage changes on failure.
+    pub fn try_push_sysex_exact_companion(
+        &mut self,
+        token: ExactEventToken,
+        sample_offset: u32,
+        port: u8,
+        data: &[u8],
+    ) -> Result<(), PushError> {
+        let Some(exact_index) = self.exact_index_for_token(token) else {
+            return self.fail(PushError::UnknownExactEvent);
+        };
+        self.reserve_event_slot()?;
+        let pool_offset = self.sysex_pool.len();
+        let Some(pool_end) = pool_offset.checked_add(data.len()) else {
+            return self.fail(PushError::PoolFull);
+        };
+        if pool_end > self.sysex_pool.capacity() {
+            return self.fail(PushError::PoolFull);
+        }
+
+        self.sysex_pool.extend_from_slice(data);
+        #[allow(clippy::cast_possible_truncation)]
+        let event = Event::on_port(
+            sample_offset,
+            port,
+            EventBody::SysEx {
+                pool_offset: pool_offset as u32,
+                len: data.len() as u32,
+            },
+        );
+        let sequence = self.take_sequence();
+        let event_index = self.events.len();
+        self.events.push(event);
+        self.event_order.push(event_index);
+        self.event_exact
+            .push(EventExactLink::Companion(exact_index));
+        self.companion_next.push(None);
+        self.event_sequence.push(sequence);
+        self.link_companion(exact_index, event_index);
         Ok(())
     }
 
@@ -774,58 +1014,29 @@ impl EventList {
     /// ordered by time; wrappers call this before draining so a plugin
     /// that pushed block-level events after per-event ones can't hand
     /// the host an unsorted queue; wrappers also sort the merged
-    /// *input* stream before processing. Audio-thread safe: the
-    /// common already-sorted case is one linear scan, and the fix-up
-    /// is an in-place insertion sort - no allocation (`sort_by_key`
-    /// is a std stable sort that allocates past ~20 elements;
-    /// `sort_unstable` would reorder equal offsets, and stability is
-    /// load-bearing: "note-on then CC on the same sample" must stay
-    /// in push order). Linked exact payloads follow their fallback while
+    /// *input* stream before processing. Audio-thread safe: only the
+    /// preallocated index lanes move, and `sort_unstable_by_key` is
+    /// allocation-free. The globally unique sequence component keeps
+    /// equal-offset events in push order despite the unstable sort.
+    /// Linked exact payloads follow their fallback while
     /// exact-only events are sorted in their own lane. `SysEx` pool offsets
     /// stay valid because the pool's bytes aren't moved.
     pub fn ensure_sorted_by_offset(&mut self) {
-        if !self.events.is_sorted_by_key(|event| event.sample_offset) {
-            for i in 1..self.events.len() {
-                let mut j = i;
-                while j > 0 && self.events[j - 1].sample_offset > self.events[j].sample_offset {
-                    self.events.swap(j - 1, j);
-                    self.event_exact.swap(j - 1, j);
-                    self.event_sequence.swap(j - 1, j);
-                    j -= 1;
-                }
-            }
-        }
+        let events = &self.events;
+        let event_sequence = &self.event_sequence;
+        self.event_order
+            .sort_unstable_by_key(|&index| (events[index].sample_offset, event_sequence[index]));
 
-        for (event_index, exact_index) in self.event_exact.iter().copied().enumerate() {
-            if let Some(stored) = exact_index.and_then(|index| self.exact_events.get_mut(index)) {
-                stored.fallback_index = Some(event_index);
-            }
-        }
-
-        for i in 1..self.exact_events.len() {
-            let mut j = i;
-            while j > 0
-                && Self::exact_offset(&self.exact_events[j - 1], &self.events)
-                    > Self::exact_offset(&self.exact_events[j], &self.events)
-            {
-                self.exact_events.swap(j - 1, j);
-                j -= 1;
-            }
-        }
-
-        for link in &mut self.event_exact {
-            if link.is_some() {
-                *link = None;
-            }
-        }
-        for (exact_index, stored) in self.exact_events.iter().enumerate() {
-            if let Some(link) = stored
-                .fallback_index
-                .and_then(|event_index| self.event_exact.get_mut(event_index))
-            {
-                *link = Some(exact_index);
-            }
-        }
+        let exact_events = &self.exact_events;
+        self.exact_order.sort_unstable_by_key(|&index| {
+            let stored = &exact_events[index];
+            let sample_offset = stored
+                .primary_index
+                .map_or(stored.event.sample_offset, |primary| {
+                    events[primary].sample_offset
+                });
+            (sample_offset, stored.token.sequence)
+        });
     }
 
     /// Append a `SysEx` event whose payload is copied into the pool.
@@ -862,6 +1073,7 @@ impl EventList {
         data: &[u8],
     ) -> Result<(), PushError> {
         self.push_sysex_on_port_impl(sample_offset, port, data, None)
+            .map(|_| ())
     }
 
     /// Atomically copy a `SysEx` payload and link its typed event to an exact
@@ -877,7 +1089,24 @@ impl EventList {
         data: &[u8],
         exact: ExactEvent,
     ) -> Result<(), PushError> {
-        self.push_sysex_on_port_impl(sample_offset, port, data, Some(exact))
+        self.try_push_sysex_with_exact_on_port_token(sample_offset, port, data, exact)
+            .map(|_| ())
+    }
+
+    /// Token-returning form of [`Self::try_push_sysex_with_exact_on_port`].
+    ///
+    /// # Errors
+    /// [`PushError::EventFull`], [`PushError::ExactEventFull`], or
+    /// [`PushError::PoolFull`] when the corresponding bounded storage is full.
+    pub fn try_push_sysex_with_exact_on_port_token(
+        &mut self,
+        sample_offset: u32,
+        port: u8,
+        data: &[u8],
+        exact: ExactEvent,
+    ) -> Result<ExactEventToken, PushError> {
+        self.push_sysex_on_port_impl(sample_offset, port, data, Some(exact))?
+            .ok_or(PushError::UnknownExactEvent)
     }
 
     fn push_sysex_on_port_impl(
@@ -886,7 +1115,7 @@ impl EventList {
         port: u8,
         data: &[u8],
         exact: Option<ExactEvent>,
-    ) -> Result<(), PushError> {
+    ) -> Result<Option<ExactEventToken>, PushError> {
         let pool_offset = self.sysex_pool.len();
         self.reserve_event_slot()?;
         if exact.is_some() {
@@ -914,20 +1143,38 @@ impl EventList {
             },
         };
         let event_index = self.events.len();
+        let exact_index = self.exact_events.len();
         let sequence = self.take_sequence();
-        let exact_index = exact.as_ref().map(|_| self.exact_events.len());
+        let token = exact.as_ref().map(|_| ExactEventToken {
+            owner: self.token_owner,
+            exact_index,
+            sequence,
+        });
         self.events.push(event);
-        self.event_exact.push(exact_index);
+        self.event_order.push(event_index);
+        self.event_exact.push(if token.is_some() {
+            EventExactLink::Primary(exact_index)
+        } else {
+            EventExactLink::None
+        });
+        self.companion_next.push(None);
         self.event_sequence.push(sequence);
         if let Some(mut exact) = exact {
             exact.sample_offset = sample_offset;
             self.exact_events.push(StoredExactEvent {
                 event: exact,
-                fallback_index: Some(event_index),
-                sequence,
+                token: token.unwrap_or(ExactEventToken {
+                    owner: self.token_owner,
+                    exact_index,
+                    sequence,
+                }),
+                primary_index: Some(event_index),
+                first_companion: None,
+                last_companion: None,
             });
+            self.exact_order.push(exact_index);
         }
-        Ok(())
+        Ok(token)
     }
 
     /// Resolve a [`EventBody::SysEx`] entry to its payload bytes.
@@ -936,31 +1183,58 @@ impl EventList {
     /// fail closed rather than panicking on the audio thread.
     #[must_use]
     pub fn sysex_bytes(&self, body: &EventBody) -> &[u8] {
+        self.sysex_bytes_checked(body).unwrap_or(&[])
+    }
+
+    /// Checked form of [`Self::sysex_bytes`].
+    #[must_use]
+    pub fn sysex_bytes_checked(&self, body: &EventBody) -> Option<&[u8]> {
         match body {
             EventBody::SysEx { pool_offset, len } => {
                 let start = *pool_offset as usize;
-                let Some(end) = start.checked_add(*len as usize) else {
-                    return &[];
-                };
-                self.sysex_pool.get(start..end).unwrap_or(&[])
+                let end = start.checked_add(*len as usize)?;
+                self.sysex_pool.get(start..end)
             }
-            _ => &[],
+            _ => None,
         }
     }
 
     pub fn clear(&mut self) {
         self.events.clear();
+        self.event_order.clear();
         self.event_exact.clear();
+        self.companion_next.clear();
         self.event_sequence.clear();
         self.exact_events.clear();
+        self.exact_order.clear();
         // `Vec::clear` preserves capacity; the pool stays
         // pre-allocated for the next block.
         self.sysex_pool.clear();
-        self.next_sequence = 0;
+        let maximum_block_sequences = self
+            .events
+            .capacity()
+            .saturating_add(self.exact_events.capacity());
+        let maximum_block_sequences = u64::try_from(maximum_block_sequences).unwrap_or(u64::MAX);
+        if self
+            .next_sequence
+            .checked_add(maximum_block_sequences)
+            .is_none()
+        {
+            self.token_owner = allocate_event_list_owner();
+            self.next_sequence = 0;
+        }
+    }
+
+    /// Record a bounded side-channel overflow in this event list. The signal
+    /// remains sticky until [`Self::clear_overflow`] is called.
+    pub fn record_overflow(&mut self, error: PushError) {
+        self.overflow = Some(error);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Event> {
-        self.events.iter()
+        self.event_order
+            .iter()
+            .filter_map(|index| self.events.get(*index))
     }
 
     /// Exact events in stable timestamp order after
@@ -968,23 +1242,14 @@ impl EventList {
     /// fallback; exact-only entries return `None` from
     /// [`ExactEventRef::fallback`].
     pub fn exact_iter(&self) -> impl Iterator<Item = ExactEventRef<'_>> {
-        self.exact_events.iter().map(|stored| ExactEventRef {
-            exact: &stored.event,
-            fallback: stored
-                .fallback_index
-                .and_then(|index| self.events.get(index)),
-        })
+        self.exact_order
+            .iter()
+            .filter_map(|index| self.exact_ref(*index))
     }
 
     #[must_use]
     pub fn exact_get(&self, index: usize) -> Option<ExactEventRef<'_>> {
-        let stored = self.exact_events.get(index)?;
-        Some(ExactEventRef {
-            exact: &stored.event,
-            fallback: stored
-                .fallback_index
-                .and_then(|fallback| self.events.get(fallback)),
-        })
+        self.exact_ref(*self.exact_order.get(index)?)
     }
 
     /// Return the exact payload linked to a typed event index, if any.
@@ -992,58 +1257,64 @@ impl EventList {
     /// the fallback when they emit the exact payload separately.
     #[must_use]
     pub fn exact_for_event(&self, event_index: usize) -> Option<ExactEventRef<'_>> {
-        let exact_index = self.event_exact.get(event_index).copied().flatten()?;
-        self.exact_get(exact_index)
+        let storage_index = *self.event_order.get(event_index)?;
+        let exact_index = match self.event_exact.get(storage_index)? {
+            EventExactLink::Primary(index) | EventExactLink::Companion(index) => *index,
+            EventExactLink::None => return None,
+        };
+        self.exact_ref(exact_index)
     }
 
     /// Merge exact events with typed events lacking an exact payload without
     /// allocation. Call [`Self::ensure_sorted_by_offset`] first. Ties retain
     /// the original cross-lane insertion order.
     pub fn lossless_iter(&self) -> impl Iterator<Item = LosslessEventRef<'_>> {
-        let mut event_index = 0;
-        let mut exact_index = 0;
+        let mut event_order_index = 0;
+        let mut exact_order_index = 0;
 
         core::iter::from_fn(move || {
             while self
-                .event_exact
-                .get(event_index)
-                .copied()
-                .flatten()
-                .is_some()
+                .event_order
+                .get(event_order_index)
+                .is_some_and(|index| {
+                    self.event_exact
+                        .get(*index)
+                        .is_some_and(|link| *link != EventExactLink::None)
+                })
             {
-                event_index += 1;
+                event_order_index += 1;
             }
 
-            let typed_key = self.events.get(event_index).and_then(|event| {
-                self.event_sequence
-                    .get(event_index)
-                    .map(|sequence| (event.sample_offset, *sequence))
+            let typed_storage_index = self.event_order.get(event_order_index).copied();
+            let typed_key = typed_storage_index.and_then(|index| {
+                self.events.get(index).and_then(|event| {
+                    self.event_sequence
+                        .get(index)
+                        .map(|sequence| (event.sample_offset, *sequence))
+                })
             });
-            let exact_key = self
-                .exact_events
-                .get(exact_index)
-                .map(|stored| (Self::exact_offset(stored, &self.events), stored.sequence));
+            let exact_storage_index = self.exact_order.get(exact_order_index).copied();
+            let exact_key = exact_storage_index.and_then(|index| {
+                self.exact_events
+                    .get(index)
+                    .map(|stored| (self.exact_offset(index), stored.token.sequence))
+            });
 
             match (typed_key, exact_key) {
                 (None, None) => None,
                 (Some(_), None) => {
-                    let event = self.events.get(event_index)?;
-                    event_index += 1;
+                    let event = self.events.get(typed_storage_index?)?;
+                    event_order_index += 1;
                     Some(LosslessEventRef::Typed(event))
-                }
-                (None, Some(_)) => {
-                    let event = self.exact_get(exact_index)?;
-                    exact_index += 1;
-                    Some(LosslessEventRef::Exact(event))
                 }
                 (Some(typed), Some(exact)) if typed <= exact => {
-                    let event = self.events.get(event_index)?;
-                    event_index += 1;
+                    let event = self.events.get(typed_storage_index?)?;
+                    event_order_index += 1;
                     Some(LosslessEventRef::Typed(event))
                 }
-                (Some(_), Some(_)) => {
-                    let event = self.exact_get(exact_index)?;
-                    exact_index += 1;
+                (_, Some(_)) => {
+                    let event = self.exact_ref(exact_storage_index?)?;
+                    exact_order_index += 1;
                     Some(LosslessEventRef::Exact(event))
                 }
             }
@@ -1052,7 +1323,7 @@ impl EventList {
 
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&Event> {
-        self.events.get(index)
+        self.events.get(*self.event_order.get(index)?)
     }
 
     #[must_use]
@@ -1129,7 +1400,9 @@ impl EventList {
 
     fn reserve_event_slot(&mut self) -> Result<(), PushError> {
         if self.events.len() >= self.events.capacity()
+            || self.event_order.len() >= self.event_order.capacity()
             || self.event_exact.len() >= self.event_exact.capacity()
+            || self.companion_next.len() >= self.companion_next.capacity()
             || self.event_sequence.len() >= self.event_sequence.capacity()
         {
             return self.fail(PushError::EventFull);
@@ -1138,27 +1411,81 @@ impl EventList {
     }
 
     fn reserve_exact_slot(&mut self) -> Result<(), PushError> {
-        if self.exact_events.len() >= self.exact_events.capacity() {
+        if self.exact_events.len() >= self.exact_events.capacity()
+            || self.exact_order.len() >= self.exact_order.capacity()
+        {
             return self.fail(PushError::ExactEventFull);
         }
         Ok(())
     }
 
     fn fail<T>(&mut self, error: PushError) -> Result<T, PushError> {
-        self.overflow = Some(error);
+        self.record_overflow(error);
         Err(error)
     }
 
     fn take_sequence(&mut self) -> u64 {
         let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .expect("EventList sequence invariant exhausted");
         sequence
     }
 
-    fn exact_offset(stored: &StoredExactEvent, events: &[Event]) -> u32 {
+    fn take_exact_token(&mut self, exact_index: usize) -> ExactEventToken {
+        ExactEventToken {
+            owner: self.token_owner,
+            exact_index,
+            sequence: self.take_sequence(),
+        }
+    }
+
+    fn exact_index_for_token(&self, token: ExactEventToken) -> Option<usize> {
+        if token.owner != self.token_owner {
+            return None;
+        }
+        self.exact_events
+            .get(token.exact_index)
+            .filter(|stored| stored.token == token)
+            .map(|_| token.exact_index)
+    }
+
+    fn link_companion(&mut self, exact_index: usize, event_index: usize) {
+        let Some(stored) = self.exact_events.get_mut(exact_index) else {
+            return;
+        };
+        if let Some(last) = stored.last_companion {
+            if let Some(next) = self.companion_next.get_mut(last) {
+                *next = Some(event_index);
+            }
+        } else {
+            stored.first_companion = Some(event_index);
+        }
+        stored.last_companion = Some(event_index);
+    }
+
+    fn exact_ref(&self, exact_index: usize) -> Option<ExactEventRef<'_>> {
+        let stored = self.exact_events.get(exact_index)?;
+        Some(ExactEventRef {
+            exact: &stored.event,
+            fallback: stored
+                .primary_index
+                .and_then(|index| self.events.get(index)),
+            events: &self.events,
+            companion_next: &self.companion_next,
+            first_companion: stored.first_companion,
+            sysex_pool: &self.sysex_pool,
+        })
+    }
+
+    fn exact_offset(&self, exact_index: usize) -> u32 {
+        let Some(stored) = self.exact_events.get(exact_index) else {
+            return 0;
+        };
         stored
-            .fallback_index
-            .and_then(|index| events.get(index))
+            .primary_index
+            .and_then(|index| self.events.get(index))
             .map_or(stored.event.sample_offset, |event| event.sample_offset)
     }
 }

@@ -33,18 +33,19 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::events::{
-    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_IS_LIVE, CLAP_EVENT_MIDI, CLAP_EVENT_MIDI_SYSEX,
-    CLAP_EVENT_MIDI2, CLAP_EVENT_NOTE_CHOKE, CLAP_EVENT_NOTE_EXPRESSION, CLAP_EVENT_NOTE_OFF,
-    CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END,
-    CLAP_EVENT_PARAM_MOD, CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT,
-    CLAP_NOTE_EXPRESSION_BRIGHTNESS, CLAP_NOTE_EXPRESSION_EXPRESSION, CLAP_NOTE_EXPRESSION_PAN,
-    CLAP_NOTE_EXPRESSION_PRESSURE, CLAP_NOTE_EXPRESSION_TUNING, CLAP_NOTE_EXPRESSION_VIBRATO,
-    CLAP_NOTE_EXPRESSION_VOLUME, CLAP_TRANSPORT_HAS_BEATS_TIMELINE,
-    CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_HAS_TEMPO,
-    CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_LOOP_ACTIVE, CLAP_TRANSPORT_IS_PLAYING,
-    CLAP_TRANSPORT_IS_RECORDING, clap_event_header, clap_event_midi, clap_event_midi_sysex,
-    clap_event_midi2, clap_event_note, clap_event_note_expression, clap_event_param_gesture,
-    clap_event_param_value, clap_event_transport, clap_input_events, clap_output_events,
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_DONT_RECORD, CLAP_EVENT_IS_LIVE, CLAP_EVENT_MIDI,
+    CLAP_EVENT_MIDI_SYSEX, CLAP_EVENT_MIDI2, CLAP_EVENT_NOTE_CHOKE, CLAP_EVENT_NOTE_END,
+    CLAP_EVENT_NOTE_EXPRESSION, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON,
+    CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_MOD,
+    CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT, CLAP_NOTE_EXPRESSION_BRIGHTNESS,
+    CLAP_NOTE_EXPRESSION_EXPRESSION, CLAP_NOTE_EXPRESSION_PAN, CLAP_NOTE_EXPRESSION_PRESSURE,
+    CLAP_NOTE_EXPRESSION_TUNING, CLAP_NOTE_EXPRESSION_VIBRATO, CLAP_NOTE_EXPRESSION_VOLUME,
+    CLAP_TRANSPORT_HAS_BEATS_TIMELINE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE,
+    CLAP_TRANSPORT_HAS_TEMPO, CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_LOOP_ACTIVE,
+    CLAP_TRANSPORT_IS_PLAYING, CLAP_TRANSPORT_IS_RECORDING, clap_event_header, clap_event_midi,
+    clap_event_midi_sysex, clap_event_midi2, clap_event_note, clap_event_note_expression,
+    clap_event_param_gesture, clap_event_param_mod, clap_event_param_value, clap_event_transport,
+    clap_input_events, clap_output_events,
 };
 use clap_sys::ext::audio_ports::{
     CLAP_AUDIO_PORT_IS_MAIN, CLAP_AUDIO_PORT_PREFERS_64BITS, CLAP_AUDIO_PORT_SUPPORTS_64BITS,
@@ -106,14 +107,19 @@ use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::editor::{
     ClosureBridge, Editor, EditorBuilder, PluginContext, RawWindowHandle, SendPtr, fit_logical_size,
 };
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, TransportInfo};
+use truce_core::events::{
+    EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
+    ExactEventQualifiers, ExactEventRef, ExactNoteAddress, ExactNoteKind, LosslessEventRef,
+    PushError, RawMidi1, RawUmp, TransportInfo,
+};
 use truce_core::export::PluginExport;
 use truce_core::info::{MidiDialect, PluginCategory, PluginInfo, resolve_name_override};
 use truce_core::meters::MeterStore;
+#[cfg(test)]
+use truce_core::midi::per_note_bend_semitones;
 use truce_core::midi::{
     PER_NOTE_VOLUME_MAX_GAIN, decode_short_message, denorm_7bit, downconvert_to_midi1,
-    event_to_midi1, per_note_bend_from_semitones, per_note_bend_semitones, pitch_bend_to_bytes,
-    route_midi_port,
+    per_note_bend_from_semitones, pitch_bend_to_bytes,
 };
 use truce_core::plugin::PluginRuntime;
 use truce_core::presets::parse_preset_file;
@@ -123,7 +129,7 @@ use truce_core::snapshot::SnapshotSlot;
 use truce_core::state;
 use truce_core::state::PluginFormat;
 use truce_core::tasks::AnyTaskSpawner;
-use truce_core::ump::decode_ump_channel_voice_2;
+use truce_core::ump::{decode_ump_channel_voice_2, encode_ump_channel_voice_2};
 use truce_core::wrapper::{
     PluginCell, SharedPlugin, copy_c_str, enter_plugin, run_audio_block_with,
     run_extern_callback_with, save_extra, shared_plugin,
@@ -319,8 +325,8 @@ struct ClapPluginData<P: PluginExport> {
 struct ClapAudio<P: PluginExport> {
     /// Re-usable event list for converting CLAP events each process call.
     event_list: EventList,
-    /// Sounding-note tracker backing wildcard `NOTE_OFF` / `NOTE_CHOKE`
-    /// expansion (see [`SoundingNotes`]). Audio-thread only.
+    /// Note lifecycle tracker backing wildcard release/expression matching and
+    /// successful outbound `NOTE_END` cleanup. Audio-thread only.
     sounding_notes: SoundingNotes,
     /// Re-usable output event list for the process context.
     output_events: EventList,
@@ -816,6 +822,7 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
 // ---------------------------------------------------------------------------
 
 /// 32-bit wire value -> CLAP `0..1` note-expression value.
+#[cfg(test)]
 fn unit_from_u32(v: u32) -> f64 {
     f64::from(v) / f64::from(u32::MAX)
 }
@@ -829,6 +836,7 @@ fn u32_from_unit(v: f64) -> u32 {
 /// Map a truce per-note 2.0 event to a CLAP note expression
 /// `(expression_id, channel, note, value)`. `TUNING` is in semitones;
 /// the rest are `0..1`.
+#[cfg(test)]
 fn clap_note_expression_of(body: &EventBody) -> Option<(i32, u8, u8, f64)> {
     match *body {
         // Registered per-note controllers only: the predefined CLAP
@@ -893,6 +901,7 @@ fn clap_note_expression_of(body: &EventBody) -> Option<(i32, u8, u8, f64)> {
 /// outside the domain - wildcards included - is dropped rather than
 /// delivered mislabeled. (Wildcard `NOTE_OFF` / `NOTE_CHOKE` don't take
 /// this path; see [`SoundingNotes`].)
+#[cfg(test)]
 fn clap_note_address(ne: &clap_event_note) -> Option<(u8, u8)> {
     let channel = u8::try_from(ne.channel).ok().filter(|c| *c <= 15)?;
     let note = u8::try_from(ne.key).ok().filter(|k| *k <= 127)?;
@@ -919,76 +928,141 @@ impl NoteAxis {
             _ => Self::Invalid,
         }
     }
+}
 
-    /// Concrete filter for [`SoundingNotes::drain_matching`]; `All`
-    /// filters nothing.
-    fn filter(self) -> Option<u8> {
-        match self {
-            Self::One(v) => Some(v),
-            Self::All | Self::Invalid => None,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Pck {
+    port: u8,
+    channel: u8,
+    key: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrackedVoice {
+    pck: Pck,
+    note_id: i32,
+    lifecycle: VoiceLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceLifecycle {
+    Active,
+    Released,
+    Choked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoteIdAxis {
+    All,
+    One(i32),
+    Invalid,
+}
+
+impl NoteIdAxis {
+    fn parse(raw: i32) -> Self {
+        match raw {
+            -1 => Self::All,
+            0.. => Self::One(raw),
+            _ => Self::Invalid,
         }
     }
 }
 
-/// Bitset of currently-sounding `(channel, key)` pairs, one 16x128
-/// set per MIDI input port, maintained from the decoded CLAP note
-/// events. Wildcard (`-1`) `NOTE_OFF` / `NOTE_CHOKE` addresses are
-/// spec-legal (`note_id`-addressing hosts release notes that way) but
-/// truce's `EventBody` speaks concrete addresses only - the set
-/// expands a wildcard to `NoteOff`s for exactly the sounding notes it
-/// matches, so a voice can't ring forever and the expansion stays
-/// bounded by real polyphony instead of the 2048-slot address space.
-/// Notes started through raw-MIDI or UMP events aren't tracked; hosts
-/// that address notes with wildcards start them with note events.
-///
-/// Known limitations, both spec-legal: the host's `note_id` is not
-/// round-tripped onto output events (truce emits `note_id: -1`), and
-/// `CLAP_EVENT_NOTE_END` is never emitted - so a polyphonic-modulation
-/// host can't correlate a truce plugin's output notes with its own
-/// voice bookkeeping, and it reclaims voices by its own timeout
-/// rather than on the plugin's say-so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VoicePattern {
+    port: NoteAxis,
+    channel: NoteAxis,
+    key: NoteAxis,
+    note_id: NoteIdAxis,
+}
+
+impl VoicePattern {
+    fn parse(port: i16, channel: i16, key: i16, note_id: i32, port_count: u8) -> Self {
+        Self {
+            port: NoteAxis::parse(port, port_count),
+            channel: NoteAxis::parse(channel, 16),
+            key: NoteAxis::parse(key, 128),
+            note_id: NoteIdAxis::parse(note_id),
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.port != NoteAxis::Invalid
+            && self.channel != NoteAxis::Invalid
+            && self.key != NoteAxis::Invalid
+            && self.note_id != NoteIdAxis::Invalid
+    }
+
+    fn concrete_pck(self) -> Option<Pck> {
+        match (self.port, self.channel, self.key) {
+            (NoteAxis::One(port), NoteAxis::One(channel), NoteAxis::One(key)) => {
+                Some(Pck { port, channel, key })
+            }
+            _ => None,
+        }
+    }
+
+    fn matches(self, voice: TrackedVoice) -> bool {
+        fn axis_matches(axis: NoteAxis, value: u8) -> bool {
+            matches!(axis, NoteAxis::All) || matches!(axis, NoteAxis::One(one) if one == value)
+        }
+
+        axis_matches(self.port, voice.pck.port)
+            && axis_matches(self.channel, voice.pck.channel)
+            && axis_matches(self.key, voice.pck.key)
+            && (matches!(self.note_id, NoteIdAxis::All)
+                || matches!(self.note_id, NoteIdAxis::One(one) if one == voice.note_id))
+    }
+}
+
+/// Bounded, preallocated tracker for CLAP note identities. Every
+/// `(port, channel, key, note_id)` voice is retained separately, including
+/// stacked anonymous (`note_id == -1`) voices. Wildcard fanout is emitted only
+/// while the tracker is complete; an overflow makes completeness sticky until
+/// the next host reset so partial state can never invent semantic events.
 struct SoundingNotes {
-    /// 2048 bits (16 channels x 128 keys) per input port.
-    ports: Vec<[u64; 32]>,
+    voices: Vec<TrackedVoice>,
+    complete: bool,
 }
 
 impl SoundingNotes {
-    fn new(midi_input_ports: u8) -> Self {
+    fn new(_midi_input_ports: u8) -> Self {
         Self {
-            ports: vec![[0u64; 32]; usize::from(midi_input_ports.max(1))],
+            voices: Vec::with_capacity(EVENT_LIST_PREALLOC),
+            complete: true,
         }
     }
 
-    fn index(channel: u8, key: u8) -> (usize, u64) {
-        let bit = usize::from(channel & 0x0F) * 128 + usize::from(key & 0x7F);
-        (bit / 64, 1u64 << (bit % 64))
+    fn track(&mut self, voice: TrackedVoice) -> bool {
+        if self.voices.len() >= self.voices.capacity() {
+            self.complete = false;
+            return false;
+        }
+        self.voices.push(voice);
+        true
     }
 
+    #[cfg(test)]
     fn set(&mut self, port: u8, channel: u8, key: u8) {
-        if let Some(bits) = self.ports.get_mut(usize::from(port)) {
-            let (word, mask) = Self::index(channel, key);
-            bits[word] |= mask;
-        }
+        let _ = self.track(TrackedVoice {
+            pck: Pck { port, channel, key },
+            note_id: -1,
+            lifecycle: VoiceLifecycle::Active,
+        });
     }
 
+    #[cfg(test)]
     fn clear(&mut self, port: u8, channel: u8, key: u8) {
-        if let Some(bits) = self.ports.get_mut(usize::from(port)) {
-            let (word, mask) = Self::index(channel, key);
-            bits[word] &= !mask;
-        }
+        self.voices
+            .retain(|voice| voice.pck != Pck { port, channel, key });
     }
 
-    /// Forget every sounding note - the host reset all playing state,
-    /// so stale bits would make a later wildcard note-off emit
-    /// releases for notes that no longer exist.
     fn clear_all(&mut self) {
-        for bits in &mut self.ports {
-            bits.fill(0);
-        }
+        self.voices.clear();
+        self.complete = true;
     }
 
-    /// Visit and clear every sounding `(channel, key)` on `port` that
-    /// matches the (possibly wildcard) axis filters.
+    #[cfg(test)]
     fn drain_matching(
         &mut self,
         port: u8,
@@ -999,9 +1073,7 @@ impl SoundingNotes {
         self.visit_matching(port, channel, key, true, f);
     }
 
-    /// Like [`Self::drain_matching`] but leaves the visited notes
-    /// sounding - expression fan-out addresses voices without
-    /// releasing them.
+    #[cfg(test)]
     fn for_each_matching(
         &mut self,
         port: u8,
@@ -1012,6 +1084,7 @@ impl SoundingNotes {
         self.visit_matching(port, channel, key, false, f);
     }
 
+    #[cfg(test)]
     fn visit_matching(
         &mut self,
         port: u8,
@@ -1020,26 +1093,80 @@ impl SoundingNotes {
         clear: bool,
         mut f: impl FnMut(u8, u8),
     ) {
-        let Some(bits) = self.ports.get_mut(usize::from(port)) else {
-            return;
+        let pattern = VoicePattern {
+            port: NoteAxis::One(port),
+            channel: channel.map_or(NoteAxis::All, NoteAxis::One),
+            key: key.map_or(NoteAxis::All, NoteAxis::One),
+            note_id: NoteIdAxis::All,
         };
-        for (word_index, word) in bits.iter_mut().enumerate() {
-            let mut live = *word;
-            while live != 0 {
-                let bit = live.trailing_zeros() as usize;
-                live &= live - 1;
-                let flat = word_index * 64 + bit;
-                // Flat index is 0..2048, so both halves fit u8.
-                #[allow(clippy::cast_possible_truncation)]
-                let (ch, k) = ((flat / 128) as u8, (flat % 128) as u8);
-                if channel.is_some_and(|c| c != ch) || key.is_some_and(|n| n != k) {
-                    continue;
+        if clear {
+            self.release_pattern(pattern, |pck| f(pck.channel, pck.key));
+        } else {
+            self.for_each_pattern(pattern, |pck| f(pck.channel, pck.key));
+        }
+    }
+
+    fn release_pattern(&mut self, pattern: VoicePattern, mut f: impl FnMut(Pck)) {
+        if !pattern.is_valid() {
+            return;
+        }
+        let mut matched = [Pck::default(); EVENT_LIST_PREALLOC];
+        let mut matched_len = 0;
+        for voice in &mut self.voices {
+            if voice.lifecycle == VoiceLifecycle::Active && pattern.matches(*voice) {
+                if self.complete {
+                    matched[matched_len] = voice.pck;
+                    matched_len += 1;
                 }
-                if clear {
-                    *word &= !(1u64 << bit);
-                }
-                f(ch, k);
+                voice.lifecycle = VoiceLifecycle::Released;
             }
+        }
+        if !self.complete {
+            return;
+        }
+        emit_unique_pcks(&mut matched[..matched_len], &mut f);
+    }
+
+    fn choke_pattern(&mut self, pattern: VoicePattern) {
+        if !pattern.is_valid() {
+            return;
+        }
+        for voice in &mut self.voices {
+            if voice.lifecycle != VoiceLifecycle::Choked && pattern.matches(*voice) {
+                voice.lifecycle = VoiceLifecycle::Choked;
+            }
+        }
+    }
+
+    fn remove_pattern(&mut self, pattern: VoicePattern) {
+        if pattern.is_valid() {
+            self.voices.retain(|voice| !pattern.matches(*voice));
+        }
+    }
+
+    fn for_each_pattern(&self, pattern: VoicePattern, mut f: impl FnMut(Pck)) {
+        if !pattern.is_valid() || !self.complete {
+            return;
+        }
+        let mut matched = [Pck::default(); EVENT_LIST_PREALLOC];
+        let mut matched_len = 0;
+        for voice in &self.voices {
+            if voice.lifecycle != VoiceLifecycle::Choked && pattern.matches(*voice) {
+                matched[matched_len] = voice.pck;
+                matched_len += 1;
+            }
+        }
+        emit_unique_pcks(&mut matched[..matched_len], &mut f);
+    }
+}
+
+fn emit_unique_pcks(matched: &mut [Pck], mut f: impl FnMut(Pck)) {
+    matched.sort_unstable();
+    let mut previous = None;
+    for pck in matched {
+        if previous != Some(*pck) {
+            f(*pck);
+            previous = Some(*pck);
         }
     }
 }
@@ -1158,157 +1285,636 @@ fn build_transport_info(t: &clap_event_transport, sample_rate: f64) -> Transport
     }
 }
 
-/// MIDI port an inbound CLAP event arrived on, read from the event's
-/// `port_index`. Non-MIDI events (params, transport) report `0`. The
-/// wildcard-capable events (notes, note expressions) resolve a `-1`
-/// port in their own fan-out paths ([`push_note_offs`],
-/// [`push_note_expressions`]) - the collapse to `0` here only feeds
-/// concrete-address routing, and the raw MIDI / `SysEx` events carry
-/// an unsigned `port_index` with no wildcard to lose.
-unsafe fn clap_input_port(header: *const clap_event_header, type_: u16) -> u8 {
-    unsafe {
-        let idx: i32 = match type_ {
-            CLAP_EVENT_NOTE_ON | CLAP_EVENT_NOTE_OFF | CLAP_EVENT_NOTE_CHOKE => {
-                i32::from((*header.cast::<clap_event_note>()).port_index)
-            }
-            CLAP_EVENT_NOTE_EXPRESSION => {
-                i32::from((*header.cast::<clap_event_note_expression>()).port_index)
-            }
-            CLAP_EVENT_MIDI => i32::from((*header.cast::<clap_event_midi>()).port_index),
-            CLAP_EVENT_MIDI2 => i32::from((*header.cast::<clap_event_midi2>()).port_index),
-            CLAP_EVENT_MIDI_SYSEX => {
-                i32::from((*header.cast::<clap_event_midi_sysex>()).port_index)
-            }
-            _ => 0,
-        };
-        u8::try_from(idx).unwrap_or(0)
+/// UMP packet width from the message-type nibble (MIDI 2.0 UMP table 1).
+/// CLAP stores every packet in four words, so retaining this width is what
+/// distinguishes meaningful words from padding without decoding the payload.
+fn ump_word_count(word0: u32) -> u8 {
+    const WORD_COUNTS: [u8; 16] = [1, 1, 1, 2, 2, 4, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4];
+    let message_type = usize::try_from((word0 >> 28) & 0x0F).unwrap_or(0);
+    WORD_COUNTS[message_type]
+}
+
+fn exact_event_qualifiers(flags: u32) -> ExactEventQualifiers {
+    ExactEventQualifiers {
+        is_live: flags & CLAP_EVENT_IS_LIVE != 0,
+        dont_record: flags & CLAP_EVENT_DONT_RECORD != 0,
     }
 }
 
-/// Deliver a `NOTE_OFF` / `NOTE_CHOKE` as concrete `NoteOff`s. A
-/// concrete address is one event per matched port (clearing its
-/// sounding bit); a wildcard axis (`-1`, spec-legal from
-/// `note_id`-addressing hosts) expands to the sounding notes it
-/// matches - dropping it would leave those voices ringing forever.
-/// The port is an axis too: `port_index == -1` matches every input
-/// port, so the expansion walks each port's sounding set instead of
-/// collapsing onto the routed port. Out-of-domain junk on the channel
-/// or key axis drops the event, matching the concrete path's
-/// hostile-host guard.
+fn clap_exact_flags(qualifiers: ExactEventQualifiers) -> u32 {
+    let mut flags = 0;
+    if qualifiers.is_live {
+        flags |= CLAP_EVENT_IS_LIVE;
+    }
+    if qualifiers.dont_record {
+        flags |= CLAP_EVENT_DONT_RECORD;
+    }
+    flags
+}
+
+fn exact_note_event(sample_offset: u32, kind: ExactNoteKind, note: &clap_event_note) -> ExactEvent {
+    ExactEvent::new(
+        sample_offset,
+        ExactEventBody::Note {
+            kind,
+            address: ExactNoteAddress::from_raw_signed(
+                note.port_index,
+                note.channel,
+                note.key,
+                note.note_id,
+            ),
+            velocity: note.velocity,
+        },
+    )
+    .with_qualifiers(exact_event_qualifiers(note.header.flags))
+}
+
+fn exact_note_expression(
+    sample_offset: u32,
+    expression: &clap_event_note_expression,
+) -> ExactEvent {
+    ExactEvent::new(
+        sample_offset,
+        ExactEventBody::NoteExpression {
+            expression_id: expression.expression_id,
+            address: ExactNoteAddress::from_raw_signed(
+                expression.port_index,
+                expression.channel,
+                expression.key,
+                expression.note_id,
+            ),
+            value: expression.value,
+        },
+    )
+    .with_qualifiers(exact_event_qualifiers(expression.header.flags))
+}
+
+/// Keep the exact lane authoritative without sacrificing the semantic view
+/// when only one bounded lane is full. Returns whether the typed view became
+/// visible, which lets state trackers avoid seeding semantic fanout from an
+/// exact-only event. A partial-capacity result remains observable through
+/// `EventList::overflow()`.
+fn push_exact_with_fallback(
+    event_list: &mut EventList,
+    exact: ExactEvent,
+    fallback: Event,
+) -> bool {
+    match event_list.try_push_with_exact(fallback, exact) {
+        Ok(()) => true,
+        Err(PushError::PoolFull | PushError::UnknownExactEvent | PushError::VoiceTrackerFull) => {
+            false
+        }
+        Err(PushError::EventFull) => {
+            let _ = event_list.try_push_exact(exact);
+            false
+        }
+        Err(PushError::ExactEventFull) => event_list.try_push(fallback).is_ok(),
+    }
+}
+
+type ClapTryPush =
+    unsafe extern "C" fn(list: *const clap_output_events, event: *const clap_event_header) -> bool;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactEmit {
+    Emitted,
+    Unsupported,
+    Invalid,
+    QueueFull,
+}
+
+fn exact_push_result(pushed: bool) -> ExactEmit {
+    if pushed {
+        ExactEmit::Emitted
+    } else {
+        ExactEmit::QueueFull
+    }
+}
+
+fn note_expression_value_is_valid(expression_id: i32, value: f64) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    match expression_id {
+        CLAP_NOTE_EXPRESSION_VOLUME => value > 0.0 && value <= PER_NOTE_VOLUME_MAX_GAIN,
+        CLAP_NOTE_EXPRESSION_PAN
+        | CLAP_NOTE_EXPRESSION_VIBRATO
+        | CLAP_NOTE_EXPRESSION_EXPRESSION
+        | CLAP_NOTE_EXPRESSION_BRIGHTNESS
+        | CLAP_NOTE_EXPRESSION_PRESSURE => (0.0..=1.0).contains(&value),
+        CLAP_NOTE_EXPRESSION_TUNING => (-120.0..=120.0).contains(&value),
+        _ => false,
+    }
+}
+
+fn typed_output_body_is_valid(body: &EventBody) -> bool {
+    match *body {
+        EventBody::NoteOn {
+            group,
+            channel,
+            note,
+            velocity,
+        }
+        | EventBody::NoteOff {
+            group,
+            channel,
+            note,
+            velocity,
+        } => group == 0 && channel < 16 && note < 128 && velocity < 128,
+        EventBody::Aftertouch {
+            group,
+            channel,
+            note,
+            pressure,
+        } => group == 0 && channel < 16 && note < 128 && pressure < 128,
+        EventBody::ChannelPressure {
+            group,
+            channel,
+            pressure,
+        } => group == 0 && channel < 16 && pressure < 128,
+        EventBody::ControlChange {
+            group,
+            channel,
+            cc,
+            value,
+        } => group == 0 && channel < 16 && cc < 128 && value < 128,
+        EventBody::PitchBend {
+            group,
+            channel,
+            value,
+        } => group == 0 && channel < 16 && value < 16_384,
+        EventBody::ProgramChange {
+            group,
+            channel,
+            program,
+        } => group == 0 && channel < 16 && program < 128,
+        EventBody::NoteOn2 {
+            group,
+            channel,
+            note,
+            attribute_type,
+            ..
+        }
+        | EventBody::NoteOff2 {
+            group,
+            channel,
+            note,
+            attribute_type,
+            ..
+        } => group < 16 && channel < 16 && note < 128 && attribute_type < 4,
+        EventBody::PolyPressure2 {
+            group,
+            channel,
+            note,
+            ..
+        }
+        | EventBody::PerNotePitchBend {
+            group,
+            channel,
+            note,
+            ..
+        }
+        | EventBody::PerNoteCC {
+            group,
+            channel,
+            note,
+            ..
+        } => group < 16 && channel < 16 && note < 128,
+        EventBody::PerNoteManagement {
+            group,
+            channel,
+            note,
+            flags,
+        } => group < 16 && channel < 16 && note < 128 && flags & !0b11 == 0,
+        EventBody::ControlChange2 {
+            group, channel, cc, ..
+        } => group < 16 && channel < 16 && cc < 128,
+        EventBody::ChannelPressure2 { group, channel, .. }
+        | EventBody::PitchBend2 { group, channel, .. } => group < 16 && channel < 16,
+        EventBody::ProgramChange2 {
+            group,
+            channel,
+            program,
+            bank,
+        } => {
+            group < 16
+                && channel < 16
+                && program < 128
+                && bank.is_none_or(|(msb, lsb)| msb < 128 && lsb < 128)
+        }
+        EventBody::RegisteredController {
+            group,
+            channel,
+            bank,
+            index,
+            ..
+        }
+        | EventBody::AssignableController {
+            group,
+            channel,
+            bank,
+            index,
+            ..
+        } => group < 16 && channel < 16 && bank < 128 && index < 128,
+        EventBody::ParamChange { id, value } => id != CLAP_INVALID_ID && value.is_finite(),
+        EventBody::ParamMod { id, note_id, value } => {
+            id != CLAP_INVALID_ID && note_id >= -1 && value.is_finite()
+        }
+        EventBody::Transport(_) | EventBody::SysEx { .. } => true,
+    }
+}
+
+fn is_portless_output_body(body: &EventBody) -> bool {
+    matches!(
+        body,
+        EventBody::ParamChange { .. } | EventBody::ParamMod { .. } | EventBody::Transport(_)
+    )
+}
+
+fn exact_note_fields(
+    address: ExactNoteAddress,
+    output_ports: u8,
+    require_concrete_note_address: bool,
+) -> Option<(i32, i16, i16, i16)> {
+    if output_ports == 0
+        || address.port.invalid_raw().is_some()
+        || address.channel.invalid_raw().is_some()
+        || address.key.invalid_raw().is_some()
+        || address.note_id.invalid_raw().is_some()
+    {
+        return None;
+    }
+
+    let port = address.port.raw_i32();
+    let channel = address.channel.raw_i32();
+    let key = address.key.raw_i32();
+    let note_id = address.note_id.raw_i32();
+    if note_id < -1
+        || (port != -1 && !(0..i32::from(output_ports)).contains(&port))
+        || (channel != -1 && !(0..=15).contains(&channel))
+        || (key != -1 && !(0..=127).contains(&key))
+        || (require_concrete_note_address && (port == -1 || channel == -1 || key == -1))
+    {
+        return None;
+    }
+
+    Some((
+        note_id,
+        i16::try_from(port).ok()?,
+        i16::try_from(channel).ok()?,
+        i16::try_from(key).ok()?,
+    ))
+}
+
+/// Emit an exact event when the configured CLAP port can legally carry it.
+/// Unsupported and invalid representations fail closed, while queue exhaustion
+/// stops the globally ordered replay.
+unsafe fn emit_exact_clap(
+    out_events: *const clap_output_events,
+    try_push: ClapTryPush,
+    event: ExactEventRef<'_>,
+    info: &PluginInfo,
+    frames_count: u32,
+) -> ExactEmit {
+    let sample_offset = event.sample_offset();
+    if sample_offset >= frames_count {
+        return ExactEmit::Invalid;
+    }
+    let flags = clap_exact_flags(event.qualifiers());
+    match event.body() {
+        ExactEventBody::Midi1 { port, message } => {
+            if *port >= u16::from(info.midi_output_ports) {
+                return ExactEmit::Invalid;
+            }
+            let ev = clap_event_midi {
+                header: clap_event_header {
+                    size: size_of_u32::<clap_event_midi>(),
+                    time: sample_offset,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_MIDI,
+                    flags,
+                },
+                port_index: *port,
+                data: *message.storage(),
+            };
+            exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
+        }
+        ExactEventBody::Ump { port, packet } => {
+            if *port >= u16::from(info.midi_output_ports)
+                || packet.word_count() != usize::from(ump_word_count(packet.storage()[0]))
+            {
+                return ExactEmit::Invalid;
+            }
+            if info.midi_output_dialect != MidiDialect::Midi2 {
+                return ExactEmit::Unsupported;
+            }
+            let ev = clap_event_midi2 {
+                header: clap_event_header {
+                    size: size_of_u32::<clap_event_midi2>(),
+                    time: sample_offset,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_MIDI2,
+                    flags,
+                },
+                port_index: *port,
+                data: *packet.storage(),
+            };
+            exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
+        }
+        ExactEventBody::SysEx { port } => {
+            if *port >= u16::from(info.midi_output_ports) {
+                return ExactEmit::Invalid;
+            }
+            let Some(bytes) = event.sysex_bytes_checked() else {
+                return ExactEmit::Invalid;
+            };
+            let ev = clap_event_midi_sysex {
+                header: clap_event_header {
+                    size: size_of_u32::<clap_event_midi_sysex>(),
+                    time: sample_offset,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_MIDI_SYSEX,
+                    flags,
+                },
+                port_index: *port,
+                buffer: bytes.as_ptr(),
+                size: len_u32(bytes.len()),
+            };
+            exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
+        }
+        ExactEventBody::Note {
+            kind,
+            address,
+            velocity,
+        } => {
+            // Choke is host -> plugin; replaying it toward the host would
+            // reverse a lifecycle command with no legal output meaning.
+            if matches!(kind, ExactNoteKind::Choke) {
+                return ExactEmit::Unsupported;
+            }
+            let type_ = match kind {
+                ExactNoteKind::On => CLAP_EVENT_NOTE_ON,
+                ExactNoteKind::Off => CLAP_EVENT_NOTE_OFF,
+                ExactNoteKind::End => CLAP_EVENT_NOTE_END,
+                _ => return ExactEmit::Unsupported,
+            };
+            if !velocity.is_finite() || !(0.0..=1.0).contains(velocity) {
+                return ExactEmit::Invalid;
+            }
+            let port_count = if matches!(kind, ExactNoteKind::End) {
+                info.midi_input_ports
+            } else {
+                info.midi_output_ports
+            };
+            let Some((note_id, port_index, channel, key)) = exact_note_fields(
+                *address,
+                port_count,
+                matches!(kind, ExactNoteKind::On | ExactNoteKind::End),
+            ) else {
+                return ExactEmit::Invalid;
+            };
+            let ev = clap_event_note {
+                header: clap_event_header {
+                    size: size_of_u32::<clap_event_note>(),
+                    time: sample_offset,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_,
+                    flags,
+                },
+                note_id,
+                port_index,
+                channel,
+                key,
+                velocity: *velocity,
+            };
+            exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
+        }
+        ExactEventBody::NoteExpression {
+            expression_id,
+            address,
+            value,
+        } => {
+            if !note_expression_value_is_valid(*expression_id, *value) {
+                return ExactEmit::Invalid;
+            }
+            let Some((note_id, port_index, channel, key)) =
+                exact_note_fields(*address, info.midi_output_ports, false)
+            else {
+                return ExactEmit::Invalid;
+            };
+            let ev = clap_event_note_expression {
+                header: clap_event_header {
+                    size: size_of_u32::<clap_event_note_expression>(),
+                    time: sample_offset,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_NOTE_EXPRESSION,
+                    flags,
+                },
+                expression_id: *expression_id,
+                note_id,
+                port_index,
+                channel,
+                key,
+                value: *value,
+            };
+            exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
+        }
+        _ => ExactEmit::Unsupported,
+    }
+}
+
+fn outbound_note_end_pattern(event: ExactEventRef<'_>, info: &PluginInfo) -> Option<VoicePattern> {
+    let ExactEventBody::Note {
+        kind: ExactNoteKind::End,
+        address,
+        ..
+    } = event.body()
+    else {
+        return None;
+    };
+    let pattern = VoicePattern::parse(
+        i16::try_from(address.port.value()?).ok()?,
+        i16::from(address.channel.value()?),
+        i16::from(address.key.value()?),
+        address.note_id.raw_i32(),
+        info.midi_input_ports,
+    );
+    (pattern.is_valid() && pattern.concrete_pck().is_some()).then_some(pattern)
+}
+
+/// Preserve one exact release and expose each newly released semantic PCK once.
+/// Released voices remain tracked for note expressions until the plugin emits
+/// `NOTE_END`; a repeated host release therefore has no semantic companion.
 fn push_note_offs<P: PluginExport>(
     scr: &mut ClapAudio<P>,
     info: &PluginInfo,
     note_event: &clap_event_note,
     sample_offset: u32,
-    port: u8,
+    exact: ExactEvent,
     velocity: u8,
 ) {
-    let channel = NoteAxis::parse(note_event.channel, 16);
-    let key = NoteAxis::parse(note_event.key, 128);
-    if channel == NoteAxis::Invalid || key == NoteAxis::Invalid {
+    let pattern = VoicePattern::parse(
+        note_event.port_index,
+        note_event.channel,
+        note_event.key,
+        note_event.note_id,
+        info.midi_input_ports,
+    );
+    if !pattern.is_valid() {
         return;
     }
-    let (first_port, last_port) = if note_event.port_index == -1 {
-        (0, info.midi_input_ports.max(1) - 1)
-    } else {
-        (port, port)
-    };
-    // Destructure so the tracker and the event list borrow disjointly.
+
     let ClapAudio {
         sounding_notes,
         event_list,
         ..
     } = scr;
-    for p in first_port..=last_port {
-        if let (NoteAxis::One(channel), NoteAxis::One(note)) = (channel, key) {
-            sounding_notes.clear(p, channel, note);
-            event_list.push(Event::on_port(
-                sample_offset,
-                p,
-                EventBody::NoteOff {
-                    group: 0,
-                    channel,
-                    note,
-                    velocity,
-                },
-            ));
+    let token = event_list.try_push_exact_token(exact);
+    sounding_notes.release_pattern(pattern, |pck| {
+        let event = Event::on_port(
+            sample_offset,
+            pck.port,
+            EventBody::NoteOff {
+                group: 0,
+                channel: pck.channel,
+                note: pck.key,
+                velocity,
+            },
+        );
+        if let Ok(token) = token {
+            let _ = event_list.try_push_exact_companion(token, event);
         } else {
-            sounding_notes.drain_matching(p, channel.filter(), key.filter(), |channel, note| {
-                event_list.push(Event::on_port(
-                    sample_offset,
-                    p,
-                    EventBody::NoteOff {
-                        group: 0,
-                        channel,
-                        note,
-                        velocity,
-                    },
-                ));
-            });
+            let _ = event_list.try_push(event);
         }
-    }
+    });
 }
 
-/// Deliver a note expression to the voices it addresses. A concrete
-/// address is one event on the routed port; a wildcard axis (`-1`,
-/// spec-legal from `note_id`-addressing hosts) fans out to the
-/// sounding notes it matches, and the port is an axis too - dropping
-/// a wildcard would silence expression for exactly the hosts that
-/// rely on it. Out-of-domain junk on the channel or key axis drops
-/// the event, matching [`push_note_offs`].
+/// Preserve a host choke exactly and stop later semantic expression fanout for
+/// the affected voices. Choke is not a MIDI note-off and has no typed fallback.
+fn push_note_choke<P: PluginExport>(
+    scr: &mut ClapAudio<P>,
+    info: &PluginInfo,
+    note_event: &clap_event_note,
+    exact: ExactEvent,
+) {
+    let pattern = VoicePattern::parse(
+        note_event.port_index,
+        note_event.channel,
+        note_event.key,
+        note_event.note_id,
+        info.midi_input_ports,
+    );
+    if !pattern.is_valid() {
+        return;
+    }
+    let _ = scr.event_list.try_push_exact(exact);
+    scr.sounding_notes.choke_pattern(pattern);
+}
+
+/// Deliver one exact note expression plus the linked semantic PCK views that
+/// a typed plugin can consume.
 fn push_note_expressions<P: PluginExport>(
     scr: &mut ClapAudio<P>,
     info: &PluginInfo,
     ne: &clap_event_note_expression,
     sample_offset: u32,
-    port: u8,
+    exact: ExactEvent,
 ) {
-    let channel = NoteAxis::parse(ne.channel, 16);
-    let key = NoteAxis::parse(ne.key, 128);
-    if channel == NoteAxis::Invalid || key == NoteAxis::Invalid {
+    let pattern = VoicePattern::parse(
+        ne.port_index,
+        ne.channel,
+        ne.key,
+        ne.note_id,
+        info.midi_input_ports,
+    );
+    if !pattern.is_valid() {
         return;
     }
-    let (first_port, last_port) = if ne.port_index == -1 {
-        (0, info.midi_input_ports.max(1) - 1)
-    } else {
-        (port, port)
+
+    let semantic = |pck: Pck| {
+        let decoded = note_expression_body(ne, pck.channel, pck.key)?;
+        let body = if info.midi_input_dialect == MidiDialect::Midi2 {
+            Some(decoded)
+        } else {
+            downconvert_to_midi1(&decoded)
+        }?;
+        Some(Event::on_port(sample_offset, pck.port, body))
     };
-    let midi2 = info.midi_input_dialect == MidiDialect::Midi2;
-    // Destructure so the tracker and the event list borrow disjointly.
+
     let ClapAudio {
         sounding_notes,
         event_list,
         ..
     } = scr;
-    let mut push = |p: u8, channel: u8, note: u8| {
-        let Some(decoded) = note_expression_body(ne, channel, note) else {
+    let token = event_list.try_push_exact_token(exact);
+    sounding_notes.for_each_pattern(pattern, |pck| {
+        let Some(event) = semantic(pck) else {
             return;
         };
-        let body = if midi2 {
-            Some(decoded)
+        if let Ok(token) = token {
+            let _ = event_list.try_push_exact_companion(token, event);
         } else {
-            downconvert_to_midi1(&decoded)
-        };
-        if let Some(body) = body {
-            event_list.push(Event::on_port(sample_offset, p, body));
+            let _ = event_list.try_push(event);
         }
-    };
-    for p in first_port..=last_port {
-        if let (NoteAxis::One(channel), NoteAxis::One(note)) = (channel, key) {
-            push(p, channel, note);
-        } else {
-            sounding_notes.for_each_matching(p, channel.filter(), key.filter(), |channel, note| {
-                push(p, channel, note);
-            });
-        }
-    }
+    });
 }
 
 /// `sort` controls whether the resulting `event_list` gets a stable
 /// sort by sample offset. `process` needs sorted events (the plugin
 /// iterates them in time order); `params_flush` discards the events
 /// after extracting param/GUI updates and doesn't care about order, so
-/// it passes `false` to skip the sort.
+/// it passes `false` to skip the sort. Process calls supply `frames_count`
+/// so out-of-block host timestamps fail closed before state changes; flush has
+/// no audio block and passes `None`.
+fn clap_event_has_size<T>(header: &clap_event_header) -> bool {
+    header.size >= size_of_u32::<T>()
+}
+
+fn input_note_pattern(
+    note: &clap_event_note,
+    info: &PluginInfo,
+    require_concrete_pck: bool,
+) -> Option<VoicePattern> {
+    if info.midi_input_ports == 0
+        || !note.velocity.is_finite()
+        || !(0.0..=1.0).contains(&note.velocity)
+    {
+        return None;
+    }
+    let pattern = VoicePattern::parse(
+        note.port_index,
+        note.channel,
+        note.key,
+        note.note_id,
+        info.midi_input_ports,
+    );
+    (pattern.is_valid() && (!require_concrete_pck || pattern.concrete_pck().is_some()))
+        .then_some(pattern)
+}
+
+fn input_note_expression_pattern(
+    expression: &clap_event_note_expression,
+    info: &PluginInfo,
+) -> Option<VoicePattern> {
+    if info.midi_input_ports == 0
+        || !note_expression_value_is_valid(expression.expression_id, expression.value)
+    {
+        return None;
+    }
+    let pattern = VoicePattern::parse(
+        expression.port_index,
+        expression.channel,
+        expression.key,
+        expression.note_id,
+        info.midi_input_ports,
+    );
+    pattern.is_valid().then_some(pattern)
+}
+
+fn declared_input_port(port: u16, count: u8) -> Option<u8> {
+    (port < u16::from(count)).then(|| u8::try_from(port).ok())?
+}
+
 #[allow(clippy::too_many_lines)]
 unsafe fn convert_input_events<P: PluginExport>(
     scr: &mut ClapAudio<P>,
@@ -1316,6 +1922,7 @@ unsafe fn convert_input_events<P: PluginExport>(
     in_events: *const clap_input_events,
     sort: bool,
     state_loaded: bool,
+    frames_count: Option<u32>,
 ) {
     unsafe {
         scr.event_list.clear();
@@ -1334,67 +1941,88 @@ unsafe fn convert_input_events<P: PluginExport>(
         let count = size_fn(in_events);
 
         for i in 0..count {
-            let header = get_fn(in_events, i);
-            if header.is_null() {
+            let header_ptr = get_fn(in_events, i);
+            if header_ptr.is_null() {
                 continue;
             }
 
-            if (*header).space_id != CLAP_CORE_EVENT_SPACE_ID {
+            let header = &*header_ptr;
+            if !clap_event_has_size::<clap_event_header>(header)
+                || header.space_id != CLAP_CORE_EVENT_SPACE_ID
+                || frames_count.is_some_and(|frames| header.time >= frames)
+            {
                 continue;
             }
 
-            let sample_offset = (*header).time;
-            // Stamp each event with the MIDI port it arrived on; an
-            // event on a port the plugin doesn't expose routes to 0.
-            // Non-MIDI events report 0. Single-port plugins always
-            // get 0.
-            let port = route_midi_port(
-                clap_input_port(header, (*header).type_),
-                info.midi_input_ports,
-            );
-
-            match (*header).type_ {
+            let sample_offset = header.time;
+            // `NOTE_END` is plugin -> host only. An inbound event is a
+            // protocol violation and must not alter plugin voice state.
+            if header.type_ == CLAP_EVENT_NOTE_END {
+                continue;
+            }
+            match header.type_ {
                 CLAP_EVENT_NOTE_ON => {
-                    let note_event = &*header.cast::<clap_event_note>();
-                    // The spec requires concrete addresses on NOTE_ON;
-                    // a wildcard port drops like the wildcard channel /
-                    // key axes (`clap_note_address`) instead of
-                    // masquerading as port 0.
-                    if note_event.port_index < 0 {
+                    if !clap_event_has_size::<clap_event_note>(header) {
                         continue;
                     }
-                    let Some((channel, note)) = clap_note_address(note_event) else {
+                    let note_event = &*header_ptr.cast::<clap_event_note>();
+                    let Some(pattern) = input_note_pattern(note_event, info, true) else {
                         continue;
                     };
-                    scr.sounding_notes.set(port, channel, note);
+                    let Some(pck) = pattern.concrete_pck() else {
+                        continue;
+                    };
+                    let exact = exact_note_event(sample_offset, ExactNoteKind::On, note_event);
                     // CLAP's f64 velocity is a normalized [0, 1]; truce
-                    // exposes it as a wire-native 7-bit value to match
-                    // every other format. Plugins that want CLAP's full
-                    // float precision can handle `NoteOn2` from
-                    // `CLAP_EVENT_MIDI2` (when the host emits that path).
-                    scr.event_list.push(Event::on_port(
-                        sample_offset,
-                        port,
-                        EventBody::NoteOn {
-                            group: 0,
-                            channel,
-                            note,
-                            velocity: denorm_7bit(f32::from_f64(note_event.velocity)),
-                        },
-                    ));
+                    // exposes it as a wire-native 7-bit value in the semantic
+                    // view to match every other format. Track the voice only
+                    // when that semantic onset is actually visible.
+                    let typed_visible = push_exact_with_fallback(
+                        &mut scr.event_list,
+                        exact,
+                        Event::on_port(
+                            sample_offset,
+                            pck.port,
+                            EventBody::NoteOn {
+                                group: 0,
+                                channel: pck.channel,
+                                note: pck.key,
+                                velocity: denorm_7bit(f32::from_f64(note_event.velocity)),
+                            },
+                        ),
+                    );
+                    if typed_visible
+                        && !scr.sounding_notes.track(TrackedVoice {
+                            pck,
+                            note_id: note_event.note_id,
+                            lifecycle: VoiceLifecycle::Active,
+                        })
+                    {
+                        scr.event_list.record_overflow(PushError::VoiceTrackerFull);
+                    }
                 }
                 CLAP_EVENT_NOTE_OFF => {
-                    let note_event = &*header.cast::<clap_event_note>();
+                    if !clap_event_has_size::<clap_event_note>(header) {
+                        continue;
+                    }
+                    let note_event = &*header_ptr.cast::<clap_event_note>();
+                    if input_note_pattern(note_event, info, false).is_none() {
+                        continue;
+                    }
                     let velocity = denorm_7bit(f32::from_f64(note_event.velocity));
-                    push_note_offs(scr, info, note_event, sample_offset, port, velocity);
+                    let exact = exact_note_event(sample_offset, ExactNoteKind::Off, note_event);
+                    push_note_offs(scr, info, note_event, sample_offset, exact, velocity);
                 }
                 CLAP_EVENT_NOTE_CHOKE => {
-                    // A choke is an immediate voice cut (drum choke
-                    // groups, edit re-triggers). `EventBody` has no
-                    // choke variant, so deliver a `NoteOff`: a release
-                    // tail beats a voice hanging forever.
-                    let note_event = &*header.cast::<clap_event_note>();
-                    push_note_offs(scr, info, note_event, sample_offset, port, 0);
+                    if !clap_event_has_size::<clap_event_note>(header) {
+                        continue;
+                    }
+                    let note_event = &*header_ptr.cast::<clap_event_note>();
+                    if input_note_pattern(note_event, info, false).is_none() {
+                        continue;
+                    }
+                    let exact = exact_note_event(sample_offset, ExactNoteKind::Choke, note_event);
+                    push_note_choke(scr, info, note_event, exact);
                 }
                 CLAP_EVENT_PARAM_VALUE => {
                     // When a state load was applied at the head of
@@ -1404,18 +2032,20 @@ unsafe fn convert_input_events<P: PluginExport>(
                     // the same block as the preset-A state recall).
                     // Drop them so the just-restored preset isn't
                     // partly overwritten by stale automation.
-                    if state_loaded {
+                    if state_loaded || !clap_event_has_size::<clap_event_param_value>(header) {
                         continue;
                     }
-                    let param_event = &*header.cast::<clap_event_param_value>();
+                    let param_event = &*header_ptr.cast::<clap_event_param_value>();
+                    if param_event.param_id == CLAP_INVALID_ID || !param_event.value.is_finite() {
+                        continue;
+                    }
                     // `set_plain` is deferred to the per-sub-block
                     // `apply_pending_events` pass in
                     // `chunked_process::process_chunked` - that way
                     // the smoother sees `set_target` at the event's
                     // sample, not at the head of the audio block.
-                    scr.event_list.push(Event::on_port(
+                    scr.event_list.push(Event::new(
                         sample_offset,
-                        port,
                         EventBody::ParamChange {
                             id: param_event.param_id,
                             value: param_event.value,
@@ -1425,22 +2055,30 @@ unsafe fn convert_input_events<P: PluginExport>(
                 CLAP_EVENT_PARAM_MOD => {
                     // Same rationale as PARAM_VALUE above: drop
                     // pre-state-load mod packets.
-                    if state_loaded {
+                    if state_loaded || !clap_event_has_size::<clap_event_param_mod>(header) {
                         continue;
                     }
-                    let mod_event = &*header.cast::<clap_event_param_value>();
-                    scr.event_list.push(Event::on_port(
+                    let mod_event = &*header_ptr.cast::<clap_event_param_mod>();
+                    if mod_event.param_id == CLAP_INVALID_ID
+                        || mod_event.note_id < -1
+                        || !mod_event.amount.is_finite()
+                    {
+                        continue;
+                    }
+                    scr.event_list.push(Event::new(
                         sample_offset,
-                        port,
                         EventBody::ParamMod {
                             id: mod_event.param_id,
                             note_id: mod_event.note_id,
-                            value: mod_event.value,
+                            value: mod_event.amount,
                         },
                     ));
                 }
                 CLAP_EVENT_TRANSPORT => {
-                    let transport = &*header.cast::<clap_event_transport>();
+                    if !clap_event_has_size::<clap_event_transport>(header) {
+                        continue;
+                    }
+                    let transport = &*header_ptr.cast::<clap_event_transport>();
                     scr.event_list.push(Event::new(
                         sample_offset,
                         EventBody::Transport(build_transport_info(transport, scr.sample_rate)),
@@ -1454,12 +2092,42 @@ unsafe fn convert_input_events<P: PluginExport>(
                     // raw MIDI (`CLAP_NOTE_DIALECT_MIDI` ports)
                     // silently drop CC / PitchBend / Aftertouch /
                     // ChannelPressure / ProgramChange at the wrapper.
-                    let midi = &*header.cast::<clap_event_midi>();
-                    if let Some(body) =
-                        decode_short_message(midi.data[0], midi.data[1], midi.data[2])
-                    {
-                        scr.event_list
-                            .push(Event::on_port(sample_offset, port, body));
+                    if !clap_event_has_size::<clap_event_midi>(header) {
+                        continue;
+                    }
+                    let midi = &*header_ptr.cast::<clap_event_midi>();
+                    if let Some(message) = RawMidi1::new(midi.data, 3) {
+                        let exact = ExactEvent::new(
+                            sample_offset,
+                            ExactEventBody::Midi1 {
+                                port: midi.port_index,
+                                message,
+                            },
+                        )
+                        .with_qualifiers(exact_event_qualifiers(midi.header.flags));
+                        let status = midi.data[0] & 0xF0;
+                        let semantic_is_valid = (0x80..=0xE0).contains(&status)
+                            && midi.data[1] < 128
+                            && (matches!(status, 0xC0 | 0xD0) || midi.data[2] < 128);
+                        if let Some((port, body)) = declared_input_port(
+                            midi.port_index,
+                            info.midi_input_ports,
+                        )
+                        .zip(
+                            semantic_is_valid
+                                .then(|| {
+                                    decode_short_message(midi.data[0], midi.data[1], midi.data[2])
+                                })
+                                .flatten(),
+                        ) {
+                            let _ = push_exact_with_fallback(
+                                &mut scr.event_list,
+                                exact,
+                                Event::on_port(sample_offset, port, body),
+                            );
+                        } else {
+                            let _ = scr.event_list.try_push_exact(exact);
+                        }
                     }
                 }
                 CLAP_EVENT_MIDI_SYSEX => {
@@ -1472,31 +2140,67 @@ unsafe fn convert_input_events<P: PluginExport>(
                     // message and keep going (a corrupt-by-split
                     // alternative is never the right answer for
                     // `SysEx`).
-                    let sysex = &*header.cast::<clap_event_midi_sysex>();
-                    let bytes = if sysex.buffer.is_null() || sysex.size == 0 {
-                        &[][..]
-                    } else {
-                        std::slice::from_raw_parts(sysex.buffer, sysex.size as usize)
+                    if !clap_event_has_size::<clap_event_midi_sysex>(header) {
+                        continue;
+                    }
+                    let sysex = &*header_ptr.cast::<clap_event_midi_sysex>();
+                    let Some(port) = declared_input_port(sysex.port_index, info.midi_input_ports)
+                    else {
+                        continue;
                     };
-                    let _ = scr.event_list.push_sysex(sample_offset, bytes);
-                }
-                // Decode the UMP packet. A `Midi2`-dialect plugin gets
-                // the native 2.0 `EventBody` variants (group nibble
-                // included); a plugin that didn't opt into MIDI 2.0 gets
-                // the 1.0 down-conversion instead of a dropped event -
-                // hosts don't always honor the advertised dialect, so a
-                // 2.0 packet can still arrive at a 1.0 plugin.
-                CLAP_EVENT_MIDI2 => {
-                    let midi2 = &*header.cast::<clap_event_midi2>();
-                    if let Some(decoded) = decode_ump_channel_voice_2(midi2.data) {
-                        let body = if info.midi_input_dialect == MidiDialect::Midi2 {
-                            Some(decoded)
-                        } else {
-                            downconvert_to_midi1(&decoded)
+                    let bytes = if sysex.size == 0 {
+                        &[][..]
+                    } else if sysex.buffer.is_null() {
+                        continue;
+                    } else {
+                        let Ok(size) = usize::try_from(sysex.size) else {
+                            continue;
                         };
-                        if let Some(body) = body {
-                            scr.event_list
-                                .push(Event::on_port(sample_offset, port, body));
+                        std::slice::from_raw_parts(sysex.buffer, size)
+                    };
+                    let exact = ExactEvent::new(
+                        sample_offset,
+                        ExactEventBody::SysEx {
+                            port: sysex.port_index,
+                        },
+                    )
+                    .with_qualifiers(exact_event_qualifiers(sysex.header.flags));
+                    let _ = scr.event_list.try_push_sysex_with_exact_on_port(
+                        sample_offset,
+                        port,
+                        bytes,
+                        exact,
+                    );
+                }
+                // Preserve every well-formed UMP exactly. Only a declared
+                // MIDI 2.0 input port receives a typed semantic companion;
+                // an ignored dialect never triggers a lossy down-conversion.
+                CLAP_EVENT_MIDI2 => {
+                    if !clap_event_has_size::<clap_event_midi2>(header) {
+                        continue;
+                    }
+                    let midi2 = &*header_ptr.cast::<clap_event_midi2>();
+                    if let Some(packet) = RawUmp::new(midi2.data, ump_word_count(midi2.data[0])) {
+                        let exact = ExactEvent::new(
+                            sample_offset,
+                            ExactEventBody::Ump {
+                                port: midi2.port_index,
+                                packet,
+                            },
+                        )
+                        .with_qualifiers(exact_event_qualifiers(midi2.header.flags));
+                        if let Some((port, body)) =
+                            declared_input_port(midi2.port_index, info.midi_input_ports)
+                                .filter(|_| info.midi_input_dialect == MidiDialect::Midi2)
+                                .zip(decode_ump_channel_voice_2(midi2.data))
+                        {
+                            let _ = push_exact_with_fallback(
+                                &mut scr.event_list,
+                                exact,
+                                Event::on_port(sample_offset, port, body),
+                            );
+                        } else {
+                            let _ = scr.event_list.try_push_exact(exact);
                         }
                     }
                 }
@@ -1505,8 +2209,15 @@ unsafe fn convert_input_events<P: PluginExport>(
                     // input). Decode to the 2.0 per-note event - fanned
                     // out across wildcard axes - with the down-converted
                     // channel form for plugins that didn't opt into 2.0.
-                    let ne = &*header.cast::<clap_event_note_expression>();
-                    push_note_expressions(scr, info, ne, sample_offset, port);
+                    if !clap_event_has_size::<clap_event_note_expression>(header) {
+                        continue;
+                    }
+                    let ne = &*header_ptr.cast::<clap_event_note_expression>();
+                    if input_note_expression_pattern(ne, info).is_none() {
+                        continue;
+                    }
+                    let exact = exact_note_expression(sample_offset, ne);
+                    push_note_expressions(scr, info, ne, sample_offset, exact);
                 }
                 _ => {
                     // Unsupported event type (system real-time, utility)
@@ -1528,13 +2239,13 @@ unsafe fn convert_input_events<P: PluginExport>(
 unsafe fn flush_gui_changes<P: PluginExport>(
     data: &ClapPluginData<P>,
     out_events: *const clap_output_events,
-) {
+) -> bool {
     unsafe {
         if out_events.is_null() {
-            return;
+            return true;
         }
         let Some(try_push) = (*out_events).try_push else {
-            return;
+            return true;
         };
 
         while let Some(change) = data.gui_changes.pop() {
@@ -1550,7 +2261,9 @@ unsafe fn flush_gui_changes<P: PluginExport>(
                         },
                         param_id: id,
                     };
-                    try_push(out_events, &raw const event.header);
+                    if !try_push(out_events, &raw const event.header) {
+                        return false;
+                    }
                 }
                 GuiParamChange::Value(id, plain) => {
                     let event = clap_event_param_value {
@@ -1569,7 +2282,9 @@ unsafe fn flush_gui_changes<P: PluginExport>(
                         key: -1,
                         value: plain,
                     };
-                    try_push(out_events, &raw const event.header);
+                    if plain.is_finite() && !try_push(out_events, &raw const event.header) {
+                        return false;
+                    }
                 }
                 GuiParamChange::GestureEnd(id) => {
                     let event = clap_event_param_gesture {
@@ -1582,10 +2297,13 @@ unsafe fn flush_gui_changes<P: PluginExport>(
                         },
                         param_id: id,
                     };
-                    try_push(out_events, &raw const event.header);
+                    if !try_push(out_events, &raw const event.header) {
+                        return false;
+                    }
                 }
             }
         }
+        true
     }
 }
 
@@ -1650,7 +2368,14 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // sample offset so the plugin sees them in time order.
         // `state_loaded` causes ParamValue/ParamMod events to be
         // dropped because they predate the state-load intent.
-        convert_input_events::<P>(scr, &data.info, proc.in_events, true, state_loaded);
+        convert_input_events::<P>(
+            scr,
+            &data.info,
+            proc.in_events,
+            true,
+            state_loaded,
+            Some(proc.frames_count),
+        );
 
         // Build transport info from the CLAP transport event (or default).
         let transport = if proc.transport.is_null() {
@@ -1877,10 +2602,10 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         }
 
         // Flush GUI-initiated param changes to host output events
-        flush_gui_changes::<P>(data, proc.out_events);
+        let output_queue_open = flush_gui_changes::<P>(data, proc.out_events);
 
         // Forward plugin output events (MIDI output from instruments/effects)
-        if !proc.out_events.is_null() && !scr.output_events.is_empty() {
+        if output_queue_open && !proc.out_events.is_null() && !scr.output_events.is_empty() {
             let Some(try_push) = (*proc.out_events).try_push else {
                 return CLAP_PROCESS_CONTINUE;
             };
@@ -1889,10 +2614,51 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             // sweep) after per-event ones would otherwise hand the
             // host an unsorted queue.
             scr.output_events.ensure_sorted_by_offset();
-            // Route each output event to the note port the plugin
-            // stamped it with; an out-of-range port routes to 0.
-            for event in scr.output_events.iter() {
-                let out_port = route_midi_port(event.port, data.info.midi_output_ports);
+            // Exact payloads are authoritative. `lossless_iter` suppresses a
+            // linked typed view, and an unsupported exact representation is
+            // never replayed through a lossy compatibility conversion.
+            macro_rules! push_output {
+                ($queue:ident, $header:expr) => {
+                    $queue = try_push(proc.out_events, $header);
+                };
+            }
+            'output_events: for replay in scr.output_events.lossless_iter() {
+                let mut queue_open = true;
+                let event = match replay {
+                    LosslessEventRef::Typed(event) => event,
+                    LosslessEventRef::Exact(exact) => {
+                        let note_end = outbound_note_end_pattern(exact, &data.info);
+                        match emit_exact_clap(
+                            proc.out_events,
+                            try_push,
+                            exact,
+                            &data.info,
+                            proc.frames_count,
+                        ) {
+                            ExactEmit::Emitted => {
+                                if let Some(pattern) = note_end {
+                                    scr.sounding_notes.remove_pattern(pattern);
+                                }
+                                continue;
+                            }
+                            ExactEmit::Invalid | ExactEmit::Unsupported => continue,
+                            ExactEmit::QueueFull => break 'output_events,
+                        }
+                    }
+                };
+                if event.sample_offset >= proc.frames_count {
+                    continue;
+                }
+                if !typed_output_body_is_valid(&event.body) {
+                    continue;
+                }
+                if !is_portless_output_body(&event.body)
+                    && (data.info.midi_output_ports == 0
+                        || event.port >= data.info.midi_output_ports)
+                {
+                    continue;
+                }
+                let out_port = event.port;
                 match &event.body {
                     EventBody::NoteOn {
                         channel,
@@ -1914,7 +2680,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                             key: i16::from(*note),
                             velocity: f64::from(*velocity) / 127.0,
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
                     EventBody::NoteOff {
                         channel,
@@ -1936,7 +2702,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                             key: i16::from(*note),
                             velocity: f64::from(*velocity) / 127.0,
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
                     // CLAP carries MIDI 1.0 control / channel events as
                     // `CLAP_EVENT_MIDI` 3-byte packets. The host
@@ -1955,9 +2721,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                                 flags: 0,
                             },
                             port_index: u16::from(out_port),
-                            data: [0xB0 | (channel & 0x0F), *cc, *value],
+                            data: [0xB0 | *channel, *cc, *value],
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
                     EventBody::Aftertouch {
                         channel,
@@ -1974,9 +2740,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                                 flags: 0,
                             },
                             port_index: u16::from(out_port),
-                            data: [0xA0 | (channel & 0x0F), *note, *pressure],
+                            data: [0xA0 | *channel, *note, *pressure],
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
                     EventBody::ChannelPressure {
                         channel, pressure, ..
@@ -1990,9 +2756,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                                 flags: 0,
                             },
                             port_index: u16::from(out_port),
-                            data: [0xD0 | (channel & 0x0F), *pressure, 0],
+                            data: [0xD0 | *channel, *pressure, 0],
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
                     EventBody::PitchBend { channel, value, .. } => {
                         let (lsb, msb) = pitch_bend_to_bytes(*value);
@@ -2005,9 +2771,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                                 flags: 0,
                             },
                             port_index: u16::from(out_port),
-                            data: [0xE0 | (channel & 0x0F), lsb, msb],
+                            data: [0xE0 | *channel, lsb, msb],
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
                     EventBody::ProgramChange {
                         channel, program, ..
@@ -2021,9 +2787,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                                 flags: 0,
                             },
                             port_index: u16::from(out_port),
-                            data: [0xC0 | (channel & 0x0F), *program, 0],
+                            data: [0xC0 | *channel, *program, 0],
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
                     EventBody::ParamChange { id, value } => {
                         // CLAP params are global, not tied to a specific
@@ -2048,7 +2814,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                             key: -1,
                             value: *value,
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
                     EventBody::SysEx { .. } => {
                         // CLAP's contract for the output direction
@@ -2063,7 +2829,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                         // defers the copy until later in
                         // `process()` is still fine because the
                         // pool stays valid through the whole block.
-                        let bytes = scr.output_events.sysex_bytes(&event.body);
+                        let Some(bytes) = scr.output_events.sysex_bytes_checked(&event.body) else {
+                            continue;
+                        };
                         let ev = clap_event_midi_sysex {
                             header: clap_event_header {
                                 size: size_of_u32::<clap_event_midi_sysex>(),
@@ -2076,102 +2844,47 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                             buffer: bytes.as_ptr(),
                             size: len_u32(bytes.len()),
                         };
-                        try_push(proc.out_events, &raw const ev.header);
+                        push_output!(queue_open, &raw const ev.header);
                     }
-                    // MIDI 2.0 channel-voice + per-note events. Emitted
-                    // CLAP-native so every host reads them: notes as
-                    // `clap_event_note` (full 16-bit velocity via the f64
-                    // field), per-note control as note expressions, and
-                    // channel-level control down-converted to raw MIDI.
-                    // Native `CLAP_EVENT_MIDI2` output is only consumed by
-                    // UMP-aware hosts; note graphs (Bitwig, ...) read notes
-                    // + expressions. ParamMod / Transport have no wire form
-                    // and fall through the encoder as `None`.
-                    EventBody::NoteOn2 {
-                        channel,
-                        note,
-                        velocity,
-                        ..
-                    } => {
-                        let ev = clap_event_note {
-                            header: clap_event_header {
-                                size: size_of_u32::<clap_event_note>(),
-                                time: event.sample_offset,
-                                space_id: CLAP_CORE_EVENT_SPACE_ID,
-                                type_: CLAP_EVENT_NOTE_ON,
-                                flags: 0,
-                            },
-                            note_id: -1,
-                            port_index: i16::from(out_port),
-                            channel: i16::from(*channel),
-                            key: i16::from(*note),
-                            velocity: f64::from(*velocity) / f64::from(u16::MAX),
-                        };
-                        try_push(proc.out_events, &raw const ev.header);
-                    }
-                    EventBody::NoteOff2 {
-                        channel,
-                        note,
-                        velocity,
-                        ..
-                    } => {
-                        let ev = clap_event_note {
-                            header: clap_event_header {
-                                size: size_of_u32::<clap_event_note>(),
-                                time: event.sample_offset,
-                                space_id: CLAP_CORE_EVENT_SPACE_ID,
-                                type_: CLAP_EVENT_NOTE_OFF,
-                                flags: 0,
-                            },
-                            note_id: -1,
-                            port_index: i16::from(out_port),
-                            channel: i16::from(*channel),
-                            key: i16::from(*note),
-                            velocity: f64::from(*velocity) / f64::from(u16::MAX),
-                        };
-                        try_push(proc.out_events, &raw const ev.header);
-                    }
-                    body if clap_note_expression_of(body).is_some() => {
-                        let (expression_id, channel, note, value) =
-                            clap_note_expression_of(body).unwrap();
-                        let ev = clap_event_note_expression {
-                            header: clap_event_header {
-                                size: size_of_u32::<clap_event_note_expression>(),
-                                time: event.sample_offset,
-                                space_id: CLAP_CORE_EVENT_SPACE_ID,
-                                type_: CLAP_EVENT_NOTE_EXPRESSION,
-                                flags: 0,
-                            },
-                            expression_id,
-                            note_id: -1,
-                            port_index: i16::from(out_port),
-                            channel: i16::from(channel),
-                            key: i16::from(note),
-                            value,
-                        };
-                        try_push(proc.out_events, &raw const ev.header);
-                    }
-                    body => {
-                        // Channel-level 2.0 (ControlChange2 / PitchBend2 /
-                        // ChannelPressure2 / ProgramChange2): down-convert
-                        // to a 1.0 short message and emit as raw MIDI.
-                        if let Some(m1) = downconvert_to_midi1(body)
-                            && let Some((_, data)) = event_to_midi1(&m1)
-                        {
-                            let ev = clap_event_midi {
-                                header: clap_event_header {
-                                    size: size_of_u32::<clap_event_midi>(),
-                                    time: event.sample_offset,
-                                    space_id: CLAP_CORE_EVENT_SPACE_ID,
-                                    type_: CLAP_EVENT_MIDI,
-                                    flags: 0,
-                                },
-                                port_index: u16::from(out_port),
-                                data,
-                            };
-                            try_push(proc.out_events, &raw const ev.header);
+                    // Typed MIDI 2.0 remains native UMP. The strict domain
+                    // check above makes the shared encoder's masks inert, so
+                    // group, attributes, banks, controllers, and wide values
+                    // reach the host unchanged.
+                    body @ (EventBody::NoteOn2 { .. }
+                    | EventBody::NoteOff2 { .. }
+                    | EventBody::PolyPressure2 { .. }
+                    | EventBody::PerNoteCC { .. }
+                    | EventBody::PerNotePitchBend { .. }
+                    | EventBody::PerNoteManagement { .. }
+                    | EventBody::ControlChange2 { .. }
+                    | EventBody::ChannelPressure2 { .. }
+                    | EventBody::PitchBend2 { .. }
+                    | EventBody::ProgramChange2 { .. }
+                    | EventBody::RegisteredController { .. }
+                    | EventBody::AssignableController { .. }) => {
+                        if data.info.midi_output_dialect != MidiDialect::Midi2 {
+                            continue;
                         }
+                        let Some(words) = encode_ump_channel_voice_2(body) else {
+                            continue;
+                        };
+                        let ev = clap_event_midi2 {
+                            header: clap_event_header {
+                                size: size_of_u32::<clap_event_midi2>(),
+                                time: event.sample_offset,
+                                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                                type_: CLAP_EVENT_MIDI2,
+                                flags: 0,
+                            },
+                            port_index: u16::from(out_port),
+                            data: words,
+                        };
+                        push_output!(queue_open, &raw const ev.header);
                     }
+                    EventBody::ParamMod { .. } | EventBody::Transport(_) => {}
+                }
+                if !queue_open {
+                    break 'output_events;
                 }
             }
         }
@@ -2546,7 +3259,7 @@ unsafe extern "C" fn params_flush<P: PluginExport>(
         // event list in time order, so skip the sort.
         // params_flush is a non-audio-thread param sweep; no state-load
         // race possible here, so the drain flag stays false.
-        convert_input_events::<P>(scr, &data.info, in_events, false, false);
+        convert_input_events::<P>(scr, &data.info, in_events, false, false, None);
         // `flush` doesn't enter `process()`, so the chunker's deferred
         // `set_plain` apply pass never runs. Apply `ParamChange` events
         // synchronously here so host-thread param sweeps (preset
@@ -2560,7 +3273,7 @@ unsafe extern "C" fn params_flush<P: PluginExport>(
                 params.set_plain(id, value);
             }
         }
-        flush_gui_changes::<P>(data, out_events);
+        let _ = flush_gui_changes::<P>(data, out_events);
     });
 }
 
@@ -3138,31 +3851,14 @@ unsafe extern "C" fn note_ports_get<P: PluginExport>(
     info: *mut clap_note_port_info,
 ) -> bool {
     unsafe {
-        let in_ports = u32::from(P::info().midi_input_ports);
-        let out_ports = u32::from(P::info().midi_output_ports);
-        let (ports, opposite) = if is_input {
-            (in_ports, out_ports)
+        let ports = if is_input {
+            u32::from(P::info().midi_input_ports)
         } else {
-            (out_ports, in_ports)
+            u32::from(P::info().midi_output_ports)
         };
-        // clap-validator's output-port sweep queries with
-        // `is_input = true` (its note_ports.rs), so a plugin with more
-        // note outputs than inputs fails every test that fetches the
-        // note-port config. Answer an out-of-range query with the
-        // matching port of the *other* direction - what the sweep meant
-        // to ask. `ports` flips along with the direction so the name
-        // below numbers by the resolved direction's count (the same
-        // port id must always answer with the same name). Compliant
-        // hosts iterate `0..count(direction)` and can never reach
-        // this; remove when the validator queries the direction it
-        // iterates.
-        let (is_input, ports) = if index < ports {
-            (is_input, ports)
-        } else if index < opposite {
-            (!is_input, opposite)
-        } else {
+        if index >= ports {
             return false;
-        };
+        }
 
         let out = &mut *info;
         // Port ids must be unique across the plugin. Fold the direction

@@ -349,6 +349,9 @@ fn rebase_events_into(
     block_end: usize,
 ) {
     scratch.clear();
+    if let Some(error) = events.overflow() {
+        scratch.record_overflow(error);
+    }
     for event in events.lossless_iter() {
         let off = match event {
             LosslessEventRef::Typed(event) => event.sample_offset,
@@ -381,26 +384,44 @@ fn rebase_events_into(
                 body => scratch.push(Event::on_port(rebased_offset, event.port, body)),
             },
             LosslessEventRef::Exact(exact) => {
-                let rebased_exact = ExactEvent::new(rebased_offset, *exact.body());
-                if let Some(fallback) = exact.fallback() {
+                let rebased_exact = ExactEvent::new(rebased_offset, *exact.body())
+                    .with_qualifiers(exact.qualifiers());
+                let token = if let Some(fallback) = exact.fallback() {
                     match fallback.body {
+                        EventBody::SysEx { .. } => scratch.try_push_sysex_with_exact_on_port_token(
+                            rebased_offset,
+                            fallback.port,
+                            events.sysex_bytes(&fallback.body),
+                            rebased_exact,
+                        ),
+                        body => scratch.try_push_with_exact_token(
+                            Event::on_port(rebased_offset, fallback.port, body),
+                            rebased_exact,
+                        ),
+                    }
+                } else {
+                    scratch.try_push_exact_token(rebased_exact)
+                };
+                let Ok(token) = token else {
+                    continue;
+                };
+                for companion in exact.companions() {
+                    match companion.body {
                         EventBody::SysEx { .. } => {
-                            let _ = scratch.try_push_sysex_with_exact_on_port(
+                            let _ = scratch.try_push_sysex_exact_companion(
+                                token,
                                 rebased_offset,
-                                fallback.port,
-                                events.sysex_bytes(&fallback.body),
-                                rebased_exact,
+                                companion.port,
+                                events.sysex_bytes(&companion.body),
                             );
                         }
                         body => {
-                            let _ = scratch.try_push_with_exact(
-                                Event::on_port(rebased_offset, fallback.port, body),
-                                rebased_exact,
+                            let _ = scratch.try_push_exact_companion(
+                                token,
+                                Event::on_port(rebased_offset, companion.port, body),
                             );
                         }
                     }
-                } else {
-                    let _ = scratch.try_push_exact(rebased_exact);
                 }
             }
         }
