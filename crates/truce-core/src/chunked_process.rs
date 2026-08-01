@@ -9,7 +9,7 @@
 //! the whole audio block.
 //!
 //! Every format wrapper routes its `process()` call through
-//! [`process_chunked`]. On formats whose host events all carry
+//! [`process_chunked_with_bus_routing`]. On formats whose host events all carry
 //! `sample_offset = 0` (VST2, AAX, LV2 in v1, AU until ramp decoding
 //! lands) the loop runs once per block and the splitting machinery
 //! is inert.
@@ -56,8 +56,6 @@ pub struct ChunkedProcess<'a> {
     /// each block (VST3 `processMode`, LV2 freewheel port) or cache it
     /// from a set-once callback (CLAP / AU).
     pub process_mode: ProcessMode,
-    /// Host bus routing snapshot, copied into every sub-block context.
-    pub bus_routing: BusRouting,
     /// Plugin's outbound event queue. The chunker re-bases outbound
     /// events back to block-relative coordinates before the wrapper
     /// hands them to the host: the plugin pushes events with
@@ -107,13 +105,28 @@ where
     S: Sample,
     P: PluginRuntime<Sample = S>,
 {
+    process_chunked_with_bus_routing(plugin, params, buffer, args, BusRouting::new())
+}
+
+/// Routed twin of [`process_chunked`], used by format adapters that have a
+/// truthful allocation-free bus snapshot for the current block.
+pub fn process_chunked_with_bus_routing<S, P>(
+    plugin: &mut P,
+    params: &dyn Params,
+    buffer: &mut AudioBuffer<S>,
+    args: ChunkedProcess<'_>,
+    bus_routing: BusRouting,
+) -> ProcessStatus
+where
+    S: Sample,
+    P: PluginRuntime<Sample = S>,
+{
     let ChunkedProcess {
         events,
         sub_event_scratch,
         transport,
         sample_rate,
         process_mode,
-        bus_routing,
         output_events,
         params_fn,
         meters_fn,

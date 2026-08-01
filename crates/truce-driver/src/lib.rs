@@ -51,7 +51,7 @@ use truce_core::bus_routing::{BusActivation, BusRouting};
 #[cfg(feature = "wav")]
 use truce_core::cast::sample_rate_u32;
 use truce_core::cast::{len_u32, sample_count_usize};
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::events::{
     EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus, TransportInfo,
@@ -171,6 +171,7 @@ fn default_sidechain_channels(layouts: &[BusLayout], main_channels: usize) -> us
             l.inputs
                 .iter()
                 .skip(1)
+                .filter(|bus| bus.enabled)
                 .map(|b| b.channels.channel_count() as usize)
                 .sum()
         })
@@ -898,11 +899,10 @@ impl<P: PluginExport> PluginDriver<P> {
         let is_effect = P::info().category == PluginCategory::Effect;
         let total_frames = sample_count_usize(self.duration.as_secs_f64() * self.sample_rate);
 
-        // Sidechain (non-main) input width. A plugin's sidechain bus is
-        // always present at its declared width - silent when nothing
-        // drives it - so an effect that declares one runs with the extra
-        // input channels even under the default silent source. `channels`
-        // is the main-bus width; `num_in` = main + sidechain. The default
+        // Sidechain (non-main) input width. Every enabled sidechain bus is
+        // present at its declared width - silent when nothing drives it;
+        // disabled declarations stay out of the flattened audio buffer.
+        // `channels` is the main-bus width; `num_in` = main + sidechain. The default
         // is read from the layout whose main width matches `channels`, not
         // always layout 0, so a plugin driven at a non-default width
         // (`.channels(...)`) doesn't combine a main width and a sidechain
@@ -923,23 +923,45 @@ impl<P: PluginExport> PluginDriver<P> {
             let declared_inputs = layout
                 .inputs
                 .iter()
+                .filter(|bus| bus.enabled)
                 .map(|bus| bus.channels.channel_count() as usize)
                 .sum::<usize>();
             let declared_outputs = layout
                 .outputs
                 .iter()
+                .filter(|bus| bus.enabled)
                 .map(|bus| bus.channels.channel_count() as usize)
                 .sum::<usize>();
             if declared_inputs == num_in {
                 for bus in layout.inputs {
-                    let _ =
-                        bus_routing.push_input(bus.channels.channel_count(), BusActivation::Active);
+                    let _ = bus_routing.push_input(
+                        if bus.enabled {
+                            bus.channels.channel_count()
+                        } else {
+                            0
+                        },
+                        if bus.enabled {
+                            BusActivation::Active
+                        } else {
+                            BusActivation::Inactive
+                        },
+                    );
                 }
             }
             if declared_outputs == channels {
                 for bus in layout.outputs {
-                    let _ = bus_routing
-                        .push_output(bus.channels.channel_count(), BusActivation::Active);
+                    let _ = bus_routing.push_output(
+                        if bus.enabled {
+                            bus.channels.channel_count()
+                        } else {
+                            0
+                        },
+                        if bus.enabled {
+                            BusActivation::Active
+                        } else {
+                            BusActivation::Inactive
+                        },
+                    );
                 }
             }
         }
@@ -1160,18 +1182,18 @@ impl<P: PluginExport> PluginDriver<P> {
                 transport: &mut transport_snap,
                 sample_rate: self.sample_rate,
                 process_mode: self.process_mode,
-                bus_routing,
                 output_events: &mut output_events_block,
                 params_fn: None,
                 meters_fn: None,
                 param_infos: &param_infos,
                 min_subblock_samples,
             };
-            process_chunked(
+            process_chunked_with_bus_routing(
                 &mut plugin,
                 params_arc.as_ref() as &dyn Params,
                 &mut audio,
                 chunk_args,
+                bus_routing,
             );
             let _ = audio;
             output_events_block.ensure_sorted_by_offset();

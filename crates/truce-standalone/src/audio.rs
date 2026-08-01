@@ -25,7 +25,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::{sample_count_usize, sample_rate_u32};
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus};
 use truce_core::export::PluginExport;
@@ -1408,15 +1408,7 @@ fn open_output_stream<P: PluginExport>(
         p.reset(&AudioConfig::new(sample_rate, frame_bound));
     }
     scratch.ensure_capacity(num_in, num_out, frame_bound);
-    let mut bus_routing = BusRouting::new();
-    if let Some(layout) = P::bus_layouts().into_iter().nth(layout_index) {
-        for bus in layout.inputs.into_iter().filter(|bus| bus.enabled) {
-            let _ = bus_routing.push_input(bus.channels.channel_count(), BusActivation::Active);
-        }
-        for bus in layout.outputs.into_iter().filter(|bus| bus.enabled) {
-            let _ = bus_routing.push_output(bus.channels.channel_count(), BusActivation::Active);
-        }
-    }
+    let bus_routing = bus_routing_at_index::<P>(layout_index);
     // `num_main_in` (the main/sidechain split of the selected layout) is
     // resolved by the caller and passed in - the layout is fixed for the
     // stream's lifetime.
@@ -1764,6 +1756,40 @@ fn layout_at_index<P: PluginExport>(idx: usize) -> (usize, usize, usize) {
     })
 }
 
+fn bus_routing_at_index<P: PluginExport>(idx: usize) -> BusRouting {
+    let mut routing = BusRouting::new();
+    let Some(layout) = P::bus_layouts().into_iter().nth(idx) else {
+        return routing;
+    };
+    for bus in layout.inputs {
+        let state = if bus.enabled {
+            BusActivation::Active
+        } else {
+            BusActivation::Inactive
+        };
+        let channels = if bus.enabled {
+            bus.channels.channel_count()
+        } else {
+            0
+        };
+        let _ = routing.push_input(channels, state);
+    }
+    for bus in layout.outputs {
+        let state = if bus.enabled {
+            BusActivation::Active
+        } else {
+            BusActivation::Inactive
+        };
+        let channels = if bus.enabled {
+            bus.channels.channel_count()
+        } else {
+            0
+        };
+        let _ = routing.push_output(channels, state);
+    }
+    routing
+}
+
 /// Whether the output device advertises a config with exactly `ch`
 /// channels. Used to reject a `--bus-layout` wider than the hardware.
 fn device_supports_output_channels(device: &cpal::Device, ch: u16) -> bool {
@@ -2089,18 +2115,18 @@ fn audio_callback<P: PluginExport>(
         // The standalone is a live host; offline render goes through
         // `offline.rs` + the driver, not this realtime path.
         process_mode: ProcessMode::Realtime,
-        bus_routing,
         output_events,
         params_fn: None,
         meters_fn: None,
         param_infos,
         min_subblock_samples,
     };
-    process_chunked(
+    process_chunked_with_bus_routing(
         &mut *plugin,
         params_arc.as_ref() as &dyn Params,
         &mut audio_buffer,
         chunk_args,
+        bus_routing,
     );
     let _ = audio_buffer;
     let output_status = output_events.overflow().map_or_else(

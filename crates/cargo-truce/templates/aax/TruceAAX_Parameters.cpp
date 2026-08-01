@@ -357,7 +357,7 @@ void TruceAAX_Parameters::RenderAudio(
     constexpr uint32_t kMaxChannels = 8; // 7.1 DTS, the widest main stem we register
     // The input array carries the appended sidechain after the main
     // channels, so it needs room for a full-width main PLUS the declared
-    // sidechain width. Sizing it to kMaxChannels alone silently dropped the
+    // first sidechain-bus width. Sizing it to kMaxChannels alone silently dropped the
     // sidechain of a 7.1 main (numIn already == kMaxChannels), feeding Rust
     // fewer channels than the negotiated layout - an out-of-range read the
     // Rust bridge panics on, leaving the track permanently silent. The
@@ -377,7 +377,7 @@ void TruceAAX_Parameters::RenderAudio(
     // Append the AAX side-chain after the main input channels, so the
     // plugin sees flat channel indexing (main then sidechain). Pro Tools
     // side-chain is always mono; duplicate it across the plugin's declared
-    // sidechain width so a stereo-sidechain plugin gets it on both
+    // first sidechain bus's width so a stereo-sidechain plugin gets it on both
     // channels. AddSideChainIn's per-block channel index is AAX's only
     // realtime activation signal: 0 means no source is patched. Keep the
     // declared topology stable, but feed silence until the host supplies a

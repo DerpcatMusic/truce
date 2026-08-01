@@ -32,7 +32,7 @@ use truce_core::editor::Editor;
 // AppKit/UiKit variants don't exist on Linux/Windows. Importing them
 // from a non-apple module would also trigger the unused-import lint
 // there.
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use truce_core::editor::{ClosureBridge, PluginContext, RawWindowHandle, SendPtr};
@@ -41,7 +41,7 @@ use truce_core::editor::{ClosureBridge, PluginContext, RawWindowHandle, SendPtr}
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
-use truce_core::bus_routing::{BusActivation, BusRouting};
+use truce_core::bus_routing::{BusActivation, BusRouting, MAX_AUDIO_BUSES};
 use truce_core::editor::fit_logical_size;
 use truce_core::events::{
     AuEventMetadata, EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
@@ -334,7 +334,9 @@ struct AuInstance<P: PluginExport> {
     param_infos: Vec<ParamInfo>,
     /// `min_subblock_samples` from `truce.toml`'s `[automation]`.
     min_subblock_samples: u32,
-    /// AU exposes one main input plus one combined sidechain element.
+    input_bus_count: usize,
+    output_bus_count: usize,
+    /// AU exposes one main input plus one sidechain element.
     sidechain_channels: u32,
     plugin_id_hash: u64,
     /// Audio + lifecycle-owned per-block scratch. Behind a `PluginCell` so
@@ -476,14 +478,17 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let mut plugin = P::create();
             plugin.init();
             let info = P::info();
-            let sidechain_channels = P::bus_layouts().first().map_or(0, |layout| {
-                layout
-                    .inputs
-                    .iter()
-                    .skip(1)
-                    .map(|bus| bus.channels.channel_count())
-                    .sum()
-            });
+            let layouts = P::bus_layouts();
+            let input_bus_count = layouts
+                .first()
+                .map_or(0, |layout| layout.inputs.len().min(MAX_AUDIO_BUSES));
+            let output_bus_count = layouts
+                .first()
+                .map_or(0, |layout| layout.outputs.len().min(MAX_AUDIO_BUSES));
+            let sidechain_channels = layouts
+                .first()
+                .and_then(|layout| layout.inputs.get(1))
+                .map_or(0, |bus| bus.channels.channel_count());
             let param_infos = plugin.params().param_infos();
             let params_arc = plugin.params_arc();
             let latency_cache = AtomicU32::new(plugin.latency());
@@ -504,6 +509,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 param_notify: None,
                 param_infos,
                 min_subblock_samples: info.automation.min_subblock_samples,
+                input_bus_count,
+                output_bus_count,
                 sidechain_channels,
                 plugin_id_hash: state::shared_plugin_state_hash(&info),
                 audio: PluginCell::new(AuAudio {
@@ -1233,17 +1240,27 @@ unsafe fn cb_process_impl<P: PluginExport>(
             None => BusActivation::Unknown,
         };
         let mut bus_routing = BusRouting::new();
-        if main_input_channels > 0 {
-            let _ =
-                bus_routing.push_input(main_input_channels, activation(bus_active.map(|m| m.0), 0));
+        for index in 0..inst.input_bus_count {
+            let channels = match index {
+                0 => main_input_channels,
+                1 => sidechain_channels,
+                _ => 0,
+            };
+            let state = if channels == 0 {
+                BusActivation::Inactive
+            } else {
+                activation(bus_active.map(|m| m.0), index)
+            };
+            let _ = bus_routing.push_input(channels, state);
         }
-        if sidechain_channels > 0 {
-            let _ =
-                bus_routing.push_input(sidechain_channels, activation(bus_active.map(|m| m.0), 1));
-        }
-        if num_output_channels > 0 {
-            let _ = bus_routing
-                .push_output(num_output_channels, activation(bus_active.map(|m| m.1), 0));
+        for index in 0..inst.output_bus_count {
+            let channels = if index == 0 { num_output_channels } else { 0 };
+            let state = if channels == 0 {
+                BusActivation::Inactive
+            } else {
+                activation(bus_active.map(|m| m.1), index)
+            };
+            let _ = bus_routing.push_output(channels, state);
         }
 
         let transport = if !transport_ptr.is_null() && (*transport_ptr).valid != 0 {
@@ -1286,18 +1303,18 @@ unsafe fn cb_process_impl<P: PluginExport>(
             // mode`); read per block so a mid-session toggle applies to
             // the next block without waiting on a re-prep.
             process_mode: ProcessMode::from_u8(inst.render_mode.load(Ordering::Relaxed)),
-            bus_routing,
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };
-        process_chunked(
+        process_chunked_with_bus_routing(
             &mut *plugin,
             inst.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
+            bus_routing,
         );
         let _ = audio_buffer;
         // Narrow rendered f64 output back to host f32 when needed.
@@ -3197,7 +3214,7 @@ fn midi_status_byte(source: MidiSource) -> u8 {
 /// declares. So only layouts matching the first layout's sidechain width
 /// are offered; the rest are dropped (with a one-line warning at the call
 /// site). The main input width is the first input bus; the sidechain width
-/// is the sum of the remaining input buses.
+/// is the one remaining supported input bus.
 fn au_negotiable_layouts(layouts: &[BusLayout]) -> (Vec<i16>, Vec<i16>, u32, usize) {
     fn main_in(l: &BusLayout) -> u32 {
         l.inputs.first().map_or(0, |b| b.channels.channel_count())

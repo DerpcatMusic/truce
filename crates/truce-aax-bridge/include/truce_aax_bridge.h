@@ -102,11 +102,10 @@ typedef struct {
     const int16_t* layout_in_channels;
     const int16_t* layout_out_channels;
     uint32_t num_layouts;
-    /* Total sidechain (non-main) input channel width from the first bus
-     * layout. > 0 makes the describe template register an AAX side-chain
-     * input port (AddSideChainIn) - Pro Tools side-chain is always mono,
-     * so RenderAudio duplicates that one channel across this width and
-     * appends it after the main input channels. 0 for no sidechain. */
+    /* First sidechain bus width from the default layout. > 0 makes the
+     * describe template register AAX's single side-chain input. Pro Tools
+     * supplies one mono source, duplicated across this bus's channels.
+     * Later declared sidechain buses remain unavailable. */
     uint32_t sidechain_in_channels;
 } TruceAaxDescriptor;
 

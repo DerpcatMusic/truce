@@ -37,7 +37,7 @@ use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusKind;
 use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::len_u32;
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::events::{
     EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus, TransportInfo,
@@ -754,18 +754,18 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                 transport: &mut transport_snap,
                 sample_rate: inst.sample_rate,
                 process_mode,
-                bus_routing,
                 output_events: &mut inst.output_events,
                 params_fn: None,
                 meters_fn: None,
                 param_infos: &inst.param_infos,
                 min_subblock_samples: inst.min_subblock_samples,
             };
-            let _ = process_chunked(
+            let _ = process_chunked_with_bus_routing(
                 &mut inst.plugin,
                 inst.params_arc.as_ref() as &dyn Params,
                 &mut audio,
                 chunk_args,
+                bus_routing,
             );
             // End the `audio` borrow before reaching back into `scratch`.
             let _ = audio;

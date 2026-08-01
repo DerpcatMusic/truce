@@ -16,7 +16,7 @@ use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::{BusConfig, BusKind, BusLayout};
 use truce_core::bus_routing::{BusActivation, BusRouting, MAX_AUDIO_BUSES};
 use truce_core::cast::{len_u32, sample_pos_i64};
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::editor::EditorBuilder;
 use truce_core::editor::{
@@ -1422,18 +1422,18 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             transport: &mut transport_snap,
             sample_rate: scr.sample_rate,
             process_mode: vst3_process_mode(process_mode),
-            bus_routing,
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };
-        process_chunked(
+        process_chunked_with_bus_routing(
             &mut *plugin,
             inst.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
+            bus_routing,
         );
         scr.output_events.ensure_sorted_by_offset();
         // End the `audio_buffer` borrow before reaching back into scratch.

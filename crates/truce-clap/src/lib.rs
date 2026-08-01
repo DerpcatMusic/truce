@@ -103,7 +103,7 @@ use truce_core::buffer::AudioBuffer;
 use truce_core::bus::ChannelConfig;
 use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::{len_u32, size_of_u32};
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::editor::{
     ClosureBridge, Editor, EditorBuilder, PluginContext, RawWindowHandle, SendPtr, fit_logical_size,
@@ -2696,18 +2696,18 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             transport: &mut transport_snap,
             sample_rate: scr.sample_rate,
             process_mode: ProcessMode::from_u8(data.render_mode.load(Ordering::Relaxed)),
-            bus_routing,
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
             param_infos: &data.param_infos,
             min_subblock_samples: data.info.automation.min_subblock_samples,
         };
-        let status = process_chunked(
+        let status = process_chunked_with_bus_routing(
             &mut *instance,
             data.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
+            bus_routing,
         );
 
         // Convert + copy back to host outputs for every channel that

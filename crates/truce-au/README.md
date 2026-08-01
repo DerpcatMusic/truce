@@ -31,8 +31,10 @@ declared channels and no sidechain pull is performed.
 
 `ProcessContext::bus_routing` reports the main/sidechain flattened ranges and
 the v2 connection/callback or v3 `isEnabled` snapshot for the current block.
-AU supports one independently routable sidechain element; registration rejects
-layouts with multiple auxiliary input buses instead of merging them.
+The supported main and sidechain indices are retained even when their current
+range is zero. AU supports one independently routable sidechain element;
+registration rejects layouts with multiple auxiliary input buses instead of
+merging them.
 
 ## Architecture
 

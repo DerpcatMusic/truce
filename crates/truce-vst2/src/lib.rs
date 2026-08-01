@@ -15,7 +15,7 @@ use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
 use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::{len_u32, sample_pos_i64};
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::editor::EditorBuilder;
 use truce_core::editor::{ClosureBridge, Editor, PluginContext, RawWindowHandle, SendPtr};
@@ -330,13 +330,33 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let info = P::info();
             let mut bus_routing = BusRouting::new();
             if let Some(layout) = P::bus_layouts().into_iter().next() {
-                for bus in layout.inputs.into_iter().filter(|bus| bus.enabled) {
-                    let _ = bus_routing
-                        .push_input(bus.channels.channel_count(), BusActivation::Unknown);
+                for bus in layout.inputs {
+                    let _ = bus_routing.push_input(
+                        if bus.enabled {
+                            bus.channels.channel_count()
+                        } else {
+                            0
+                        },
+                        if bus.enabled {
+                            BusActivation::Unknown
+                        } else {
+                            BusActivation::Inactive
+                        },
+                    );
                 }
-                for bus in layout.outputs.into_iter().filter(|bus| bus.enabled) {
-                    let _ = bus_routing
-                        .push_output(bus.channels.channel_count(), BusActivation::Unknown);
+                for bus in layout.outputs {
+                    let _ = bus_routing.push_output(
+                        if bus.enabled {
+                            bus.channels.channel_count()
+                        } else {
+                            0
+                        },
+                        if bus.enabled {
+                            BusActivation::Unknown
+                        } else {
+                            BusActivation::Inactive
+                        },
+                    );
                 }
             }
             let param_infos = plugin.params().param_infos();
@@ -659,18 +679,18 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             transport: &mut transport_snap,
             sample_rate: scr.sample_rate,
             process_mode: vst2_process_mode(process_level),
-            bus_routing: inst.bus_routing,
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };
-        process_chunked(
+        process_chunked_with_bus_routing(
             &mut *plugin,
             inst.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
+            inst.bus_routing,
         );
         let _ = audio_buffer;
         // Narrow rendered f64 output back to host f32 when needed.
