@@ -55,9 +55,9 @@ use truce_gui_types::theme::{Color, Theme};
 /// A stale epoch-5 dylib lacks the symbol; this bump rejects it at the
 /// canary before symbol resolution fails.
 /// Epoch 7: `truce_init_state` receives the current managed-task bundle and
-/// logic dylibs export `truce_build_tasks`. A stale epoch-6 dylib has the old
-/// init signature and no task constructor, so it must be rejected before
-/// either symbol is called.
+/// logic dylibs export `truce_build_tasks` plus `truce_warm_tasks`. A stale
+/// epoch-6 dylib has the old init signature and no task constructor, so it
+/// must be rejected before either symbol is called.
 pub const ABI_EPOCH: u32 = 7;
 
 /// ABI fingerprint. Compared between shell and dylib before loading.

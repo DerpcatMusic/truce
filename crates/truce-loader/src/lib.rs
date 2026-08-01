@@ -92,6 +92,17 @@ pub use loader::NativeLoader;
 #[macro_export]
 macro_rules! export_plugin {
     ($logic:ty, $params:ty $(, tasks: [$($task:ty),+])?) => {
+        /// Start this logic generation's own task pool before any DSP call
+        /// can schedule onto it. The shell calls this export on its loader
+        /// thread only after the candidate has been accepted.
+        #[unsafe(no_mangle)]
+        pub fn truce_warm_tasks() {
+            $(
+                let _ = ::core::marker::PhantomData::<($($task,)+)>;
+                $crate::__macro_deps::truce_core::tasks::warm_pool();
+            )?
+        }
+
         /// Build this logic generation's typed managed-task lanes. The
         /// queues and handler vtables originate in the same dylib as the
         /// task values that `init` / `process` enqueue into them.

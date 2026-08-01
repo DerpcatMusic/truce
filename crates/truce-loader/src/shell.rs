@@ -28,7 +28,7 @@ use truce_core::events::{EventBody, EventList};
 use truce_core::info::PluginInfo;
 use truce_core::plugin::PluginRuntime;
 use truce_core::process::{ProcessContext, ProcessStatus};
-use truce_core::tasks::{AnyTaskSpawner, warm_pool};
+use truce_core::tasks::AnyTaskSpawner;
 use truce_params::Params;
 use truce_params::sample::Sample;
 
@@ -135,11 +135,6 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
     }
 
     pub fn new_with_tasks(params: P, dylib_path: PathBuf, tasks: Option<AnyTaskSpawner>) -> Self {
-        if tasks.is_some() {
-            // Host/main thread: ensure first process scheduling stays the
-            // same wait-free queue push as the static shell.
-            warm_pool();
-        }
         let params = Arc::new(params);
         let params_ptr = Arc::as_ptr(&params).cast::<()>();
         let loader = NativeLoader::new_with_tasks(dylib_path, params_ptr, tasks.clone());
@@ -272,14 +267,17 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
     /// open. The closure takes the shared params `Arc`, `try_lock_for`s
     /// the loader (the audio thread only `try_lock`s it, so this never
     /// stalls audio), and returns `None` during an in-flight reload -
-    /// the host retries editor creation on a later idle tick.
+    /// the host retries editor creation on a later idle tick. Editor and
+    /// fixed task bundle are captured under that same lock, so every format's
+    /// later `Editor::open` uses the exact generation that built the editor.
     #[must_use]
     pub fn editor_builder(&self) -> truce_core::editor::EditorBuilder<P> {
         let loader = Arc::clone(&self.loader);
         Box::new(move |params: Arc<P>| {
             let params_ptr = Arc::as_ptr(&params).cast::<()>();
             let guard = loader.try_lock_for(GUI_LOCK_WAIT)?;
-            guard.build_editor(params_ptr)
+            let (editor, tasks) = guard.build_editor(params_ptr)?;
+            Some(truce_core::editor::bind_editor_tasks(editor, tasks))
         })
     }
 }
@@ -568,8 +566,8 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
 impl<P: Params, S: Sample> Drop for HotShell<P, S> {
     fn drop(&mut self) {
         // Free the DSP state through the dylib that produced it (its
-        // `Drop` glue lives there). The loader retains every origin
-        // generation until this state is gone, then releases quiescent code.
+        // `Drop` glue lives there). Every activated generation remains mapped
+        // for process lifetime, including after this loader is dropped.
         self.drop_state();
     }
 }

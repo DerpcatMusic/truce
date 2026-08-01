@@ -1,6 +1,6 @@
 //! Managed background-task pool.
 //!
-//! A process-global pool of worker threads runs plugin
+//! A module-local pool of worker threads runs plugin
 //! `BackgroundTask::run` handlers off the audio thread. Each plugin
 //! instance owns a
 //! preallocated, wait-free inbound queue via a [`TaskSpawner`]: the
@@ -23,10 +23,11 @@
 //! contract sets `BackgroundTask::SERIALIZED = true`, and the pool then
 //! runs that instance's handler one at a time.
 //!
-//! The pool is shared across every instance in the process (one small
-//! set of threads, not one thread per instance) and initializes lazily
-//! the first time any instance actually schedules a task, so a plugin
-//! that never declares a `BackgroundTask` spawns no threads.
+//! A static plug-in module shares one pool across its instances. Each
+//! hot-reload logic generation has its own pool because its monomorphized
+//! handlers and queue operations live in that dylib; accepted generations
+//! warm and pin that pool before processing. A plugin that never declares a
+//! `BackgroundTask` spawns no threads.
 //!
 //! Because the pool is shared and small (`available_parallelism() - 1`,
 //! as few as one thread), task handlers must stay short and
@@ -242,7 +243,7 @@ fn pool() -> &'static Pool {
 }
 
 /// Pin the module `truce-core` is linked into (the plugin cdylib in a
-/// static build, or the hot-reload shell cdylib) so it is never
+/// static build, or one hot-reload logic dylib generation) so it is never
 /// unmapped. The pool's workers loop forever - park + drain - with no
 /// shutdown path and no `JoinHandle`s; if the host `dlclose`d the module
 /// on last-instance teardown while a worker was parked, it would wake
@@ -317,14 +318,14 @@ fn pin_current_module() {
 #[cfg(any(miri, not(any(unix, windows))))]
 fn pin_current_module() {}
 
-/// Eagerly start the shared pool on the calling thread. The shell calls
-/// this at instantiation (the host/main thread) when a plugin wires a
-/// task spawner, so the worker threads exist before the audio thread ever
-/// schedules. Without it a plugin that first schedules from `process()`
-/// (the "rebuild the filter when a knob moves" pattern, with no startup
-/// work in `init` to warm the pool) would cold-start the threads inside
-/// the audio callback. Idempotent: the pool is a process-global singleton
-/// after the first call.
+/// Eagerly start this loaded module's pool on the calling thread. Static
+/// shells call this at instantiation; hot shells call the accepted logic
+/// generation's exported warmer, so the worker threads exist before the
+/// audio thread ever schedules. Without it a plugin that first schedules
+/// from `process()` (the "rebuild the filter when a knob moves" pattern,
+/// with no startup work in `init` to warm the pool) would cold-start the
+/// threads inside the audio callback. Idempotent: the pool is a singleton
+/// within this loaded module after the first call.
 pub fn warm_pool() {
     let _ = pool();
 }
@@ -498,6 +499,7 @@ impl<T: Send + 'static> Sink<T> {
 
 trait RetireLane: Send + Sync {
     fn retire(&self, deadline: Instant) -> bool;
+    fn resume(&self);
 }
 
 impl<T: Send + 'static> RetireLane for Sink<T> {
@@ -506,13 +508,24 @@ impl<T: Send + 'static> RetireLane for Sink<T> {
         while self.schedulers.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
             thread::yield_now();
         }
+        if self.schedulers.load(Ordering::Acquire) != 0 {
+            self.resume();
+            return false;
+        }
         while self.coalesced.pop().is_some() {}
         while self.queue.pop().is_some() {}
         while self.active_drains.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
             thread::yield_now();
         }
-        self.schedulers.load(Ordering::Acquire) == 0
-            && self.active_drains.load(Ordering::Acquire) == 0
+        if self.active_drains.load(Ordering::Acquire) != 0 {
+            self.resume();
+            return false;
+        }
+        true
+    }
+
+    fn resume(&self) {
+        self.accepting.store(true, Ordering::Release);
     }
 }
 
@@ -528,21 +541,19 @@ struct LaneSet(Box<[ErasedLane]>);
 impl LaneSet {
     fn retire(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let mut drained = true;
         for lane in &self.0 {
-            drained &= lane.control.retire(deadline);
+            if !lane.control.retire(deadline) {
+                // The current generation stays live when any lane misses
+                // the one shared deadline. Re-open every lane already
+                // closed above so a deferred reload cannot leave the live
+                // plugin half-retired.
+                for lane in &self.0 {
+                    lane.control.resume();
+                }
+                return false;
+            }
         }
-        drained
-    }
-
-    fn is_quiescent(&self) -> bool {
-        self.0.iter().all(|lane| {
-            // The lane set itself owns two strong references to each sink:
-            // one through the typed TaskSpawner and one control handle.
-            // Any additional owner is a worker/injector or a typed handle
-            // retained by plugin/editor code.
-            Arc::strong_count(&lane.control) == 2
-        })
+        true
     }
 }
 
@@ -589,10 +600,10 @@ impl AnyTaskSpawner {
         )))))
     }
 
-    /// Install a verified logic generation and retire the previous lanes.
-    /// Called by the reload watcher while it owns the loader lock, never by
-    /// the audio thread.
-    pub fn replace_with(&self, next: &Self, timeout: Duration) -> bool {
+    /// Route future off-thread lookups to a verified logic generation.
+    /// The loader retires the previous fixed generation once before this
+    /// swap; this method only changes the route and never waits.
+    pub fn replace_with(&self, next: &Self) -> bool {
         let TaskLanes::Routed(route) = self.0.as_ref() else {
             return false;
         };
@@ -602,38 +613,21 @@ impl AnyTaskSpawner {
         let mut active = route
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let drained = active.retire(timeout);
         *active = Arc::clone(next);
-        drained
+        true
     }
 
-    /// Disconnect a hot shell's stable wrapper/editor route from its final
-    /// logic generation before the loader considers unloading that dylib.
-    pub fn clear_route(&self, timeout: Duration) -> bool {
+    /// Disconnect a hot shell's stable off-thread route. The loader owns
+    /// retirement; clearing a route is only a non-waiting pointer swap.
+    pub fn clear_route(&self) -> bool {
         let TaskLanes::Routed(route) = self.0.as_ref() else {
             return false;
         };
         let mut active = route
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let drained = active.retire(timeout);
         *active = Arc::new(LaneSet(Box::new([])));
-        drained
-    }
-
-    /// Freeze the route's current generation. Editor contexts call this at
-    /// open time so an editor compiled from an older dylib can never enqueue
-    /// a changed task layout into a newer generation's typed queue.
-    #[must_use]
-    pub fn snapshot(&self) -> Self {
-        match self.0.as_ref() {
-            TaskLanes::Fixed(_) => self.clone(),
-            TaskLanes::Routed(route) => Self(Arc::new(TaskLanes::Fixed(Arc::clone(
-                &route
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )))),
-        }
+        true
     }
 
     /// Retire the active generation without installing a replacement.
@@ -645,22 +639,6 @@ impl AnyTaskSpawner {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retire(timeout),
-        }
-    }
-
-    /// Whether no worker, queued injector entry, DSP state, or editor holds
-    /// a typed handle into this generation. A hot loader may unload the
-    /// origin dylib only after this becomes true.
-    #[must_use]
-    pub fn is_quiescent(&self) -> bool {
-        match self.0.as_ref() {
-            TaskLanes::Fixed(lanes) => Arc::strong_count(lanes) == 1 && lanes.is_quiescent(),
-            TaskLanes::Routed(route) => {
-                let lanes = route
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                Arc::strong_count(&lanes) == 1 && lanes.is_quiescent()
-            }
         }
     }
 

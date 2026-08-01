@@ -42,8 +42,8 @@ use truce_params::sample::Sample;
 
 /// Handlers are contractually short/nonblocking. A reload retires lanes on
 /// the watcher thread and gives in-flight work this bounded window to leave;
-/// a generation that still has owners remains mapped instead of risking a
-/// callback into unloaded code.
+/// if the deadline is missed, the old lanes reopen and the reload is aborted.
+/// Activated generations remain mapped for process lifetime regardless.
 const TASK_RETIRE_WAIT: Duration = Duration::from_millis(250);
 
 /// The `truce_process` export's signature (state, params, buffer,
@@ -59,8 +59,9 @@ pub type StateDropFn = fn(*mut ());
 /// The subset of a dylib's exports the shell binds to the exact state
 /// allocation that dylib produced, so it can operate on that state even
 /// after a reload swaps the active symbol table. Both are bare `fn`
-/// pointers into the origin dylib's code, which the loader retains until
-/// its state and managed-task owners are gone.
+/// pointers into the origin dylib's code. Every activated generation stays
+/// mapped for the rest of the process, so these pointers remain valid even
+/// when an editor or wrapper object outlives the loader instance.
 #[derive(Clone, Copy)]
 pub struct StateOrigin {
     /// Frees the allocation with the layout that made it.
@@ -75,9 +76,10 @@ pub struct StateOrigin {
 /// The flat function-pointer table resolved from a loaded dylib. Every
 /// entry operates on an opaque `*mut ()` / `*const ()` state pointer
 /// (an erased `Box<State>`) plus a `*const ()` params pointer (the
-/// shell's `Arc<Params>`). The loader keeps a retired generation mapped
-/// while state or managed-task handles can still call these pointers.
+/// shell's `Arc<Params>`). The loader keeps every activated generation
+/// mapped for the rest of the process.
 struct LogicSymbols<S: Sample> {
+    warm_tasks: fn(),
     build_tasks: fn(*const ()) -> Option<AnyTaskSpawner>,
     init_state: fn(*const (), Option<AnyTaskSpawner>) -> *mut (),
     drop_state: StateDropFn,
@@ -126,6 +128,7 @@ impl<S: Sample> LogicSymbols<S> {
         }
         let preserve_fn: fn() -> bool = sym!(b"truce_preserve_dsp_state", fn() -> bool);
         Some(Self {
+            warm_tasks: sym!(b"truce_warm_tasks", fn()),
             build_tasks: sym!(
                 b"truce_build_tasks",
                 fn(*const ()) -> Option<AnyTaskSpawner>
@@ -161,16 +164,14 @@ struct Candidate<S: Sample> {
     library: Library,
     hash: u32,
     mtime: SystemTime,
-    /// Path of the versioned copy in the system temp dir. Tracked so
-    /// the loader can unlink it on Drop after the matching `Library`
-    /// handle has been released.
+    /// Path of the versioned copy in the system temp dir. Rejected candidates
+    /// remove it; activated generations retain it with their permanent map.
     temp_path: PathBuf,
 }
 
 struct RetiredGeneration {
     tasks: Option<AnyTaskSpawner>,
     library: Library,
-    temp_path: Option<PathBuf>,
 }
 
 /// Manages a hot-reloadable plugin dylib.
@@ -199,11 +200,10 @@ pub struct NativeLoader<S: Sample = f32> {
     last_hash: u32,
     /// Set to true to stop the file watcher thread.
     watcher_stop: Arc<AtomicBool>,
-    /// Old code + task generations retained until instance teardown.
+    /// Old code + task generations retained until instance teardown. Their
+    /// library mappings are then intentionally kept for process lifetime:
+    /// editors, function pointers, and task workers can outlive this loader.
     retired_generations: Vec<RetiredGeneration>,
-    /// Path of the temp copy currently bound to `self.library`. Moves with
-    /// the library into its `RetiredGeneration` on reload or shutdown.
-    current_temp: Option<PathBuf>,
     load_counter: u64,
     /// Count of successful library swaps (a `reload` that actually
     /// installed new code). Unlike `load_counter`, a failed reload
@@ -249,7 +249,6 @@ impl<S: Sample> NativeLoader<S> {
             last_hash: 0,
             watcher_stop: Arc::new(AtomicBool::new(false)),
             retired_generations: Vec::new(),
-            current_temp: None,
             load_counter: 0,
             swap_generation: 0,
             instance_id: LOADER_ID.fetch_add(1, Ordering::Relaxed),
@@ -399,12 +398,16 @@ impl<S: Sample> NativeLoader<S> {
         }
         match self.build_candidate(new_hash) {
             Some(cand) => {
+                // Host/main thread: warm the pool compiled into this exact
+                // logic dylib before `init` or `process` can schedule work.
+                // Warming the shell's separate truce-core copy would leave
+                // this generation's first audio-thread schedule cold.
+                (cand.symbols.warm_tasks)();
                 self.install_tasks(cand.tasks);
                 self.library = Some(cand.library);
                 self.symbols = Some(cand.symbols);
                 self.last_hash = cand.hash;
                 self.last_modified = cand.mtime;
-                self.current_temp = Some(cand.temp_path);
                 log::info!("loaded plugin dylib: {}", self.dylib_path.display());
                 true
             }
@@ -440,23 +443,36 @@ impl<S: Sample> NativeLoader<S> {
             return false;
         };
 
-        // Retain the old generation: live DSP state, queued/running tasks,
-        // or an open editor may still own code/drop glue from it. Teardown
-        // unloads only generations whose managed-task owners are quiescent.
-        let old_tasks = self.tasks.take();
-        if let Some(tasks) = &old_tasks
+        // Close the old lanes once, before changing either the wrapper route
+        // or the active symbols. A missed deadline aborts the swap and
+        // re-opens every old lane; proceeding would allow a producer to
+        // enqueue after the queue-clear barrier.
+        if let Some(tasks) = &self.tasks
             && !tasks.retire(TASK_RETIRE_WAIT)
         {
             log::warn!(
                 "hot-reload task retirement exceeded {TASK_RETIRE_WAIT:?}; \
-                 the old dylib remains mapped"
+                 keeping the previous logic generation active"
             );
+            discard_candidate(candidate);
+            return false;
         }
+
+        // This call may create permanent worker threads, so it happens only
+        // after the candidate is fully verified and the old generation has
+        // retired successfully. It runs on the watcher thread, before any
+        // state init or process call can schedule onto the candidate pool.
+        (candidate.symbols.warm_tasks)();
+
+        // Every successfully activated generation remains mapped for process
+        // lifetime. An editor object or saved state-origin function pointer
+        // can outlive the loader's own fields, and a task pool's workers are
+        // intentionally permanent.
+        let old_tasks = self.tasks.take();
         if let Some(old) = self.library.take() {
             self.retired_generations.push(RetiredGeneration {
                 tasks: old_tasks,
                 library: old,
-                temp_path: self.current_temp.take(),
             });
         }
 
@@ -465,7 +481,6 @@ impl<S: Sample> NativeLoader<S> {
         self.symbols = Some(candidate.symbols);
         self.last_hash = candidate.hash;
         self.last_modified = candidate.mtime;
-        self.current_temp = Some(candidate.temp_path);
         self.swap_generation += 1;
 
         log::info!(
@@ -506,9 +521,9 @@ impl<S: Sample> NativeLoader<S> {
 
     fn install_tasks(&mut self, tasks: Option<AnyTaskSpawner>) {
         if let (Some(route), Some(tasks)) = (&self.task_route, &tasks) {
-            let _ = route.replace_with(tasks, TASK_RETIRE_WAIT);
+            let _ = route.replace_with(tasks);
         } else if let Some(route) = &self.task_route {
-            let _ = route.clear_route(TASK_RETIRE_WAIT);
+            let _ = route.clear_route();
         }
         self.tasks = tasks;
     }
@@ -585,26 +600,24 @@ impl<S: Sample> NativeLoader<S> {
         }
     }
 
-    /// Build the loaded plugin's editor via the dylib's
-    /// `truce_build_editor` symbol, from `params_ptr` (the shell's
-    /// shared params). Receiverless by design: it does not borrow the
-    /// loaded logic instance (whose `&mut` the audio thread holds during
-    /// a block), so the reloaded editor code is picked up without racing
-    /// `process`. `None` when no library is loaded or the symbol is
-    /// missing (a stale pre-epoch-3 dylib, already refused by the canary
-    /// before it reaches here).
+    /// Build the loaded plugin's editor and return the current fixed task
+    /// bundle with it. Both are read from one loader generation under the
+    /// caller's lock, so the editor can never be paired with a route that a
+    /// concurrent reload already advanced. Receiverless by design: this does
+    /// not borrow the logic instance whose `&mut` the audio thread owns.
+    /// `None` when no library is loaded or the editor symbol is missing.
     #[must_use]
     pub fn build_editor(
         &self,
         params_ptr: *const (),
-    ) -> Option<Box<dyn truce_core::editor::Editor>> {
+    ) -> Option<(Box<dyn truce_core::editor::Editor>, Option<AnyTaskSpawner>)> {
         type BuildEditorFn = fn(*const ()) -> Box<dyn truce_core::editor::Editor>;
         let library = self.library.as_ref()?;
         // SAFETY: `export_plugin!` fixes this symbol's signature, and the
         // ABI canary already verified this dylib matches the shell
         // before the library was bound.
         let build: Symbol<BuildEditorFn> = unsafe { library.get(b"truce_build_editor").ok()? };
-        Some(build(params_ptr))
+        Some((build(params_ptr), self.tasks.clone()))
     }
 
     /// Whether a dylib is currently loaded (symbols resolved).
@@ -656,7 +669,7 @@ impl<S: Sample> Drop for NativeLoader<S> {
     fn drop(&mut self) {
         self.watcher_stop.store(true, Ordering::Relaxed);
         if let Some(route) = &self.task_route {
-            let _ = route.clear_route(TASK_RETIRE_WAIT);
+            let _ = route.clear_route();
         }
         if let Some(tasks) = &self.tasks {
             let _ = tasks.retire(TASK_RETIRE_WAIT);
@@ -670,38 +683,38 @@ impl<S: Sample> Drop for NativeLoader<S> {
             let generation = RetiredGeneration {
                 tasks: self.tasks.take(),
                 library,
-                temp_path: self.current_temp.take(),
             };
-            release_generation(generation);
+            retain_generation_mapping(generation);
         }
         for generation in self.retired_generations.drain(..) {
-            release_generation(generation);
+            retain_generation_mapping(generation);
         }
     }
 }
 
-fn release_generation(generation: RetiredGeneration) {
-    let can_unload = generation
-        .tasks
-        .as_ref()
-        .is_none_or(AnyTaskSpawner::is_quiescent);
-    if !can_unload {
-        // A typed handle or pool worker still owns code/drop glue from this
-        // dylib. Leaking this rare final generation is the only sound choice;
-        // the normal drained path below unloads and removes its temp file.
-        std::mem::forget(generation);
-        return;
-    }
-    let RetiredGeneration {
+fn retain_generation_mapping(generation: RetiredGeneration) {
+    let RetiredGeneration { tasks, library } = generation;
+    // Drop loader-owned task handles while their code is still mapped. Other
+    // handles may remain in editors or host wrappers; leaking the Library
+    // handle below keeps their closures/vtables valid for process lifetime.
+    drop(tasks);
+    std::mem::forget(library);
+}
+
+fn discard_candidate<S: Sample>(candidate: Candidate<S>) {
+    let Candidate {
         tasks,
+        symbols: _,
         library,
+        hash: _,
+        mtime: _,
         temp_path,
-    } = generation;
+    } = candidate;
+    // The candidate was never activated or warmed, so no worker/editor/state
+    // can refer to it. Drop task closures before unloading their code.
     drop(tasks);
     drop(library);
-    if let Some(path) = temp_path {
-        let _ = std::fs::remove_file(path);
-    }
+    let _ = std::fs::remove_file(temp_path);
 }
 
 /// File watcher loop. Polls mtime ~every 500ms, but checks the stop

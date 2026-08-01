@@ -244,6 +244,94 @@ pub trait Editor: Send {
     }
 }
 
+/// Bind an editor to the exact managed-task generation that built it.
+///
+/// Hot-reload shells construct the editor and clone the current fixed task
+/// bundle while holding one loader lock, then return this wrapper. Every
+/// format may still attach its cached task handle to [`PluginContext`], but
+/// [`Editor::open`] replaces it here with the generation-matched bundle.
+/// An editor from an older dylib can therefore never enqueue a changed task
+/// type into the current dylib's lane after a reload.
+#[must_use]
+pub fn bind_editor_tasks(
+    editor: Box<dyn Editor>,
+    tasks: Option<AnyTaskSpawner>,
+) -> Box<dyn Editor> {
+    Box::new(TaskBoundEditor { editor, tasks })
+}
+
+struct TaskBoundEditor {
+    editor: Box<dyn Editor>,
+    tasks: Option<AnyTaskSpawner>,
+}
+
+impl Editor for TaskBoundEditor {
+    fn size(&self) -> (u32, u32) {
+        self.editor.size()
+    }
+
+    fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
+        self.editor
+            .open(parent, context.with_tasks(self.tasks.clone()));
+    }
+
+    fn close(&mut self) {
+        self.editor.close();
+    }
+
+    fn idle(&mut self) {
+        self.editor.idle();
+    }
+
+    fn set_size(&mut self, width: u32, height: u32) -> bool {
+        self.editor.set_size(width, height)
+    }
+
+    fn can_resize(&self) -> bool {
+        self.editor.can_resize()
+    }
+
+    fn can_maximize(&self) -> bool {
+        self.editor.can_maximize()
+    }
+
+    fn min_size(&self) -> (u32, u32) {
+        self.editor.min_size()
+    }
+
+    fn max_size(&self) -> (u32, u32) {
+        self.editor.max_size()
+    }
+
+    fn size_increment(&self) -> Option<(u32, u32)> {
+        self.editor.size_increment()
+    }
+
+    fn aspect_ratio(&self) -> Option<(u32, u32)> {
+        self.editor.aspect_ratio()
+    }
+
+    fn prefers_pow2(&self) -> bool {
+        self.editor.prefers_pow2()
+    }
+
+    fn set_scale_factor(&mut self, factor: f64) {
+        self.editor.set_scale_factor(factor);
+    }
+
+    fn set_uses_system_scale(&mut self, yes: bool) {
+        self.editor.set_uses_system_scale(yes);
+    }
+
+    fn state_changed(&mut self) {
+        self.editor.state_changed();
+    }
+
+    fn screenshot(&mut self, params: Arc<dyn Params>) -> Option<(Vec<u8>, u32, u32)> {
+        self.editor.screenshot(params)
+    }
+}
+
 /// Fluent terminal for `editor()` impls: box any concrete editor into
 /// the `Box<dyn Editor>` the trait returns, dropping the `Box::new(…)`
 /// wrapper.
@@ -454,7 +542,7 @@ impl<P: ?Sized> PluginContext<P> {
     /// building the editor context.
     #[must_use]
     pub fn with_tasks(mut self, tasks: Option<AnyTaskSpawner>) -> Self {
-        self.tasks = tasks.map(|tasks| tasks.snapshot());
+        self.tasks = tasks;
         self
     }
 
