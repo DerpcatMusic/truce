@@ -782,6 +782,26 @@ static_assert(speaker_arr_for_channels(4) == 0x33ull, "quad = L|R|Ls|Rs, not 3.1
 static_assert(speaker_arr_for_channels(6) == 0x3Full, "5.1 = L R C Lfe Ls Rs");
 static_assert(speaker_arr_for_channels(8) == 0x63Full, "7.1 = 5.1 + Sl + Sr");
 
+// One activation bit per declared bus. Every valid VST3 audio bus consumes at
+// least one channel, and registration rejects layouts wider than
+// kMaxProcChannels, so the channel cap is also a safe bus-count cap. Keeping
+// this as an always-lock-free scalar makes activateBus/process handoff
+// allocation- and lock-free.
+static_assert(std::atomic<uint32_t>::is_always_lock_free,
+              "VST3 audio-bus activation requires lock-free uint32 atomics");
+
+static uint32_t default_active_bus_mask(uint32_t count, const uint8_t* kinds) {
+    uint32_t mask = 0;
+    const uint32_t bounded = count < kMaxProcChannels ? count : kMaxProcChannels;
+    for (uint32_t i = 0; i < bounded; i++) {
+        // Main buses are active by default. Sidechain/aux buses are optional:
+        // the host explicitly activates whichever ones it routes.
+        if (!kinds || kinds[i] == 0)
+            mask |= uint32_t{1} << i;
+    }
+    return mask;
+}
+
 class TruceComponent {
     std::atomic<int32> refCount{1};
     void* ctx;
@@ -807,6 +827,15 @@ class TruceComponent {
     // setBusArrangements moves it; getBusInfo / getBusArrangement read
     // per-bus widths from it via g_cb->layout_bus_channels.
     uint32_t cur_layout = 0;
+    // Topology stays fixed while activateBus changes which declared buses
+    // participate. Main buses start active; aux buses start inactive.
+    std::atomic<uint32_t> inputBusActive{0};
+    std::atomic<uint32_t> outputBusActive{0};
+    // Negotiated per-bus widths cached outside process(). Calling the Rust
+    // layout callback from the audio thread would reconstruct bus_layouts()
+    // and may allocate; these fixed arrays make render-time lookup O(1).
+    uint32_t inputBusChannels[kMaxProcChannels] = {};
+    uint32_t outputBusChannels[kMaxProcChannels] = {};
     /* Omitted-bus scratch (see process()): the host may drop the
      * AudioBusBuffers for a deactivated last bus entirely, but the
      * plug-in negotiated fixed widths - a missing input side reads
@@ -816,6 +845,22 @@ class TruceComponent {
      * so one allocation covers both sample widths. */
     uint8_t* silenceScratch = nullptr;
     uint8_t* trashScratch = nullptr;
+
+    void refreshBusChannels() {
+        memset(inputBusChannels, 0, sizeof(inputBusChannels));
+        memset(outputBusChannels, 0, sizeof(outputBusChannels));
+        if (!g_desc || !g_cb || !g_cb->layout_bus_channels) return;
+        const uint32_t inputs = g_desc->num_input_buses < kMaxProcChannels
+            ? g_desc->num_input_buses
+            : kMaxProcChannels;
+        const uint32_t outputs = g_desc->num_output_buses < kMaxProcChannels
+            ? g_desc->num_output_buses
+            : kMaxProcChannels;
+        for (uint32_t b = 0; b < inputs; b++)
+            inputBusChannels[b] = g_cb->layout_bus_channels(cur_layout, 0, b);
+        for (uint32_t b = 0; b < outputs; b++)
+            outputBusChannels[b] = g_cb->layout_bus_channels(cur_layout, 1, b);
+    }
 public:
     // cb_create (Rust `_create`) returns null when the author's create() /
     // init() panicked; a component with a null ctx is an inert zombie that
@@ -873,6 +918,15 @@ public:
                        componentHandler(nullptr), inPerformEdit(false),
                        stateLoaded(false), deferredParent(nullptr),
                        plugView(nullptr) {
+        if (g_desc) {
+            inputBusActive.store(
+                default_active_bus_mask(g_desc->num_input_buses, g_desc->input_bus_kinds),
+                std::memory_order_relaxed);
+            outputBusActive.store(
+                default_active_bus_mask(g_desc->num_output_buses, g_desc->output_bus_kinds),
+                std::memory_order_relaxed);
+        }
+        refreshBusChannels();
         if (g_cb) {
             ctx = g_cb->create();
             if (ctx) {
@@ -1063,14 +1117,43 @@ public:
                                              : "Output";
             str_to_char16(bus->name, nm, 128);
             bus->busType = aux ? kAux : kMain;
-            bus->flags = 1;
+            // kDefaultActive is truthful per role: the main path is live on a
+            // fresh instance, while aux buses wait for activateBus.
+            bus->flags = aux ? 0 : 1;
             return kResultOk;
         }
         return kInvalidArgument;
     }
 
     tresult getRoutingInfo(RoutingInfo*, RoutingInfo*) { return kNotImplemented; }
-    tresult activateBus(int32, int32, int32, TBool) { return kResultOk; }
+    tresult activateBus(int32 type, int32 dir, int32 index, TBool state) {
+        if (!g_desc || index < 0) return kInvalidArgument;
+
+        // Event buses have no audio-buffer state to track, but accept valid
+        // host lifecycle calls as before.
+        if (type == kEvent) {
+            const int32 count = dir == kInput ? g_desc->midi_input_ports
+                                : dir == kOutput ? g_desc->midi_output_ports
+                                                 : 0;
+            return index < count ? kResultOk : kInvalidArgument;
+        }
+        if (type != kAudio || (dir != kInput && dir != kOutput))
+            return kInvalidArgument;
+
+        const uint32_t count = dir == kInput ? g_desc->num_input_buses
+                                              : g_desc->num_output_buses;
+        const uint32_t bus = static_cast<uint32_t>(index);
+        if (bus >= count || bus >= kMaxProcChannels)
+            return kInvalidArgument;
+
+        auto& active = dir == kInput ? inputBusActive : outputBusActive;
+        const uint32_t bit = uint32_t{1} << bus;
+        if (state)
+            active.fetch_or(bit, std::memory_order_release);
+        else
+            active.fetch_and(~bit, std::memory_order_release);
+        return kResultOk;
+    }
 
     tresult setActive(TBool state) {
         if (state && g_cb && ctx) {
@@ -1199,6 +1282,7 @@ public:
                 inCh.data(), (uint32_t)numIns, outCh.data(), (uint32_t)numOuts);
             if (li >= 0) {
                 cur_layout = (uint32_t)li;
+                refreshBusChannels();
                 // Keep the summed cur_in/cur_out in step for the scratch
                 // sizing and deactivated-bus synthesis in process().
                 uint32_t si = 0, so = 0;
@@ -1380,55 +1464,63 @@ public:
         const void* inPtrs[kMaxProcChannels] = {};
         void* outPtrs[kMaxProcChannels] = {};
         uint32_t numIn = 0, numOut = 0;
+        const uint32_t activeInputs = inputBusActive.load(std::memory_order_acquire);
+        const uint32_t activeOutputs = outputBusActive.load(std::memory_order_acquire);
 
-        // Concatenate every input bus's channels into one flat array in
-        // bus order - main bus first, then each sidechain/aux bus - which
-        // is exactly the flat channel indexing the plugin's AudioBuffer
-        // expects (main L/R at 0/1, sidechain L/R at 2/3, ...). Clamp the
-        // total to the pointer-array size so a channel past the cap never
-        // sends Rust an uninitialized stack pointer (registration already
-        // rejects layouts wider than this, so the clamp never bites).
-        if (data->inputs) {
-            for (int32 b = 0; b < data->numInputs && numIn < kMaxProcChannels; b++) {
-                auto& bus = data->inputs[b];
-                int32 nch = bus.numChannels;
-                uint32_t bch = nch <= 0 ? 0u : (uint32_t)nch;
-                // A deactivated/unconnected bus can legally arrive with
-                // numChannels > 0 but a NULL channelBuffers array (a third
-                // deactivated-bus shape shipping hosts produce, which
-                // JUCE / nih-plug both guard). Treat the null array as
-                // all-channels-null so the back-fill below substitutes
-                // silence, instead of dereferencing it here on the audio
-                // thread.
-                const bool nullArr =
-                    use64 ? (bus.channelBuffers64 == nullptr) : (bus.channelBuffers32 == nullptr);
-                for (uint32_t c = 0; c < bch && numIn < kMaxProcChannels; c++, numIn++)
-                    inPtrs[numIn] = nullArr ? nullptr
-                                    : use64 ? (const void*)bus.channelBuffers64[c]
-                                            : (const void*)bus.channelBuffers32[c];
+        // Concatenate every DECLARED bus's negotiated width into one flat
+        // array in bus order. Inactive buses retain their channel positions
+        // but contribute nulls, which the preallocated scratch below replaces
+        // with silence/discard. Reading the declared width (rather than a
+        // deactivated host buffer's often-zero numChannels) prevents a disabled
+        // aux bus from shifting every later bus into the wrong flat channels.
+        if (g_desc) {
+            for (uint32_t b = 0; b < g_desc->num_input_buses &&
+                                 b < kMaxProcChannels && numIn < kMaxProcChannels; b++) {
+                const uint32_t declared = inputBusChannels[b];
+                const bool active = (activeInputs & (uint32_t{1} << b)) != 0;
+                const AudioBusBuffers* bus = data->inputs && data->numInputs > 0 &&
+                                              b < static_cast<uint32_t>(data->numInputs)
+                    ? &data->inputs[b]
+                    : nullptr;
+                const uint32_t supplied = bus && bus->numChannels > 0
+                    ? static_cast<uint32_t>(bus->numChannels)
+                    : 0;
+                const bool nullArr = !bus ||
+                    (use64 ? bus->channelBuffers64 == nullptr : bus->channelBuffers32 == nullptr);
+                for (uint32_t c = 0; c < declared && numIn < kMaxProcChannels; c++, numIn++) {
+                    inPtrs[numIn] = !active || nullArr || c >= supplied ? nullptr
+                                    : use64 ? (const void*)bus->channelBuffers64[c]
+                                            : (const void*)bus->channelBuffers32[c];
+                }
             }
-        }
-        if (data->outputs) {
-            for (int32 b = 0; b < data->numOutputs && numOut < kMaxProcChannels; b++) {
-                auto& bus = data->outputs[b];
-                int32 nch = bus.numChannels;
-                uint32_t bch = nch <= 0 ? 0u : (uint32_t)nch;
-                const bool nullArr =
-                    use64 ? (bus.channelBuffers64 == nullptr) : (bus.channelBuffers32 == nullptr);
-                for (uint32_t c = 0; c < bch && numOut < kMaxProcChannels; c++, numOut++)
-                    outPtrs[numOut] = nullArr ? nullptr
-                                      : use64 ? (void*)bus.channelBuffers64[c]
-                                              : (void*)bus.channelBuffers32[c];
+            for (uint32_t b = 0; b < g_desc->num_output_buses &&
+                                 b < kMaxProcChannels && numOut < kMaxProcChannels; b++) {
+                const uint32_t declared = outputBusChannels[b];
+                const bool active = (activeOutputs & (uint32_t{1} << b)) != 0;
+                AudioBusBuffers* bus = data->outputs && data->numOutputs > 0 &&
+                                       b < static_cast<uint32_t>(data->numOutputs)
+                    ? &data->outputs[b]
+                    : nullptr;
+                const uint32_t supplied = bus && bus->numChannels > 0
+                    ? static_cast<uint32_t>(bus->numChannels)
+                    : 0;
+                const bool nullArr = !bus ||
+                    (use64 ? bus->channelBuffers64 == nullptr : bus->channelBuffers32 == nullptr);
+                for (uint32_t c = 0; c < declared && numOut < kMaxProcChannels; c++, numOut++) {
+                    outPtrs[numOut] = !active || nullArr || c >= supplied ? nullptr
+                                      : use64 ? (void*)bus->channelBuffers64[c]
+                                              : (void*)bus->channelBuffers32[c];
+                }
             }
         }
 
         /* Deactivated buses: the plug-in negotiated fixed widths
          * (cur_in / cur_out) and its flat AudioBuffer indexes every
-         * channel, but a deactivated bus reaches process() three ways -
-         * present with null per-channel pointers, present with a null
-         * channelBuffers array (both normalized to null pointers by the
-         * gather above), or a trailing bus whose AudioBusBuffers the host
-         * dropped entirely (numInputs short of the bus count). Either way
+         * channel. The activation mask above suppresses a disabled bus even
+         * if the host supplied storage; shipping hosts may also present null
+         * per-channel pointers, a null channelBuffers array, or omit inactive
+         * trailing AudioBusBuffers entirely. Every shape is normalized to
+         * null pointers by the gather above. Either way
          * the missing channels must read as
          * shared read-only silence (inputs) or absorb writes into
          * per-channel discard scratch (outputs), never arrive as a null
