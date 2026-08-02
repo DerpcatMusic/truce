@@ -14,6 +14,7 @@ use truce_core::editor::{
 };
 use truce_params::Params;
 
+use crate::lifecycle::EditorLifecycle;
 use crate::platform::ParentWindow;
 #[cfg(target_os = "windows")]
 use crate::render_thread::{FramePacket, RenderThread};
@@ -34,6 +35,10 @@ pub trait EditorUi<P: Params + ?Sized>: Send {
     /// Plugin state was restored (preset recall, undo, session load).
     /// Re-read any cached custom state. Parameter values update automatically.
     fn state_changed(&mut self, _state: &PluginContext<P>) {}
+
+    /// The native editor window has closed. Framework-owned dialogs and host
+    /// parameter gestures have already been terminated before this callback.
+    fn closed(&mut self) {}
 }
 
 impl<P: Params + ?Sized, F: FnMut(&mut egui::Ui, &PluginContext<P>) + Send> EditorUi<P> for F {
@@ -69,6 +74,10 @@ impl<P: Params + ?Sized> EditorUi<P> for WithStateChanged<P> {
 
     fn state_changed(&mut self, state: &PluginContext<P>) {
         (self.on_changed)(state);
+    }
+
+    fn closed(&mut self) {
+        self.inner.closed();
     }
 }
 
@@ -142,6 +151,8 @@ pub struct EguiEditor<P: Params + ?Sized> {
     host_scale_set: bool,
     /// Active baseview window handle - exists only while editor is open.
     window: Option<baseview::WindowHandle>,
+    /// Per-open close gate and framework-owned platform resource cleanup.
+    lifecycle: Option<EditorLifecycle>,
     /// Typed editor context stored at `open()` for `state_changed` forwarding.
     context: Option<PluginContext<P>>,
 }
@@ -176,6 +187,7 @@ impl<P: Params + 'static> EguiEditor<P> {
             use_system_scale: false,
             host_scale_set: false,
             window: None,
+            lifecycle: None,
             context: None,
             can_resize: false,
             can_maximize: false,
@@ -199,6 +211,7 @@ impl<P: Params + 'static> EguiEditor<P> {
             use_system_scale: false,
             host_scale_set: false,
             window: None,
+            lifecycle: None,
             context: None,
             can_resize: false,
             can_maximize: false,
@@ -369,6 +382,7 @@ const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(300)
 struct EguiWindowHandler<P: Params + ?Sized> {
     ui: Arc<Mutex<Box<dyn EditorUi<P>>>>,
     context: PluginContext<P>,
+    lifecycle: EditorLifecycle,
     egui_ctx: egui::Context,
     /// wgpu renderer, owned inline on the GUI thread. macOS / Linux
     /// only - their drivers don't exhibit the unbounded blocking that
@@ -385,6 +399,14 @@ struct EguiWindowHandler<P: Params + ?Sized> {
     #[cfg(target_os = "windows")]
     render_thread: Option<RenderThread>,
     pending_events: Vec<egui::Event>,
+    hovered_files: Vec<egui::HoveredFile>,
+    dropped_files: Vec<egui::DroppedFile>,
+    /// Keys whose initial down event was captured from the host. Ownership is
+    /// held through repeats and the matching key-up even if UI policy changes.
+    /// The fixed ceiling prevents a hostile event stream from growing editor
+    /// memory without bound.
+    held_captured_keys: Vec<HeldCapturedKey>,
+    focused: bool,
     modifiers: egui::Modifiers,
     start_time: std::time::Instant,
     size: (u32, u32),
@@ -487,7 +509,105 @@ struct EguiWindowHandler<P: Params + ?Sized> {
     last_resize_fitted: (u32, u32),
 }
 
+struct HeldCapturedKey {
+    code: keyboard_types::Code,
+    key: keyboard_types::Key,
+    location: keyboard_types::Location,
+    egui_key: Option<egui::Key>,
+    awaiting_release: bool,
+}
+
+impl HeldCapturedKey {
+    fn matches(&self, event: &keyboard_types::KeyboardEvent) -> bool {
+        if self.code == keyboard_types::Code::Unidentified
+            || event.code == keyboard_types::Code::Unidentified
+        {
+            self.code == event.code && self.key == event.key && self.location == event.location
+        } else {
+            self.code == event.code
+        }
+    }
+}
+
 impl<P: Params + ?Sized> EguiWindowHandler<P> {
+    const MAX_HELD_CAPTURED_KEYS: usize = 32;
+
+    fn captures_key_event(&mut self, event: &keyboard_types::KeyboardEvent) -> bool {
+        use keyboard_types::KeyState;
+
+        match event.state {
+            KeyState::Down => {
+                if let Some(index) = self
+                    .held_captured_keys
+                    .iter()
+                    .position(|held| held.matches(event))
+                {
+                    if self.held_captured_keys[index].awaiting_release {
+                        // Focus loss ended the old physical hold. A new down
+                        // for that identity begins a new ownership decision;
+                        // do not let a missing OS release poison future
+                        // presses.
+                        self.held_captured_keys.swap_remove(index);
+                    } else {
+                        // An identified code is a physical identity. For
+                        // `Unidentified`, only the backend's repeat bit proves
+                        // this is the same hold: two distinct unknown keys may
+                        // legitimately have the same logical key + location,
+                        // so retain one ownership entry per initial down.
+                        if event.code != keyboard_types::Code::Unidentified || event.repeat {
+                            return true;
+                        }
+                    }
+                }
+                if event.repeat {
+                    return false;
+                }
+                let capture = crate::input::captures(&self.egui_ctx, &event.key);
+                if capture && self.held_captured_keys.len() < Self::MAX_HELD_CAPTURED_KEYS {
+                    self.held_captured_keys.push(HeldCapturedKey {
+                        code: event.code,
+                        key: event.key.clone(),
+                        location: event.location,
+                        egui_key: convert_key(&event.key),
+                        awaiting_release: false,
+                    });
+                    true
+                } else {
+                    false
+                }
+            }
+            KeyState::Up => {
+                let Some(index) = self
+                    .held_captured_keys
+                    .iter()
+                    .position(|held| held.matches(event))
+                else {
+                    return false;
+                };
+                self.held_captured_keys.swap_remove(index);
+                true
+            }
+        }
+    }
+
+    fn release_captured_keys_for_focus_loss(&mut self) {
+        for held in &mut self.held_captured_keys {
+            if held.awaiting_release {
+                continue;
+            }
+            if let Some(key) = held.egui_key {
+                self.pending_events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: self.modifiers,
+                });
+            }
+            held.awaiting_release = true;
+        }
+    }
+
     /// Rebuild the wgpu renderer and recreate the `egui::Context` after a
     /// device loss. The new renderer starts with an empty texture map, so the
     /// context must be recreated to re-emit the font atlas on the next frame.
@@ -516,6 +636,7 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
         if let Some(font_data) = self.font {
             crate::font::apply_font(&egui_ctx, font_data);
         }
+        self.lifecycle.install(&egui_ctx);
         self.egui_ctx = egui_ctx;
         self.device_lost = device_lost;
     }
@@ -709,7 +830,9 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
             time: Some(self.start_time.elapsed().as_secs_f64()),
             modifiers: self.modifiers,
             events: std::mem::take(&mut self.pending_events),
-            focused: true,
+            hovered_files: self.hovered_files.clone(),
+            dropped_files: std::mem::take(&mut self.dropped_files),
+            focused: self.focused,
             ..Default::default()
         };
         raw_input
@@ -778,6 +901,7 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
         let scale_moved = self.scale.get_f32() != self.last_applied_scale;
         self.force_paint
             || !self.pending_events.is_empty()
+            || !self.dropped_files.is_empty()
             || params_moved
             || scale_moved
             || self.egui_ctx.has_requested_repaint()
@@ -789,6 +913,9 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
 
 impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
     fn on_frame(&mut self, window: &mut Window) {
+        if self.lifecycle.is_closing() {
+            return;
+        }
         // Catch panics at the FFI boundary: baseview drives this from an
         // `extern "system"` window proc (Windows) / AppKit callback
         // (macOS), so an unwinding panic - e.g. wgpu validation tripping
@@ -985,6 +1112,9 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
     // renaming.
     #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
     fn on_event(&mut self, _window: &mut Window, event: Event) -> EventStatus {
+        if self.lifecycle.is_closing() {
+            return EventStatus::Ignored;
+        }
         // Catch panics at the FFI boundary, like `on_frame` above: a panic
         // in egui input handling would otherwise unwind through baseview's
         // `extern "system"` window proc and abort the host. On panic we
@@ -994,7 +1124,7 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                 Event::Mouse(mouse) => {
                     use baseview::MouseEvent::{
                         ButtonPressed, ButtonReleased, CursorEntered, CursorLeft, CursorMoved,
-                        WheelScrolled,
+                        DragDropped, DragEntered, DragLeft, DragMoved, WheelScrolled,
                     };
                     // The explicit `CursorEntered => Ignored` arm signals the
                     // event was considered and intentionally ignored (vs.
@@ -1072,7 +1202,51 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                             self.pending_events.push(egui::Event::PointerGone);
                             EventStatus::Captured
                         }
-                        _ => EventStatus::Ignored,
+                        DragEntered {
+                            position,
+                            modifiers,
+                            data,
+                        }
+                        | DragMoved {
+                            position,
+                            modifiers,
+                            data,
+                        } => {
+                            self.modifiers = convert_kb_modifiers(modifiers);
+                            #[allow(clippy::cast_possible_truncation)]
+                            let pos = egui::pos2(position.x as f32, position.y as f32);
+                            self.last_cursor_pos = pos;
+                            self.pending_events.push(egui::Event::PointerMoved(pos));
+                            self.hovered_files = hovered_files(&data);
+                            if self.hovered_files.is_empty() {
+                                EventStatus::Ignored
+                            } else {
+                                EventStatus::AcceptDrop(baseview::DropEffect::Copy)
+                            }
+                        }
+                        DragLeft => {
+                            self.hovered_files.clear();
+                            self.pending_events.push(egui::Event::PointerGone);
+                            EventStatus::Ignored
+                        }
+                        DragDropped {
+                            position,
+                            modifiers,
+                            data,
+                        } => {
+                            self.modifiers = convert_kb_modifiers(modifiers);
+                            #[allow(clippy::cast_possible_truncation)]
+                            let pos = egui::pos2(position.x as f32, position.y as f32);
+                            self.last_cursor_pos = pos;
+                            self.pending_events.push(egui::Event::PointerMoved(pos));
+                            self.hovered_files.clear();
+                            self.dropped_files = dropped_files(data);
+                            if self.dropped_files.is_empty() {
+                                EventStatus::Ignored
+                            } else {
+                                EventStatus::AcceptDrop(baseview::DropEffect::Copy)
+                            }
+                        }
                     }
                 }
                 Event::Keyboard(kb) => {
@@ -1106,9 +1280,30 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                         });
                     }
 
-                    EventStatus::Captured
+                    if self.captures_key_event(&kb) {
+                        EventStatus::Captured
+                    } else {
+                        EventStatus::Ignored
+                    }
                 }
                 Event::Window(win) => {
+                    match &win {
+                        baseview::WindowEvent::Focused => {
+                            self.focused = true;
+                            self.force_paint = true;
+                        }
+                        baseview::WindowEvent::Unfocused => {
+                            self.focused = false;
+                            self.release_captured_keys_for_focus_loss();
+                            self.lifecycle.end_gestures();
+                            self.force_paint = true;
+                        }
+                        baseview::WindowEvent::WillClose => {
+                            self.lifecycle.close();
+                            return EventStatus::Ignored;
+                        }
+                        baseview::WindowEvent::Resized(_) => {}
+                    }
                     if let baseview::WindowEvent::Resized(info) = win {
                         // In host-driven (plug-in) mode the host's reported
                         // scale is authoritative; baseview's echoed
@@ -1246,6 +1441,12 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
     }
 }
 
+impl<P: Params + ?Sized> Drop for EguiWindowHandler<P> {
+    fn drop(&mut self) {
+        self.lifecycle.close();
+    }
+}
+
 // Event conversion helpers
 
 fn convert_mouse_button(btn: baseview::MouseButton) -> Option<egui::PointerButton> {
@@ -1262,6 +1463,33 @@ fn convert_mouse_button(btn: baseview::MouseButton) -> Option<egui::PointerButto
         baseview::MouseButton::Back => Some(egui::PointerButton::Extra1),
         baseview::MouseButton::Forward => Some(egui::PointerButton::Extra2),
         baseview::MouseButton::Other(_) => None,
+    }
+}
+
+fn hovered_files(data: &baseview::DropData) -> Vec<egui::HoveredFile> {
+    match data {
+        baseview::DropData::Files(paths) => paths
+            .iter()
+            .cloned()
+            .map(|path| egui::HoveredFile {
+                path: Some(path),
+                ..Default::default()
+            })
+            .collect(),
+        baseview::DropData::None => Vec::new(),
+    }
+}
+
+fn dropped_files(data: baseview::DropData) -> Vec<egui::DroppedFile> {
+    match data {
+        baseview::DropData::Files(paths) => paths
+            .into_iter()
+            .map(|path| egui::DroppedFile {
+                path: Some(path),
+                ..Default::default()
+            })
+            .collect(),
+        baseview::DropData::None => Vec::new(),
     }
 }
 
@@ -1360,17 +1588,47 @@ fn convert_key(key: &keyboard_types::Key) -> Option<egui::Key> {
 
 // Editor trait implementation
 
+impl<P: Params + ?Sized> EguiEditor<P> {
+    fn close_window(&mut self) {
+        let Some(lifecycle) = self.lifecycle.take() else {
+            return;
+        };
+
+        // Gate the handler first. Platform resources are then cancelled by
+        // framework-owned state, before either the native close/join or the
+        // fallible plugin callback can run.
+        lifecycle.close();
+        if let Some(mut window) = self.window.take() {
+            window.close();
+        }
+        self.context = None;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.ui
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closed();
+        }));
+        if result.is_err() {
+            log::error!("egui EditorUi::closed panic swallowed");
+        }
+    }
+}
+
 impl<P: Params + 'static> Editor for EguiEditor<P> {
     fn size(&self) -> (u32, u32) {
         self.size
     }
 
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
+        self.close_window();
+        let lifecycle = EditorLifecycle::new(&context);
         // Re-type the dyn-erased context to `PluginContext<P>` using
         // the Arc<P> we stored at construction.
         let typed_ctx = context.with_params(self.params.clone());
         self.context = Some(typed_ctx.clone());
         let egui_ctx = egui::Context::default();
+        lifecycle.install(&egui_ctx);
         let visuals = self.visuals.clone().unwrap_or_else(crate::theme::dark);
         egui_ctx.set_visuals(visuals.clone());
         let font = self.font;
@@ -1464,6 +1722,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
         // can recreate the `egui::Context` (which forces the font-atlas texture
         // to be re-uploaded to the fresh renderer).
         let handler_visuals = visuals.clone();
+        let handler_lifecycle = lifecycle.clone();
 
         let window = baseview::Window::open_parented(
             &parent_wrapper,
@@ -1504,12 +1763,19 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
                 EguiWindowHandler::<P> {
                     ui,
                     context: handler_ctx,
+                    lifecycle: handler_lifecycle,
                     egui_ctx,
                     #[cfg(not(target_os = "windows"))]
                     renderer,
                     #[cfg(target_os = "windows")]
                     render_thread,
                     pending_events: Vec::new(),
+                    hovered_files: Vec::new(),
+                    dropped_files: Vec::new(),
+                    held_captured_keys: Vec::with_capacity(
+                        EguiWindowHandler::<P>::MAX_HELD_CAPTURED_KEYS,
+                    ),
+                    focused: true,
                     modifiers: egui::Modifiers::NONE,
                     start_time: std::time::Instant::now(),
                     size,
@@ -1542,12 +1808,11 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
         );
 
         self.window = Some(window);
+        self.lifecycle = Some(lifecycle);
     }
 
     fn close(&mut self) {
-        if let Some(mut window) = self.window.take() {
-            window.close();
-        }
+        self.close_window();
     }
 
     fn idle(&mut self) {
@@ -1656,12 +1921,9 @@ impl<P: Params + ?Sized> Drop for EguiEditor<P> {
         // `Editor::close` leaves the timer firing `on_frame`. Unlike the
         // cpu/iced raw-pointer handlers this can't use-after-free (the
         // handler holds owned `Arc`/`EditorScale` clones), but it keeps
-        // rendering into a torn-down surface. Mirror `close`'s window
-        // teardown here; idempotent via `self.window.take()`. (Inlined
-        // rather than calling `Editor::close` because that impl requires
-        // `P: Sized` while this `Drop` must match the struct's `?Sized`.)
-        if let Some(mut window) = self.window.take() {
-            window.close();
-        }
+        // rendering into a torn-down surface. Use the same close-once path as
+        // `Editor::close`, including framework-owned platform cleanup and the
+        // one `EditorUi::closed` notification.
+        self.close_window();
     }
 }
