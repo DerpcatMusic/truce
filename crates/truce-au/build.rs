@@ -89,6 +89,7 @@ fn main() {
             "TRUCE_AU_FIXED_CONTAINER_NAME",
             fixed_container_name.as_str(),
         );
+        build.flag("-fblocks");
     }
 
     build.compile("au_shim");

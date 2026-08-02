@@ -452,6 +452,7 @@ struct StreamSlot {
     /// Pre-allocated buffer for this slot's in-progress message.
     /// Sized at construction; never grows on the audio thread.
     buffer: Vec<u8>,
+    route_family: u32,
     group: u8,
     stream_id: u8,
     /// `true` between `Start` and `End`; `false` when the slot
@@ -471,9 +472,9 @@ struct StreamSlot {
 /// Stateful reassembler for UMP `SysEx` streams.
 ///
 /// Maintains [`SYSEX_ASSEMBLER_SLOTS`] independent buffers, each
-/// keyed by `(group, stream_id)`, so hosts that interleave
-/// `SysEx` traffic across UMP groups (or across `SysEx`-8 streams
-/// within one group) don't see corrupt concatenations.
+/// keyed by `(route, family, group, stream_id)`, so hosts that interleave
+/// `SysEx` traffic across ports, UMP families, groups, or `SysEx`-8 streams
+/// don't see corrupt concatenations.
 ///
 /// Each slot's buffer is bounded by the per-slot capacity passed
 /// to [`Self::with_capacity`]; pushing past it returns
@@ -502,6 +503,7 @@ impl SysExAssembler {
         // allocates its own `Vec::with_capacity(capacity)`.
         let slots = std::array::from_fn(|_| StreamSlot {
             buffer: Vec::with_capacity(capacity),
+            route_family: 0,
             group: 0,
             stream_id: 0,
             in_progress: false,
@@ -528,20 +530,23 @@ impl SysExAssembler {
         self.touch_counter = 0;
     }
 
-    /// Find the slot currently servicing `(group, stream_id)`, or
+    /// Find the slot currently servicing `(route_family, group, stream_id)`, or
     /// `None` if no slot matches. Returns the slot index.
-    fn find_slot(&self, group: u8, stream_id: u8) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|s| s.in_use && s.group == group && s.stream_id == stream_id)
+    fn find_slot(&self, route_family: u32, group: u8, stream_id: u8) -> Option<usize> {
+        self.slots.iter().position(|s| {
+            s.in_use
+                && s.route_family == route_family
+                && s.group == group
+                && s.stream_id == stream_id
+        })
     }
 
-    /// Claim a slot for `(group, stream_id)` - preferring an empty
+    /// Claim a slot for `(route_family, group, stream_id)` - preferring an empty
     /// one, falling back to LRU eviction. Eviction drops the
     /// victim's in-progress message (we have no way to surface
     /// the loss back to the host other than the eventual missing
     /// final message).
-    fn claim_slot(&mut self, group: u8, stream_id: u8) -> usize {
+    fn claim_slot(&mut self, route_family: u32, group: u8, stream_id: u8) -> usize {
         // Pick: empty slot if any; otherwise the least-recently-
         // touched one. `unwrap` on the LRU fallback is safe because
         // the slot table is fixed-size and non-empty by construction.
@@ -559,6 +564,7 @@ impl SysExAssembler {
             });
         let slot = &mut self.slots[idx];
         slot.buffer.clear();
+        slot.route_family = route_family;
         slot.group = group;
         slot.stream_id = stream_id;
         slot.in_use = true;
@@ -571,6 +577,13 @@ impl SysExAssembler {
     /// (the format reserves no slot for it).
     #[allow(clippy::cast_possible_truncation)] // UMP bit-packing
     pub fn push_sysex7_packet(&mut self, words: [u32; 2]) -> SysExFeed<'_> {
+        self.push_sysex7_packet_on_route(0, words)
+    }
+
+    /// Route-aware form of [`Self::push_sysex7_packet`]. `route` keeps
+    /// independent host ports from sharing one in-progress stream.
+    #[allow(clippy::cast_possible_truncation)] // UMP bit-packing
+    pub fn push_sysex7_packet_on_route(&mut self, route: u16, words: [u32; 2]) -> SysExFeed<'_> {
         let w0 = words[0];
         let w1 = words[1];
         let mt = ((w0 >> 28) & 0xF) as u8;
@@ -593,7 +606,7 @@ impl SysExAssembler {
             ((w1 >> 8) & 0xFF) as u8,
             (w1 & 0xFF) as u8,
         ];
-        self.feed_payload(group, 0, status, &raw[..n as usize])
+        self.feed_payload(u32::from(route) << 1, group, 0, status, &raw[..n as usize])
     }
 
     /// Feed one `SysEx`-8 UMP (all four words). Group at word 0
@@ -602,6 +615,13 @@ impl SysExAssembler {
     /// hosts can interleave concurrent `SysEx` payloads).
     #[allow(clippy::cast_possible_truncation)] // UMP bit-packing
     pub fn push_sysex8_packet(&mut self, words: [u32; 4]) -> SysExFeed<'_> {
+        self.push_sysex8_packet_on_route(0, words)
+    }
+
+    /// Route-aware form of [`Self::push_sysex8_packet`]. `route` keeps
+    /// independent host ports from sharing one in-progress stream.
+    #[allow(clippy::cast_possible_truncation)] // UMP bit-packing
+    pub fn push_sysex8_packet_on_route(&mut self, route: u16, words: [u32; 4]) -> SysExFeed<'_> {
         let w0 = words[0];
         let mt = ((w0 >> 28) & 0xF) as u8;
         if mt != MT_SYSEX_8 {
@@ -637,11 +657,18 @@ impl SysExAssembler {
             ((words[3] >> 8) & 0xFF) as u8,
             (words[3] & 0xFF) as u8,
         ];
-        self.feed_payload(group, stream_id, status, &raw[..data_len])
+        self.feed_payload(
+            (u32::from(route) << 1) | 1,
+            group,
+            stream_id,
+            status,
+            &raw[..data_len],
+        )
     }
 
     fn feed_payload(
         &mut self,
+        route_family: u32,
         group: u8,
         stream_id: u8,
         status: u8,
@@ -657,9 +684,9 @@ impl SysExAssembler {
                 // evict it. Reuse any existing slot for this
                 // (group, stream_id) (in case the previous stream
                 // for this pair leaked an in-progress state).
-                let idx = match self.find_slot(group, stream_id) {
+                let idx = match self.find_slot(route_family, group, stream_id) {
                     Some(i) => i,
-                    None => self.claim_slot(group, stream_id),
+                    None => self.claim_slot(route_family, group, stream_id),
                 };
                 let slot = &mut self.slots[idx];
                 slot.buffer.clear();
@@ -684,9 +711,9 @@ impl SysExAssembler {
                 })
             }
             SYSEX_STATUS_START => {
-                let idx = match self.find_slot(group, stream_id) {
+                let idx = match self.find_slot(route_family, group, stream_id) {
                     Some(i) => i,
-                    None => self.claim_slot(group, stream_id),
+                    None => self.claim_slot(route_family, group, stream_id),
                 };
                 let slot = &mut self.slots[idx];
                 slot.buffer.clear();
@@ -702,7 +729,7 @@ impl SysExAssembler {
                 SysExFeed::Buffered
             }
             SYSEX_STATUS_CONTINUE | SYSEX_STATUS_END => {
-                let Some(idx) = self.find_slot(group, stream_id) else {
+                let Some(idx) = self.find_slot(route_family, group, stream_id) else {
                     // Out-of-band continuation - drop.
                     return SysExFeed::Invalid;
                 };

@@ -48,6 +48,14 @@ void truce_vst2_register(
  * Per-instance state
  * --------------------------------------------------------------------------- */
 
+#define TRUCE_VST2_MAX_OUTPUT_EVENTS 512u
+
+typedef struct {
+    int32_t numEvents;
+    VstIntPtr reserved;
+    VstEvent* events[TRUCE_VST2_MAX_OUTPUT_EVENTS];
+} TruceVst2OutputEvents;
+
 typedef struct {
     AEffect effect;             /* MUST be first - host casts pointer */
     void* rust_ctx;
@@ -64,6 +72,13 @@ typedef struct {
      * effClose - otherwise every save/preset query leaks a multi-KB blob. */
     uint8_t* saved_chunk;
     uint32_t saved_chunk_len;
+    /* Fixed output staging allocated with the instance, never on the audio
+     * thread stack. The core lane can hold 256 typed plus 256 exact events. */
+    VstMidiEvent midi_out[TRUCE_VST2_MAX_OUTPUT_EVENTS];
+    VstMidiSysExEvent sysex_out[TRUCE_VST2_MAX_OUTPUT_EVENTS];
+    TruceVst2OutputEvents output_events;
+    int32_t output_param_indices[TRUCE_VST2_MAX_OUTPUT_EVENTS];
+    float output_param_values[TRUCE_VST2_MAX_OUTPUT_EVENTS];
     /* Scratch for SysEx output: every `EventBody::SysEx` the plugin
      * emits gets framed (0xF0 + inner + 0xF7) into this buffer
      * before the `VstMidiSysExEvent::sysexDump` pointer is handed
@@ -72,8 +87,8 @@ typedef struct {
      * convention; truce's internal `EventBody::SysEx` stores inner
      * bytes only, so this is the wire-adaptation site. Sized to
      * match truce_core::SYSEX_POOL_PREALLOC (128 KiB) + 2 framing
-     * bytes per event × up to 256 events. */
-    uint8_t sysex_out_scratch[128 * 1024 + 512];
+     * bytes per event × up to 512 events. */
+    uint8_t sysex_out_scratch[128 * 1024 + 1024];
     uint32_t sysex_out_used;
 } TruceVst2;
 
@@ -598,8 +613,9 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
         processLevel = (int32_t)inst->master(
             e, audioMasterGetCurrentProcessLevel, 0, 0, NULL, 0.0f);
 
+    uint32_t process_ok = 0;
     if (use64)
-        g_vst2_callbacks->process_f64(
+        process_ok = g_vst2_callbacks->process_f64(
             inst->rust_ctx,
             (const double**)inputs, (double**)outputs,
             numIn, numOut,
@@ -607,7 +623,7 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
             inst->midi_buf, inst->midi_count,
             processLevel);
     else
-        g_vst2_callbacks->process(
+        process_ok = g_vst2_callbacks->process(
             inst->rust_ctx,
             (const float**)inputs, (float**)outputs,
             numIn, numOut,
@@ -616,6 +632,13 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
             processLevel);
 
     inst->midi_count = 0;
+
+    if (!process_ok) {
+        if (g_vst2_callbacks->finish_output_events)
+            g_vst2_callbacks->finish_output_events(
+                inst->rust_ctx, TRUCE_VST2_OUTPUT_INVALID);
+        return;
+    }
 
     /* Best-effort dynamic latency: the Rust process above refreshed the
      * plugin's latency cache, so re-read it and, on a change, update
@@ -630,96 +653,141 @@ static void processAnyReplacing(AEffect* e, void** inputs, void** outputs,
         }
     }
 
-    /* Drain plugin → host MIDI. The Rust side has already filtered
-     * the queue down to events that fit in 3-byte MIDI 1.0 packets;
-     * we rebuild a `VstEvents` block in stack-local storage and call
-     * `audioMasterProcessEvents`. Cap matches the input direction so
-     * we can't get a runaway event count past the host's expected
-     * per-block budget. */
-    if (inst->master) {
-        uint32_t midi_count = g_vst2_callbacks->output_event_count(inst->rust_ctx);
-        uint32_t sx_count = g_vst2_callbacks->output_sysex_count
-            ? g_vst2_callbacks->output_sysex_count(inst->rust_ctx)
-            : 0;
-        if (midi_count > 256) midi_count = 256;
-        if (sx_count > 256) sx_count = 256;
-        uint32_t total = midi_count + sx_count;
-        if (total > 0) {
-            VstMidiEvent midis[256];
-            VstMidiSysExEvent sxs[256];
-            /* `VstEvents` declares `events[2]` for alignment; for N
-             * events, lay out `numEvents`, `reserved`, then a
-             * trailing `VstEvent*[N]`. Use `offsetof(VstEvents,
-             * events)` rather than summing field sizes: on LP64 the
-             * compiler pads `numEvents` out to `reserved`'s 8-byte
-             * alignment, so the pointer array starts at offset 16,
-             * not the 12 a naive `sizeof(int32_t)+sizeof(VstIntPtr)`
-             * would give. The storage buffer is sized for
-             * `midi_count + sx_count` so pointer arithmetic stays
-             * in-bounds. */
-            char vstEvents_storage[offsetof(VstEvents, events)
-                                   + 512 * sizeof(VstEvent*)];
-            VstEvents* vstEvents = (VstEvents*)vstEvents_storage;
-            vstEvents->reserved = 0;
-            VstEvent** events_array = (VstEvent**)((char*)vstEvents
-                                                   + offsetof(VstEvents, events));
-            /* Slots fill compactly; a skipped SysEx must not leave a
-             * counted-but-uninitialized pointer for the host to walk. */
-            uint32_t emitted = 0;
-            for (uint32_t i = 0; i < midi_count; i++) {
-                Vst2MidiEventCompact pkt = {0};
-                g_vst2_callbacks->output_event_at(inst->rust_ctx, i, &pkt);
-                VstMidiEvent* m = &midis[i];
-                memset(m, 0, sizeof(*m));
-                m->type = kVstMidiType;
-                m->byteSize = (int32_t)sizeof(VstMidiEvent);
-                m->deltaFrames = (int32_t)pkt.delta_frames;
-                m->midiData[0] = (char)pkt.status;
-                m->midiData[1] = (char)pkt.data1;
-                m->midiData[2] = (char)pkt.data2;
-                m->midiData[3] = 0;
-                events_array[emitted++] = (VstEvent*)m;
+    /* Drain one globally ordered, preflighted MIDI/SysEx lane. Known
+     * Invalid/Unsupported blocks emit nothing; a present host can still
+     * reject the complete batch, which VST2 cannot roll back. */
+    if (g_vst2_callbacks->begin_output_events
+            && g_vst2_callbacks->next_output_event
+            && g_vst2_callbacks->finish_output_events) {
+        uint32_t status = TRUCE_VST2_OUTPUT_END;
+        uint32_t emitted = 0;
+        uint32_t midi_used = 0;
+        uint32_t sysex_used = 0;
+        uint32_t param_used = 0;
+        inst->sysex_out_used = 0;
+        inst->output_events.reserved = 0;
+        g_vst2_callbacks->begin_output_events(
+            inst->rust_ctx, (uint32_t)sampleFrames,
+            inst->master && g_vst2_callbacks->next_output_param ? 1u : 0u);
+
+        for (;;) {
+            Vst2OutputEvent out = {0};
+            uint32_t next = g_vst2_callbacks->next_output_event(inst->rust_ctx, &out);
+            if (next == TRUCE_VST2_OUTPUT_END)
+                break;
+            if (next != TRUCE_VST2_OUTPUT_EMITTED) {
+                status = next;
+                break;
             }
-            inst->sysex_out_used = 0;
-            for (uint32_t i = 0; i < sx_count; i++) {
-                uint32_t delta = 0;
-                const uint8_t* bytes = NULL;
-                uint32_t len = 0;
-                g_vst2_callbacks->output_sysex_at(inst->rust_ctx, i,
-                                                  &delta, &bytes, &len);
-                /* Frame the inner bytes (0xF0 + inner + 0xF7) into
-                 * the per-block scratch. Real-world VST2 hosts
-                 * expect framed SysEx per the Steinberg vendor
-                 * extension; truce's pool stores inner bytes only.
-                 * Skip the event if the scratch is exhausted -
-                 * truncating SysEx is never the right answer. */
-                uint32_t framed_len = len + 2;
-                if (inst->sysex_out_used + framed_len > sizeof(inst->sysex_out_scratch)) {
-                    continue;
+            if (emitted >= TRUCE_VST2_MAX_OUTPUT_EVENTS) {
+                status = TRUCE_VST2_OUTPUT_QUEUE_FULL;
+                break;
+            }
+            if (out.kind == TRUCE_VST2_OUTPUT_MIDI1) {
+                if (out.data_len == 0 || out.data_len > 3
+                        || midi_used >= TRUCE_VST2_MAX_OUTPUT_EVENTS) {
+                    status = TRUCE_VST2_OUTPUT_INVALID;
+                    break;
+                }
+                VstMidiEvent* midi = &inst->midi_out[midi_used++];
+                memset(midi, 0, sizeof(*midi));
+                midi->type = kVstMidiType;
+                midi->byteSize = (int32_t)sizeof(VstMidiEvent);
+                midi->deltaFrames = (int32_t)out.delta_frames;
+                midi->midiData[0] = (char)out.midi[0];
+                midi->midiData[1] = (char)out.midi[1];
+                midi->midiData[2] = (char)out.midi[2];
+                inst->output_events.events[emitted++] = (VstEvent*)midi;
+                continue;
+            }
+
+            if (out.kind == TRUCE_VST2_OUTPUT_SYSEX) {
+                if ((out.data_len != 0 && !out.sysex)
+                        || out.data_len > UINT32_MAX - 2u
+                        || sysex_used >= TRUCE_VST2_MAX_OUTPUT_EVENTS) {
+                    status = TRUCE_VST2_OUTPUT_INVALID;
+                    break;
+                }
+                uint32_t framed_len = out.data_len + 2u;
+                if (framed_len > sizeof(inst->sysex_out_scratch)
+                        - inst->sysex_out_used) {
+                    status = TRUCE_VST2_OUTPUT_QUEUE_FULL;
+                    break;
                 }
                 uint8_t* dst = inst->sysex_out_scratch + inst->sysex_out_used;
                 dst[0] = 0xF0;
-                if (bytes && len > 0) memcpy(dst + 1, bytes, len);
-                dst[1 + len] = 0xF7;
+                if (out.data_len > 0)
+                    memcpy(dst + 1, out.sysex, out.data_len);
+                dst[1 + out.data_len] = 0xF7;
                 inst->sysex_out_used += framed_len;
 
-                VstMidiSysExEvent* sx = &sxs[i];
+                VstMidiSysExEvent* sx = &inst->sysex_out[sysex_used++];
                 memset(sx, 0, sizeof(*sx));
                 sx->type = kVstSysExType;
                 sx->byteSize = (int32_t)sizeof(VstMidiSysExEvent);
-                sx->deltaFrames = (int32_t)delta;
+                sx->deltaFrames = (int32_t)out.delta_frames;
                 sx->dumpBytes = (int32_t)framed_len;
-                /* Cast through `uintptr_t` strips `const`; the SDK
-                 * declares the field non-const because legacy hosts
-                 * could edit in place, but our scratch is logically
-                 * read-only from the host's perspective. */
                 sx->sysexDump = (char*)(uintptr_t)dst;
-                events_array[emitted++] = (VstEvent*)sx;
+                inst->output_events.events[emitted++] = (VstEvent*)sx;
+                continue;
             }
-            vstEvents->numEvents = (int32_t)emitted;
-            if (emitted > 0)
-                inst->master(e, audioMasterProcessEvents, 0, 0, vstEvents, 0.0f);
+
+            status = TRUCE_VST2_OUTPUT_INVALID;
+            break;
         }
+
+        /* Stage and validate every parameter descriptor before the first host
+         * callback. Rust already validated timestamps, values, and IDs against
+         * the plugin table; this pass proves the C descriptor mapping too. */
+        if (status == TRUCE_VST2_OUTPUT_END
+                && g_vst2_callbacks->next_output_param) {
+            for (;;) {
+                uint32_t param_id = 0;
+                float normalized = 0.0f;
+                uint32_t next = g_vst2_callbacks->next_output_param(
+                    inst->rust_ctx, &param_id, &normalized);
+                if (next == TRUCE_VST2_OUTPUT_END)
+                    break;
+                if (next != TRUCE_VST2_OUTPUT_EMITTED
+                        || param_used >= TRUCE_VST2_MAX_OUTPUT_EVENTS) {
+                    status = next == TRUCE_VST2_OUTPUT_EMITTED
+                        ? TRUCE_VST2_OUTPUT_QUEUE_FULL : next;
+                    break;
+                }
+                uint32_t i = 0;
+                while (i < g_vst2_num_params && g_vst2_params[i].id != param_id)
+                    i++;
+                if (i == g_vst2_num_params) {
+                    status = TRUCE_VST2_OUTPUT_INVALID;
+                    break;
+                }
+                inst->output_param_indices[param_used] = (int32_t)i;
+                inst->output_param_values[param_used] = normalized;
+                param_used++;
+            }
+        }
+
+        if (status == TRUCE_VST2_OUTPUT_END && param_used > 0) {
+            for (uint32_t i = 0; i < param_used; i++) {
+                inst->master(e, audioMasterAutomate,
+                             inst->output_param_indices[i], 0, NULL,
+                             inst->output_param_values[i]);
+            }
+            status = TRUCE_VST2_OUTPUT_EMITTED;
+        }
+
+        if ((status == TRUCE_VST2_OUTPUT_END
+                || status == TRUCE_VST2_OUTPUT_EMITTED) && emitted > 0) {
+            inst->output_events.numEvents = (int32_t)emitted;
+            /* VST2 hosts disagree on the return value: some return zero
+             * after consuming the complete batch. The callback has no
+             * reliable queue-rejection signal, so a completed invocation
+             * is the strongest truthful success boundary available. */
+            inst->master(e, audioMasterProcessEvents, 0, 0,
+                         &inst->output_events, 0.0f);
+            status = TRUCE_VST2_OUTPUT_EMITTED;
+        }
+        g_vst2_callbacks->finish_output_events(inst->rust_ctx, status);
     }
 }
 

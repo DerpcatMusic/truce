@@ -310,12 +310,30 @@ typedef struct {
 } Vst2MidiEventCompact;
 
 typedef struct {
+    uint32_t delta_frames;
+    uint32_t kind;
+    uint32_t data_len;
+    uint8_t midi[3];
+    uint8_t _pad;
+    const uint8_t* sysex;
+} Vst2OutputEvent;
+
+#define TRUCE_VST2_OUTPUT_END         0u
+#define TRUCE_VST2_OUTPUT_EMITTED     1u
+#define TRUCE_VST2_OUTPUT_UNSUPPORTED 2u
+#define TRUCE_VST2_OUTPUT_INVALID     3u
+#define TRUCE_VST2_OUTPUT_QUEUE_FULL  4u
+
+#define TRUCE_VST2_OUTPUT_MIDI1 1u
+#define TRUCE_VST2_OUTPUT_SYSEX 2u
+
+typedef struct {
     void* (*create)(void);
     void  (*destroy)(void* ctx);
     void  (*reset)(void* ctx, double sample_rate, uint32_t max_frames);
     /* `process_level` is the host's audioMasterGetCurrentProcessLevel
      * (kVstProcessLevelRealtime 2 / Prefetch 3 / Offline 4). */
-    void  (*process)(void* ctx,
+    uint32_t (*process)(void* ctx,
                      const float** inputs, float** outputs,
                      uint32_t num_input_channels, uint32_t num_output_channels,
                      uint32_t num_frames,
@@ -323,7 +341,7 @@ typedef struct {
                      int32_t process_level);
     /* 64-bit twin of process, called from processDoubleReplacing
      * (only wired when the descriptor sets supports_f64). */
-    void  (*process_f64)(void* ctx,
+    uint32_t (*process_f64)(void* ctx,
                          const double** inputs, double** outputs,
                          uint32_t num_input_channels, uint32_t num_output_channels,
                          uint32_t num_frames,
@@ -342,13 +360,14 @@ typedef struct {
     /* Parse host text-entry and apply it (effString2Parameter). Returns
      * 1 on success, 0 if the text isn't a valid value for the param. */
     int32_t (*param_parse)(void* ctx, uint32_t id, const char* text);
-    /* Plugin → host MIDI output. Mirror of the input event flow:
-     * the C shim calls `output_event_count` after each process(),
-     * then `output_event_at(idx)` to fill a 3-byte MIDI packet.
-     * Unsupported event types (MIDI 2.0, ParamChange, etc.) are
-     * filtered out on the Rust side so [0..count) maps cleanly. */
-    uint32_t (*output_event_count)(void* ctx);
-    void (*output_event_at)(void* ctx, uint32_t index, Vst2MidiEventCompact* out);
+    /* Plugin → host MIDI output. Rust preflights one globally ordered,
+     * lossless lane; the shim reports the host's final acceptance result. */
+    void (*begin_output_events)(void* ctx, uint32_t num_frames,
+                                uint32_t host_available);
+    uint32_t (*next_output_event)(void* ctx, Vst2OutputEvent* out);
+    uint32_t (*next_output_param)(void* ctx, uint32_t* out_id,
+                                  float* out_normalized);
+    void (*finish_output_events)(void* ctx, uint32_t status);
     /* SysEx input - shim calls once per kVstSysExType event in
      * effProcessEvents, AFTER the shim has stripped any leading
      * 0xF0 / trailing 0xF7 framing the host included. Rust always
@@ -356,17 +375,6 @@ typedef struct {
      * shim's problem. Valid only for the duration of this call. */
     void (*push_sysex_input)(void* ctx, uint32_t delta_frames,
                              const uint8_t* bytes, uint32_t len);
-    /* SysEx output - Rust returns inner bytes (no framing); the
-     * shim re-adds 0xF0 / 0xF7 before handing the bytes to the
-     * host via VstMidiSysExEvent. Bytes returned here point into
-     * the plug-in's EventList SysEx pool, valid until the next
-     * process() clears it (which is after the host has consumed
-     * the event). */
-    uint32_t (*output_sysex_count)(void* ctx);
-    void (*output_sysex_at)(void* ctx, uint32_t index,
-                            uint32_t* out_delta_frames,
-                            const uint8_t** out_bytes,
-                            uint32_t* out_len);
     void (*state_save)(void* ctx, uint8_t** out_data, uint32_t* out_len);
     /* Returns 1 when the blob was accepted (truce envelope, or the
      * plugin's migrate_state translated it), 0 when the load failed -

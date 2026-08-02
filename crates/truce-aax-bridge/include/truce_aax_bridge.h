@@ -40,8 +40,12 @@ extern "C" {
  *           display delegate's StringToValue to the plugin's parse_value.
  *   9 → 10: custom taper - truce_aax_normalize / truce_aax_denormalize
  *           route a skewed param's coefficient<->plain mapping through the
- *           plugin's ParamRange (AAX has no native skew taper). */
-#define TRUCE_AAX_ABI_VERSION 10u
+ *           plugin's ParamRange (AAX has no native skew taper).
+ *   10 → 11: one strict native MIDI 1.0 / SysEx event lane with explicit
+ *            loss status and a sequential output cursor.
+ *   11 → 12: completed output-event delivery status.
+ *   12 → 13: process-time audio-bus activation masks. */
+#define TRUCE_AAX_ABI_VERSION 13u
 
 /* Capacity of TruceAaxDescriptor::legacy_chunk_ids. */
 #define TRUCE_AAX_MAX_LEGACY_CHUNKS 8u
@@ -98,11 +102,10 @@ typedef struct {
     const int16_t* layout_in_channels;
     const int16_t* layout_out_channels;
     uint32_t num_layouts;
-    /* Total sidechain (non-main) input channel width from the first bus
-     * layout. > 0 makes the describe template register an AAX side-chain
-     * input port (AddSideChainIn) - Pro Tools side-chain is always mono,
-     * so RenderAudio duplicates that one channel across this width and
-     * appends it after the main input channels. 0 for no sidechain. */
+    /* First sidechain bus width from the default layout. > 0 makes the
+     * describe template register AAX's single side-chain input. Pro Tools
+     * supplies one mono source, duplicated across this bus's channels.
+     * Later declared sidechain buses remain unavailable. */
     uint32_t sidechain_in_channels;
 } TruceAaxDescriptor;
 
@@ -119,14 +122,34 @@ typedef struct {
     uint8_t _pad[7];            /* Match Rust-side trailing pad. */
 } TruceAaxParamInfo;
 
-/* MIDI event. */
+#define TRUCE_AAX_NATIVE_EVENT_MIDI1 1u
+#define TRUCE_AAX_NATIVE_EVENT_SYSEX 2u
+
+/* Bounded input storage shared by the C++ template and Rust EventList. */
+#define TRUCE_AAX_NATIVE_EVENT_CAP 256u
+#define TRUCE_AAX_SYSEX_POOL_CAP 131072u
+
+/* Sequential event-adapter statuses. END is also the successful block status. */
+#define TRUCE_AAX_EVENT_END 0u
+#define TRUCE_AAX_EVENT_EMITTED 1u
+#define TRUCE_AAX_EVENT_UNSUPPORTED 2u
+#define TRUCE_AAX_EVENT_INVALID 3u
+#define TRUCE_AAX_EVENT_QUEUE_FULL 4u
+
+/* One host-native AAX event. AAX exposes one MIDI stream, so port must be 0.
+ * MIDI1 uses exactly data_len bytes from midi (1..3). SysEx uses data_len
+ * bytes at sysex, without F0/F7 framing. The pointer is borrowed only for the
+ * synchronous process/output callback which receives it. */
 typedef struct {
-    uint32_t delta_frames;
-    uint8_t status;
-    uint8_t data1;
-    uint8_t data2;
+    uint32_t sample_offset;
+    uint16_t port;
+    uint8_t kind;
+    uint8_t reserved;
+    uint32_t data_len;
+    uint8_t midi[3];
     uint8_t _pad;
-} TruceAaxMidiEvent;
+    const uint8_t* sysex;
+} TruceAaxNativeEvent;
 
 /* Transport snapshot filled by the AAX template each render from
  * AAX_ITransport. Fields default to 0 / false when Pro Tools does not
@@ -191,51 +214,25 @@ void  truce_aax_set_render_mode(void* ctx, uint32_t mode);
  * changes to the host via AAX_IController::SetSignalLatency. */
 uint32_t truce_aax_latency(void* ctx);
 
-/* Audio processing. `transport` may be NULL when the template did not
- * manage to query AAX_ITransport for this block. */
-void truce_aax_process(void* ctx,
+/* Strict audio/event processing. `input_status` is END when the full host
+ * packet stream fit and validated; otherwise no partial event prefix is
+ * delivered to the plugin. The return value reports Rust-side validation or
+ * bounded-lane failure. `transport` may be NULL. */
+uint32_t truce_aax_process_native(void* ctx,
     const float** inputs, float** outputs,
     uint32_t num_input_channels, uint32_t num_output_channels,
+    uint32_t input_bus_active, uint32_t output_bus_active,
     uint32_t num_frames,
-    const TruceAaxMidiEvent* midi_events, uint32_t num_midi_events,
+    const TruceAaxNativeEvent* events, uint32_t num_events,
+    uint32_t input_status,
     const TruceAaxTransportSnapshot* transport);
 
-/* Drain plugin-emitted MIDI events from the most recent process() call.
- * Call _count first; iterate _at(0..count) to read each packet. The
- * C++ template forwards each to AAX_IMIDINode::PostMIDIPacket on the
- * LocalOutput node it registered in its hand-built component
- * descriptor. Only encodable events (NoteOn/Off, CC, channel/poly
- * pressure, pitch bend, program change) are surfaced - see
- * `try_encode_aax_midi` in truce-aax/src/lib.rs for the predicate. */
-uint32_t truce_aax_output_event_count(void* ctx);
-void     truce_aax_output_event_at(void* ctx, uint32_t index,
-                                    TruceAaxMidiEvent* out);
-
-/* SysEx input - the C++ template walks the host's AAX_CMidiStream
- * looking for `0xF0` start bytes and accumulates across consecutive
- * AAX_CMidiPackets until it hits `0xF7`. Once a complete message
- * is reassembled, it calls this once with the inner bytes (no
- * `0xF0`/`0xF7` framing). Pointer is valid for the duration of
- * the call; Rust copies into its `EventList` SysEx pool.
- *
- * Per the AAX SDK (`AAX.h:605-608`):
- *   "SysEx messages greater than 4 bytes in length can be
- *    transmitted via a series of concurrent AAX_CMidiPacket
- *    objects in mBuffer." */
-void     truce_aax_push_sysex_input(void* ctx, uint32_t delta_frames,
-                                     const uint8_t* bytes, uint32_t len);
-
-/* SysEx output - Rust reports the number of SysEx-shaped events the
- * plug-in queued during process(), and provides each event's inner
- * bytes. The C++ template fragments each event into a sequence of
- * ≤4-byte AAX_CMidiPackets framed with `0xF0` ... `0xF7` and posts
- * them via `PostMIDIPacket` on the LocalOutput node. Pointer is
- * valid until the next process() clears the pool. */
-uint32_t truce_aax_output_sysex_count(void* ctx);
-void     truce_aax_output_sysex_at(void* ctx, uint32_t index,
-                                    uint32_t* out_delta_frames,
-                                    const uint8_t** out_bytes,
-                                    uint32_t* out_len);
+/* One ordered output transaction. begin preflights the entire lossless lane;
+ * next returns one logical MIDI1/SysEx event at a time or an explicit error.
+ * An error is returned before any event when the block cannot round-trip. */
+void     truce_aax_begin_output_events(void* ctx, uint32_t num_frames);
+uint32_t truce_aax_next_output_event(void* ctx, TruceAaxNativeEvent* out);
+void     truce_aax_finish_output_events(void* ctx, uint32_t status);
 
 /* Parameters (plain values, not normalized). */
 double truce_aax_get_param(void* ctx, uint32_t id);

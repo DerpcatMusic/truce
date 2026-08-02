@@ -165,8 +165,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 [[package]]
 name = "baseview-truce"
 version = "0.1.1-truce.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dc830ece0415c778e700c97d38bb28f4d8af0280f9d140f50ea094d0fed3e27"
+source = "git+https://github.com/DerpcatMusic/baseview.git?rev=15cf1fe518e7ad53ec0c7d1fd98fbbd9091a0866#15cf1fe518e7ad53ec0c7d1fd98fbbd9091a0866"
 dependencies = [
  "keyboard-types",
  "nix 0.22.3",
@@ -291,7 +290,7 @@ checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
 name = "cargo-truce"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "base64",
  "hound",
@@ -520,7 +519,7 @@ checksum = "173852283a9a57a3cbe365d86e74dc428a09c50421477d5ad6fe9d9509e37737"
 dependencies = [
  "bitflags 2.13.0",
  "fontdb",
- "harfrust",
+ "harfrust 0.3.2",
  "linebender_resource_handle",
  "log",
  "rangemap",
@@ -587,7 +586,7 @@ dependencies = [
  "clap",
  "criterion-plot",
  "is-terminal",
- "itertools",
+ "itertools 0.10.5",
  "num-traits",
  "once_cell",
  "oorandom",
@@ -606,7 +605,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
 dependencies = [
  "cast",
- "itertools",
+ "itertools 0.10.5",
 ]
 
 [[package]]
@@ -725,9 +724,9 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "ecolor"
-version = "0.34.3"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a05fbfa222ffb51989d5ccf33e5f7aebfcf96c5023413856b0c3618a7f79896e"
+checksum = "6758be723a3f298bbfda4db75748bc2ba0abafe096b6383c7c32da264764fbc3"
 dependencies = [
  "bytemuck",
  "emath",
@@ -735,15 +734,16 @@ dependencies = [
 
 [[package]]
 name = "egui"
-version = "0.34.3"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42112be0ae157289312b92b3dfaf20e911b5a3c4c65d4aab0e7c47fbc0ce16e3"
+checksum = "2796c98d50b79631281d516343a6f6e93c0666462ca36e2c93b39f25d7793325"
 dependencies = [
  "accesskit",
  "ahash",
  "bitflags 2.13.0",
  "emath",
  "epaint",
+ "itertools 0.14.0",
  "log",
  "nohash-hasher",
  "profiling",
@@ -753,9 +753,9 @@ dependencies = [
 
 [[package]]
 name = "egui-wgpu"
-version = "0.34.3"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f0c0559ac5598a1b887a6206dccbab7e3e6246c57cb00ae287262bd44776c9c"
+checksum = "d2e6cfac0725563555fa4f91e9f799b9d7c6c5dd831fca6abc8234afc64b7a34"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -777,9 +777,9 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "emath"
-version = "0.34.3"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b53f0d33a479321da6b0caa71366c9f67e8a2c149762d90bdc0d16e601ee8ecb"
+checksum = "cd4ec073c9898516584d8c6cfdcee95b530b3d941cd5031ef4050aa36812308b"
 dependencies = [
  "bytemuck",
 ]
@@ -795,9 +795,9 @@ dependencies = [
 
 [[package]]
 name = "epaint"
-version = "0.34.3"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6675898a291ec212fc3df04f537d177fce8496120244590e6359dcaa4c25da79"
+checksum = "4e60a8888b51da911df23918fd7301359b1d43a406a0ff3b8863af093dd7fc6c"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -805,21 +805,24 @@ dependencies = [
  "emath",
  "epaint_default_fonts",
  "font-types 0.11.3",
+ "harfrust 0.7.0",
  "log",
  "nohash-hasher",
  "parking_lot",
  "profiling",
  "self_cell",
- "skrifa 0.40.0",
+ "skrifa 0.42.1",
  "smallvec",
+ "unicode-general-category",
+ "unicode-segmentation",
  "vello_cpu",
 ]
 
 [[package]]
 name = "epaint_default_fonts"
-version = "0.34.3"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8970033a4282a7bcf899b38b5ed3a58b732fe093d03785d58648515d8d309da"
+checksum = "13ee4e1f553a3584c301f3a56ff1a775f1384781396cea301c8d952e9b93f560"
 
 [[package]]
 name = "equivalent"
@@ -879,12 +882,9 @@ dependencies = [
 
 [[package]]
 name = "fearless_simd"
-version = "0.3.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fb2907d1f08b2b316b9223ced5b0e89d87028ba8deae9764741dba8ff7f3903"
-dependencies = [
- "bytemuck",
-]
+checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 
 [[package]]
 name = "fft-convolver"
@@ -1221,6 +1221,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "glifo"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d99fc21d493812643aae86d53b7bbd02f376434a90317e8a790bc209fdd6605e"
+dependencies = [
+ "bytemuck",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+ "log",
+ "peniko",
+ "skrifa 0.42.1",
+ "smallvec",
+ "vello_common",
+]
+
+[[package]]
 name = "glow"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1329,6 +1345,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "guillotiere"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b17e70c989c36bad147b27a58d148c0741c51448aa5653436547323e524d0ab"
+dependencies = [
+ "euclid",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,6 +1375,18 @@ dependencies = [
  "bytemuck",
  "core_maths",
  "read-fonts 0.35.0",
+ "smallvec",
+]
+
+[[package]]
+name = "harfrust"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0431e8e389aa0f1e72bb9d1c2db8957a1a7a3580e8ed97db819c14837aac9b3e"
+dependencies = [
+ "bitflags 2.13.0",
+ "bytemuck",
+ "read-fonts 0.39.2",
  "smallvec",
 ]
 
@@ -1388,6 +1425,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -1526,7 +1566,7 @@ dependencies = [
  "cryoglyph",
  "futures",
  "glam 0.25.0",
- "guillotiere",
+ "guillotiere 0.6.2",
  "iced_debug",
  "iced_graphics",
  "log",
@@ -1588,6 +1628,15 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -2778,16 +2827,6 @@ dependencies = [
 
 [[package]]
 name = "read-fonts"
-version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b634fabf032fab15307ffd272149b622260f55974d9fad689292a5d33df02e5"
-dependencies = [
- "bytemuck",
- "font-types 0.11.3",
-]
-
-[[package]]
-name = "read-fonts"
 version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4ed38b89c2c77ff968c524145ad65fb010f38af5c7a224b53b81d47ac2daa81"
@@ -2867,14 +2906,14 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reload-fixture-common"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "truce",
 ]
 
 [[package]]
 name = "reload-fixture-keep-a"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "reload-fixture-common",
  "truce",
@@ -2883,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "reload-fixture-keep-b"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "reload-fixture-common",
  "truce",
@@ -2892,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "reload-fixture-reset"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "reload-fixture-common",
  "truce",
@@ -3148,16 +3187,6 @@ checksum = "8c31071dedf532758ecf3fed987cdb4bd9509f900e026ab684b4ecb81ea49841"
 dependencies = [
  "bytemuck",
  "read-fonts 0.35.0",
-]
-
-[[package]]
-name = "skrifa"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fbdfe3d2475fbd7ddd1f3e5cf8288a30eb3e5f95832829570cd88115a7434ac"
-dependencies = [
- "bytemuck",
- "read-fonts 0.37.0",
 ]
 
 [[package]]
@@ -3798,7 +3827,7 @@ dependencies = [
 
 [[package]]
 name = "truce"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "truce-clap",
  "truce-core",
@@ -3814,7 +3843,7 @@ dependencies = [
 
 [[package]]
 name = "truce-aax"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "crossbeam-queue",
  "truce-aax-bridge",
@@ -3824,11 +3853,11 @@ dependencies = [
 
 [[package]]
 name = "truce-aax-bridge"
-version = "6.3.0"
+version = "7.0.0"
 
 [[package]]
 name = "truce-au"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "cc",
  "crossbeam-queue",
@@ -3839,7 +3868,7 @@ dependencies = [
 
 [[package]]
 name = "truce-build"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "base64",
  "serde",
@@ -3849,7 +3878,7 @@ dependencies = [
 
 [[package]]
 name = "truce-clap"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "crossbeam-queue",
@@ -3861,7 +3890,7 @@ dependencies = [
 
 [[package]]
 name = "truce-core"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "backtrace",
  "crossbeam-queue",
@@ -3874,7 +3903,7 @@ dependencies = [
 
 [[package]]
 name = "truce-cpu"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "tiny-skia 0.12.0",
  "truce-core",
@@ -3884,7 +3913,7 @@ dependencies = [
 
 [[package]]
 name = "truce-derive"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3897,7 +3926,7 @@ dependencies = [
 
 [[package]]
 name = "truce-driver"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "hound",
  "truce-core",
@@ -3906,7 +3935,7 @@ dependencies = [
 
 [[package]]
 name = "truce-egui"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "baseview-truce",
  "egui",
@@ -3926,7 +3955,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-arpeggio"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -3947,7 +3976,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-block-drywet"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -3969,7 +3998,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-block-gain"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -3991,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-block-gate"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4013,7 +4042,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-block-saturate"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4035,7 +4064,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-block-surround-meter"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4057,7 +4086,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-block-widen"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4079,7 +4108,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-cc-filter"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4100,7 +4129,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-chord"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4121,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-dasp-bitcrusher"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "dasp_sample",
@@ -4143,7 +4172,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-envelope"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4163,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-eq"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "biquad",
  "clap-sys",
@@ -4188,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-fundsp-reverb-simple"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "fundsp",
@@ -4210,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-fundsp-reverb-worker"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "crossbeam-queue",
@@ -4233,7 +4262,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-gain"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "hound",
@@ -4256,7 +4285,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-gain-egui"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "egui",
@@ -4278,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-gain-egui-aspect"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "egui",
@@ -4300,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-gain-iced"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4321,7 +4350,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-gain-inplace"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4342,7 +4371,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-gui-zoo"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4363,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-gui-zoo-egui"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "egui",
@@ -4386,7 +4415,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-gui-zoo-iced"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "png 0.17.16",
@@ -4408,7 +4437,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-midi-inspector"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "crossbeam-queue",
@@ -4430,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-mpe-spreader"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4450,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-mpe-synth"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4471,7 +4500,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-multiport"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "hound",
@@ -4493,7 +4522,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-sidechain"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4514,7 +4543,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-state"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "egui",
@@ -4536,7 +4565,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-stereo-utility"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4557,7 +4586,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-synth"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4580,7 +4609,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-sysex-echo"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4600,7 +4629,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-transpose"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "truce",
@@ -4621,7 +4650,7 @@ dependencies = [
 
 [[package]]
 name = "truce-example-tremolo"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "clap-sys",
  "egui",
@@ -4643,7 +4672,7 @@ dependencies = [
 
 [[package]]
 name = "truce-font"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "skrifa 0.43.2",
  "tiny-skia 0.12.0",
@@ -4651,7 +4680,7 @@ dependencies = [
 
 [[package]]
 name = "truce-gpu"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "baseview-truce",
  "bytemuck",
@@ -4668,7 +4697,7 @@ dependencies = [
 
 [[package]]
 name = "truce-gui"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "baseview-truce",
  "log",
@@ -4691,7 +4720,7 @@ dependencies = [
 
 [[package]]
 name = "truce-gui-types"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "objc2",
  "truce-core",
@@ -4699,7 +4728,7 @@ dependencies = [
 
 [[package]]
 name = "truce-gui-utils"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "objc",
  "raw-window-handle 0.5.2",
@@ -4708,7 +4737,7 @@ dependencies = [
 
 [[package]]
 name = "truce-iced"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "baseview-truce",
  "iced_core",
@@ -4732,7 +4761,7 @@ dependencies = [
 
 [[package]]
 name = "truce-loader"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "crc32fast",
  "libloading 0.9.0",
@@ -4746,7 +4775,7 @@ dependencies = [
 
 [[package]]
 name = "truce-loader-tests"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "reload-fixture-common",
  "truce",
@@ -4759,7 +4788,7 @@ dependencies = [
 
 [[package]]
 name = "truce-lv2"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "base64",
  "objc",
@@ -4771,14 +4800,14 @@ dependencies = [
 
 [[package]]
 name = "truce-params"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "bitflags 2.13.0",
 ]
 
 [[package]]
 name = "truce-plugin"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "truce-core",
  "truce-gui-types",
@@ -4787,11 +4816,11 @@ dependencies = [
 
 [[package]]
 name = "truce-shim-types"
-version = "6.3.0"
+version = "7.0.0"
 
 [[package]]
 name = "truce-simd"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
  "truce-core",
@@ -4801,7 +4830,7 @@ dependencies = [
 
 [[package]]
 name = "truce-standalone"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "baseview-truce",
  "cpal",
@@ -4827,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "truce-test"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "png 0.18.1",
  "toml",
@@ -4840,11 +4869,11 @@ dependencies = [
 
 [[package]]
 name = "truce-utils"
-version = "6.3.0"
+version = "7.0.0"
 
 [[package]]
 name = "truce-vst2"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "cc",
  "crossbeam-queue",
@@ -4854,7 +4883,7 @@ dependencies = [
 
 [[package]]
 name = "truce-vst3"
-version = "6.3.0"
+version = "7.0.0"
 dependencies = [
  "cc",
  "crossbeam-queue",
@@ -4897,6 +4926,12 @@ name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"
@@ -4942,27 +4977,29 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vello_common"
-version = "0.0.6"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bd1a4c633ce09e7d713df1a6e036644a125e15e0c169cfb5180ddf5836ca04b"
+checksum = "19d672facaa2d697285a786cd9d44d614cd2ce54cdc022504bf339f8fff3b750"
 dependencies = [
  "bytemuck",
  "fearless_simd",
- "hashbrown 0.16.1",
+ "guillotiere 0.7.0",
+ "hashbrown 0.17.1",
  "log",
  "peniko",
- "skrifa 0.40.0",
  "smallvec",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "vello_cpu"
-version = "0.0.6"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0162bfe48aabf6a9fdcd401b628c7d9f260c2cbabb343c70a65feba6f7849edc"
+checksum = "588691169aed86b5c8fb487266afee01323234e6fd0a3f2aaec0eaa8e4007f23"
 dependencies = [
  "bytemuck",
- "hashbrown 0.16.1",
+ "glifo",
+ "hashbrown 0.17.1",
  "vello_common",
 ]
 

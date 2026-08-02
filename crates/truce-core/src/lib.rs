@@ -1,6 +1,7 @@
 pub mod audio_tap;
 pub mod buffer;
 pub mod bus;
+pub mod bus_routing;
 pub mod chunked_process;
 pub mod config;
 pub mod custom_state;
@@ -26,9 +27,18 @@ pub mod wrapper;
 
 pub use buffer::{AudioBuffer, RawBufferScratch};
 pub use bus::{BusConfig, BusKind, BusLayout, ChannelConfig};
+pub use bus_routing::{
+    BusActivation, BusRoute, BusRouting, MAX_AUDIO_BUSES, bus_layout_fits_routing,
+    bus_layouts_fit_routing,
+};
 pub use config::{AudioConfig, ProcessMode};
 pub use editor::{Editor, EditorBuilder, IntoEditor, PluginContext};
-pub use events::{Event, EventBody, EventList, PushError, SYSEX_POOL_PREALLOC, TransportInfo};
+pub use events::{
+    AuEventMetadata, Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody,
+    ExactEventMetadata, ExactEventQualifiers, ExactEventRef, ExactEventToken, ExactNoteAddress,
+    ExactNoteKind, LosslessEventCursor, LosslessEventRef, OutputEventStatus, PushError, RawMidi1,
+    RawUmp, SYSEX_POOL_PREALLOC, TransportInfo, Vst3EventMetadata,
+};
 pub use export::PluginExport;
 pub use info::{AutomationConfig, MidiDialect, PluginCategory, PluginInfo};
 pub use meters::MeterStore;

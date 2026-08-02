@@ -749,9 +749,11 @@ pub use crate::__plugin_logic_deps::{InitContext, TaskSpawner};
 /// or runs long, give the plugin its own thread with
 /// `AudioTap::spawn_worker` rather than the shared pool.
 ///
-/// Schedule tasks with `ctx.tasks::<Rebuild>()` from `process` (wait-free),
-/// the editor's `PluginContext`, or the `InitContext` passed to `init` -
-/// the type parameter selects the lane.
+/// Schedule tasks with `ctx.tasks::<Rebuild>()` from `process` (wait-free and
+/// syscall-free: only bounded atomics / lock-free queues), the editor's
+/// `PluginContext`, or the `InitContext` passed to `init` - the type parameter
+/// selects the lane. A non-realtime notifier owns worker wakes and eventually
+/// retries accepted work if the bounded global injector was temporarily full.
 ///
 /// ```ignore
 /// struct Rebuild { sample_rate: f64, time_s: f32 }
@@ -784,14 +786,33 @@ pub trait BackgroundTask: Send + 'static {
     /// that isn't safe to enter re-entrantly (a scratch buffer, a
     /// non-atomic cache): the pool then serializes this lane's drains so at
     /// most one `run` for this instance runs at a time, without the author
-    /// needing a `try_lock` guard. Tasks are never dropped or reordered;
-    /// serialization only bounds concurrency, so keep the handler short
+    /// needing a `try_lock` guard. Serialization itself does not drop or
+    /// reorder work (the bounded continuation-overflow rule is documented on
+    /// [`Self::run_once`]); keep the handler short
     /// (a long serialized handler delays this lane's later tasks). The mode
     /// is per lane, so a concurrent lane in the same plugin is unaffected.
     const SERIALIZED: bool = false;
     /// Run one task on the pool. See the trait docs for the contract,
     /// including the concurrency note on [`Self::SERIALIZED`].
     fn run(self, params: &Self::Params);
+
+    /// Run one bounded pass and optionally return the task for another fair
+    /// pool turn. The lane owns the returned value: it is re-injected behind
+    /// already-ready instances and is cancelled when this plugin instance
+    /// closes, so a task never needs to retain its own [`TaskSpawner`].
+    /// Continuation storage is preallocated and bounded like the inbound
+    /// queue; overflow drops an additional returned task instead of allocating
+    /// or blocking.
+    ///
+    /// The default preserves ordinary one-shot handlers. A continuing task
+    /// should set [`Self::SERIALIZED`] and keep each pass short.
+    fn run_once(self, params: &Self::Params) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        self.run(params);
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

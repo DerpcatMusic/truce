@@ -123,7 +123,7 @@ static AAX_Result TruceDescribeOneConfig(
     // Side-chain input port. AAX side-chain is always mono; the field
     // receives a pointer to the index of the side-chain channel within
     // mAudioInputs. RenderAudio duplicates it across the plugin's declared
-    // sidechain width and appends it after the main input channels.
+    // first sidechain bus's width and appends it after the main channels.
     if (needsSidechain) {
         err = compDesc->AddSideChainIn(
             AAX_FIELD_INDEX(TruceAaxExtendedRenderInfo, mSideChainP));

@@ -4,7 +4,8 @@
 /// variants of [`crate::events::EventBody`] instead of the MIDI 1.0
 /// down-conversion. Formats with a UMP transport (CLAP, AU v3) honor
 /// `Midi2` both ways; VST3 carries the per-note subset via note
-/// expression; VST2 / AU v2 / AAX / LV2 clamp to MIDI 1.0.
+/// expression. AAX exposes its native MIDI 1.0 carrier without converting
+/// MIDI 2.0 events; unrepresentable output is reported as unsupported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum MidiDialect {
     #[default]
@@ -20,6 +21,20 @@ pub struct PluginInfo {
     pub url: &'static str,
     pub version: &'static str,
     pub category: PluginCategory,
+
+    /// Optional user-facing description published by format descriptors.
+    pub description: Option<&'static str>,
+
+    /// Optional CLAP manual URL. `None` leaves the descriptor field unset.
+    pub clap_manual_url: Option<&'static str>,
+
+    /// Optional CLAP support URL. `None` keeps the wrapper's vendor URL
+    /// fallback for backwards compatibility.
+    pub clap_support_url: Option<&'static str>,
+
+    /// Exact CLAP discovery feature strings, in host-facing order. An empty
+    /// slice keeps the category-derived defaults.
+    pub clap_features: &'static [&'static str],
 
     /// Whether the host should route MIDI / note events *into* this
     /// plugin. Defaults to `true` for instruments and note effects;

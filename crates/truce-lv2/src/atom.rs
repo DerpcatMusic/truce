@@ -16,8 +16,10 @@
 #![allow(clippy::cast_ptr_alignment)]
 
 use truce_core::cast::{len_u32, sample_pos_i64};
-use truce_core::events::{Event, EventBody, EventList, TransportInfo};
-use truce_core::midi::{downconvert_to_midi1, parse_midi1, pitch_bend_to_bytes, route_midi_port};
+use truce_core::events::{
+    Event, EventBody, EventList, LosslessEventRef, OutputEventStatus, TransportInfo,
+};
+use truce_core::midi::{parse_midi1, pitch_bend_to_bytes};
 
 use crate::urid::{Urid, UridMap};
 
@@ -431,19 +433,16 @@ pub fn midi_bytes_to_event(sample_offset: u32, bytes: &[u8]) -> Option<Event> {
 // ---------------------------------------------------------------------------
 
 /// Bytes available for sequence *events* in a host output-port buffer.
-/// The host sets `atom.size` to the buffer's total capacity measured
-/// from `out` (the LV2 convention a plugin feeds straight to
-/// `lv2_atom_forge_set_buffer`), so the outer atom header and the
-/// sequence-body header - both written before the first event - come
-/// out of it. Guarding events against the raw `atom.size` would permit
-/// one padded event past the buffer end. Saturating so a degenerate
-/// undersized buffer yields 0 rather than underflowing.
+/// LV2 defines `atom.size` as the bytes following the outer [`Atom`] header,
+/// so it already excludes that header and includes the sequence body plus
+/// events. Only [`AtomSequenceBody`] comes out of the advertised capacity.
+/// Saturating makes a degenerate undersized buffer yield zero.
 ///
 /// # Safety
 /// `out` must point to a readable [`AtomSequence`].
 unsafe fn sequence_event_capacity(out: *const AtomSequence) -> usize {
     let total = unsafe { (*out).atom.size } as usize;
-    total.saturating_sub(core::mem::size_of::<Atom>() + core::mem::size_of::<AtomSequenceBody>())
+    total.saturating_sub(core::mem::size_of::<AtomSequenceBody>())
 }
 
 /// Reset an output atom port to a well-formed, zero-event sequence.
@@ -468,12 +467,110 @@ pub unsafe fn write_empty_sequence(out: *mut AtomSequence, urid: &UridMap) {
     }
 }
 
+fn lv2_midi_body_len(events: &EventList, event: &Event) -> Result<usize, OutputEventStatus> {
+    match event.body {
+        EventBody::NoteOn {
+            group,
+            channel,
+            note,
+            velocity,
+        }
+        | EventBody::NoteOff {
+            group,
+            channel,
+            note,
+            velocity,
+        } if group == 0 && channel < 16 && note < 128 && velocity < 128 => Ok(3),
+        EventBody::Aftertouch {
+            group,
+            channel,
+            note,
+            pressure,
+        } if group == 0 && channel < 16 && note < 128 && pressure < 128 => Ok(3),
+        EventBody::ControlChange {
+            group,
+            channel,
+            cc,
+            value,
+        } if group == 0 && channel < 16 && cc < 128 && value < 128 => Ok(3),
+        EventBody::ChannelPressure {
+            group,
+            channel,
+            pressure,
+        } if group == 0 && channel < 16 && pressure < 128 => Ok(2),
+        EventBody::PitchBend {
+            group,
+            channel,
+            value,
+        } if group == 0 && channel < 16 && value < 16_384 => Ok(3),
+        EventBody::ProgramChange {
+            group,
+            channel,
+            program,
+        } if group == 0 && channel < 16 && program < 128 => Ok(2),
+        EventBody::SysEx { .. } => events
+            .sysex_bytes_checked(&event.body)
+            .filter(|bytes| bytes.iter().all(|byte| byte & 0x80 == 0))
+            .and_then(|bytes| bytes.len().checked_add(2))
+            .ok_or(OutputEventStatus::Invalid),
+        EventBody::NoteOn { .. }
+        | EventBody::NoteOff { .. }
+        | EventBody::Aftertouch { .. }
+        | EventBody::ControlChange { .. }
+        | EventBody::ChannelPressure { .. }
+        | EventBody::PitchBend { .. }
+        | EventBody::ProgramChange { .. } => Err(OutputEventStatus::Invalid),
+        _ => Err(OutputEventStatus::Unsupported),
+    }
+}
+
+pub(crate) unsafe fn preflight_midi_out_sequence(
+    out: *const AtomSequence,
+    events: &EventList,
+    port: u8,
+    port_count: u8,
+) -> OutputEventStatus {
+    let event_capacity = unsafe { sequence_event_capacity(out) };
+    let event_header = core::mem::size_of::<AtomEventHeader>();
+    let mut required = 0usize;
+    for replay in events.lossless_iter() {
+        let LosslessEventRef::Typed(event) = replay else {
+            return OutputEventStatus::Unsupported;
+        };
+        if event.port >= port_count {
+            return OutputEventStatus::Invalid;
+        }
+        if event.port != port {
+            continue;
+        }
+        let body_len = match lv2_midi_body_len(events, event) {
+            Ok(len) => len,
+            Err(status) => return status,
+        };
+        let Some(padded) = event_header
+            .checked_add(body_len)
+            .and_then(|total| total.checked_add(7))
+            .map(|total| total & !7)
+        else {
+            return OutputEventStatus::Invalid;
+        };
+        let Some(next_required) = required.checked_add(padded) else {
+            return OutputEventStatus::Invalid;
+        };
+        required = next_required;
+    }
+    if required > event_capacity {
+        OutputEventStatus::HostQueueFull
+    } else {
+        OutputEventStatus::Success
+    }
+}
+
 /// Overwrite the port's sequence body with the events destined for
 /// MIDI output port `port`, setting the header/atom sizes so the host
 /// knows how many bytes to read. `port_count` is the plugin's declared
-/// output-port count; an event whose [`Event::port`] exceeds it routes
-/// to port 0. Single-port plugins call with `port = 0`,
-/// `port_count = 1`.
+/// output-port count; an event whose [`Event::port`] exceeds it is invalid.
+/// Single-port plugins call with `port = 0`, `port_count = 1`.
 ///
 /// # Safety
 /// `out` must point to a writable atom sequence buffer with capacity the
@@ -484,20 +581,29 @@ pub unsafe fn write_midi_out_sequence(
     urid: &UridMap,
     port: u8,
     port_count: u8,
-) {
+) -> OutputEventStatus {
     unsafe {
         if urid.midi_event == 0 {
             // Host without urid:map can't get encoded MIDI atoms, but
             // the port still advertises capacity - reset it to empty so
             // the host doesn't read stale bytes as events.
             write_empty_sequence(out, urid);
-            return;
+            return if events.is_empty() {
+                OutputEventStatus::Success
+            } else {
+                OutputEventStatus::Unsupported
+            };
         }
         // On entry `atom.size` is the whole output buffer's capacity
         // (from `out`); we overwrite it with the actual body size on
         // exit. `event_capacity` is what's left for events after the
         // two fixed headers `body_start` skips past.
         let event_capacity = sequence_event_capacity(out);
+        let preflight = preflight_midi_out_sequence(out, events, port, port_count);
+        if preflight != OutputEventStatus::Success {
+            write_empty_sequence(out, urid);
+            return preflight;
+        }
         let atom_size = core::mem::size_of::<Atom>();
         let header_size = core::mem::size_of::<AtomSequenceBody>();
         let body_start = out.cast::<u8>().add(atom_size + header_size);
@@ -506,10 +612,22 @@ pub unsafe fn write_midi_out_sequence(
         (*out).atom.type_ = urid.atom_sequence;
         (*out).body.unit = 0;
         (*out).body.pad = 0;
-        for event in events.iter() {
+        let mut status = OutputEventStatus::Success;
+        for replay in events.lossless_iter() {
+            let event = match replay {
+                LosslessEventRef::Typed(event) => event,
+                LosslessEventRef::Exact(_) => {
+                    status = OutputEventStatus::Unsupported;
+                    break;
+                }
+            };
             // Only this port's events land in this sequence; an
-            // out-of-range port collapses to port 0.
-            if route_midi_port(event.port, port_count) != port {
+            // out-of-range port is invalid rather than silently rerouted.
+            if event.port >= port_count {
+                status = OutputEventStatus::Invalid;
+                break;
+            }
+            if event.port != port {
                 continue;
             }
             // `SysEx` events have a variable-length payload that
@@ -522,6 +640,7 @@ pub unsafe fn write_midi_out_sequence(
                 let total = core::mem::size_of::<AtomEventHeader>() + body_len;
                 let padded = (total + 7) & !7;
                 if offset + padded > event_capacity {
+                    status = OutputEventStatus::HostQueueFull;
                     break;
                 }
                 let ev_ptr = body_start.add(offset).cast::<AtomEventHeader>();
@@ -539,10 +658,7 @@ pub unsafe fn write_midi_out_sequence(
                 continue;
             }
             let mut buf = [0u8; 3];
-            // LV2 carries MIDI 1.0 byte streams only; down-convert any
-            // 2.0 output so it isn't dropped.
-            let cv = downconvert_to_midi1(&event.body).unwrap_or(event.body);
-            let (n, frame) = match &cv {
+            let (n, frame) = match &event.body {
                 EventBody::NoteOn {
                     channel,
                     note,
@@ -606,16 +722,16 @@ pub unsafe fn write_midi_out_sequence(
                     buf[1] = program & 0x7F;
                     (2, event.sample_offset)
                 }
-                // MIDI 2.0 channel-voice, ParamChange, Transport,
-                // per-note events: not encodable as 1- to 3-byte
-                // MIDI 1.0 messages; drop rather than emit a
-                // malformed atom.
-                _ => continue,
+                _ => {
+                    status = OutputEventStatus::Unsupported;
+                    break;
+                }
             };
             let total = core::mem::size_of::<AtomEventHeader>() + n;
             let padded = (total + 7) & !7;
             if offset + padded > event_capacity {
-                break; // out of buffer space; drop remaining events
+                status = OutputEventStatus::HostQueueFull;
+                break;
             }
             let ev_ptr = body_start.add(offset).cast::<AtomEventHeader>();
             (*ev_ptr).time_frames = i64::from(frame);
@@ -630,6 +746,7 @@ pub unsafe fn write_midi_out_sequence(
             offset += padded;
         }
         (*out).atom.size = len_u32(header_size + offset);
+        status
     }
 }
 

@@ -47,17 +47,108 @@ use std::time::Duration;
 
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
 #[cfg(feature = "wav")]
 use truce_core::cast::sample_rate_u32;
 use truce_core::cast::{len_u32, sample_count_usize};
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, TransportInfo};
+use truce_core::events::{
+    EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus, TransportInfo,
+};
 use truce_core::export::PluginExport;
 use truce_core::info::PluginCategory;
 use truce_core::plugin::PluginRuntime;
 use truce_core::state::restore_plugin;
-use truce_params::Params;
+use truce_core::ump::{decode_ump_channel_voice_2, encode_ump_channel_voice_2};
+use truce_params::{ParamInfo, Params};
+
+fn driver_output_body_valid(body: &EventBody, list: &EventList, params: &[ParamInfo]) -> bool {
+    match *body {
+        EventBody::NoteOn {
+            group,
+            channel,
+            note,
+            velocity,
+        }
+        | EventBody::NoteOff {
+            group,
+            channel,
+            note,
+            velocity,
+        } => group < 16 && channel < 16 && note < 128 && velocity < 128,
+        EventBody::Aftertouch {
+            group,
+            channel,
+            note,
+            pressure,
+        } => group < 16 && channel < 16 && note < 128 && pressure < 128,
+        EventBody::ControlChange {
+            group,
+            channel,
+            cc,
+            value,
+        } => group < 16 && channel < 16 && cc < 128 && value < 128,
+        EventBody::ChannelPressure {
+            group,
+            channel,
+            pressure,
+        } => group < 16 && channel < 16 && pressure < 128,
+        EventBody::PitchBend {
+            group,
+            channel,
+            value,
+        } => group < 16 && channel < 16 && value < 16_384,
+        EventBody::ProgramChange {
+            group,
+            channel,
+            program,
+        } => group < 16 && channel < 16 && program < 128,
+        EventBody::ParamChange { id, value } => {
+            value.is_finite() && params.iter().any(|info| info.id == id)
+        }
+        EventBody::ParamMod { id, value, .. } => {
+            value.is_finite() && params.iter().any(|info| info.id == id)
+        }
+        EventBody::Transport(transport) => {
+            transport.tempo.is_finite()
+                && transport.position_seconds.is_finite()
+                && transport.position_beats.is_finite()
+                && transport.bar_start_beats.is_finite()
+                && transport.loop_start_beats.is_finite()
+                && transport.loop_end_beats.is_finite()
+        }
+        EventBody::SysEx { .. } => list
+            .sysex_bytes_checked(body)
+            .is_some_and(|bytes| bytes.iter().all(|byte| byte & 0x80 == 0)),
+        _ => encode_ump_channel_voice_2(body)
+            .is_some_and(|words| decode_ump_channel_voice_2(words).as_ref() == Some(body)),
+    }
+}
+
+fn preflight_driver_output(
+    events: &EventList,
+    params: &[ParamInfo],
+    midi_output_ports: u8,
+    num_frames: u32,
+) -> OutputEventStatus {
+    if events.exact_len() != 0 {
+        return OutputEventStatus::Unsupported;
+    }
+    for event in events.iter() {
+        let needs_midi_port = !matches!(
+            event.body,
+            EventBody::ParamChange { .. } | EventBody::ParamMod { .. } | EventBody::Transport(_)
+        );
+        if event.sample_offset >= num_frames
+            || (needs_midi_port && event.port >= midi_output_ports)
+            || !driver_output_body_valid(&event.body, events, params)
+        {
+            return OutputEventStatus::Invalid;
+        }
+    }
+    OutputEventStatus::Success
+}
 
 /// Sidechain (non-main) input width for the declared layout whose main
 /// input width equals `main_channels`. Reading this from the layout the
@@ -80,6 +171,7 @@ fn default_sidechain_channels(layouts: &[BusLayout], main_channels: usize) -> us
             l.inputs
                 .iter()
                 .skip(1)
+                .filter(|bus| bus.enabled)
                 .map(|b| b.channels.channel_count() as usize)
                 .sum()
         })
@@ -791,6 +883,11 @@ impl<P: PluginExport> PluginDriver<P> {
                 .map_or(0, |l| l.total_output_channels() as usize);
             if outs > 0 { outs } else { 2 }
         });
+        assert!(
+            bus_layouts_fit_routing(&P::bus_layouts()),
+            "truce-driver: plugin bus topology exceeds BusRouting's limit of 32 buses per \
+             direction and 65,535 channels per bus"
+        );
 
         // 3. Setup closure (most general). Receives the resolved
         // `SetupContext` so it can size per-channel state, branch on
@@ -807,11 +904,10 @@ impl<P: PluginExport> PluginDriver<P> {
         let is_effect = P::info().category == PluginCategory::Effect;
         let total_frames = sample_count_usize(self.duration.as_secs_f64() * self.sample_rate);
 
-        // Sidechain (non-main) input width. A plugin's sidechain bus is
-        // always present at its declared width - silent when nothing
-        // drives it - so an effect that declares one runs with the extra
-        // input channels even under the default silent source. `channels`
-        // is the main-bus width; `num_in` = main + sidechain. The default
+        // Sidechain (non-main) input width. Every enabled sidechain bus is
+        // present at its declared width - silent when nothing drives it;
+        // disabled declarations stay out of the flattened audio buffer.
+        // `channels` is the main-bus width; `num_in` = main + sidechain. The default
         // is read from the layout whose main width matches `channels`, not
         // always layout 0, so a plugin driven at a non-default width
         // (`.channels(...)`) doesn't combine a main width and a sidechain
@@ -823,6 +919,57 @@ impl<P: PluginExport> PluginDriver<P> {
             0
         };
         let num_in = channels + sidechain_channels;
+        let mut bus_routing = BusRouting::new();
+        if let Some(layout) = P::bus_layouts().into_iter().find(|layout| {
+            layout.inputs.first().map_or(!is_effect, |bus| {
+                bus.channels.channel_count() as usize == channels
+            })
+        }) {
+            let declared_inputs = layout
+                .inputs
+                .iter()
+                .filter(|bus| bus.enabled)
+                .map(|bus| bus.channels.channel_count() as usize)
+                .sum::<usize>();
+            let declared_outputs = layout
+                .outputs
+                .iter()
+                .filter(|bus| bus.enabled)
+                .map(|bus| bus.channels.channel_count() as usize)
+                .sum::<usize>();
+            if declared_inputs == num_in {
+                for bus in layout.inputs {
+                    assert!(bus_routing.push_input(
+                        if bus.enabled {
+                            bus.channels.channel_count()
+                        } else {
+                            0
+                        },
+                        if bus.enabled {
+                            BusActivation::Active
+                        } else {
+                            BusActivation::Inactive
+                        },
+                    ));
+                }
+            }
+            if declared_outputs == channels {
+                for bus in layout.outputs {
+                    assert!(bus_routing.push_output(
+                        if bus.enabled {
+                            bus.channels.channel_count()
+                        } else {
+                            0
+                        },
+                        if bus.enabled {
+                            BusActivation::Active
+                        } else {
+                            BusActivation::Inactive
+                        },
+                    ));
+                }
+            }
+        }
         if sidechain_channels == 0 && !matches!(self.sidechain, InputSource::Silence) {
             eprintln!("truce-driver: sidechain source ignored - plugin declares no sidechain bus");
         }
@@ -856,6 +1003,10 @@ impl<P: PluginExport> PluginDriver<P> {
 
         let (script_events, script_sysex) =
             prepare_script_events(&mut self.script, self.sample_rate, total_frames);
+        let scripted_event_capacity = script_events
+            .len()
+            .checked_add(script_sysex.len())
+            .expect("combined script event count exceeds addressable capacity");
 
         // Transport tracker.
         let mut transport_pos_beats = self.transport.position_beats;
@@ -899,21 +1050,22 @@ impl<P: PluginExport> PluginDriver<P> {
         };
 
         let mut cursor = 0usize;
-        let mut event_list = EventList::with_capacity(script_events.len().min(256));
+        let mut event_list = EventList::with_capacity(scripted_event_capacity);
         // Hoisted out of the loop and reused. `with_capacity` reserves
-        // both the event ring and the `SysEx` byte pool (`default()`
-        // reserves neither), so the plugin's `push_sysex` into
-        // `output_events` and the chunker's rebase into the scratch
-        // stay allocation-free and don't silently drop `SysEx`.
+        // both event lanes and the `SysEx` byte pool, so the plugin's
+        // `push_sysex` into `output_events` and the chunker's rebase into
+        // the scratch stay allocation-free and don't silently drop `SysEx`.
         let mut output_events_block = EventList::with_capacity(EVENT_LIST_PREALLOC);
         // Per-sub-block scratch + cached static info so the offline
         // render routes through the same `chunked_process` helper the
         // format wrappers use. Tests scripting `set_param` at known
         // offsets get the same deferred-apply behavior live hosts see.
-        let mut sub_event_scratch = EventList::with_capacity(EVENT_LIST_PREALLOC);
+        let mut sub_event_scratch = EventList::with_capacity(scripted_event_capacity);
         let param_infos = plugin.params().param_infos();
         let params_arc = plugin.params_arc();
-        let min_subblock_samples = P::info().automation.min_subblock_samples;
+        let plugin_info = P::info();
+        let min_subblock_samples = plugin_info.automation.min_subblock_samples;
+        let midi_output_ports = plugin_info.midi_output_ports;
 
         // Routes the offline-render loop through the same
         // `RawBufferScratch::build` helper every format wrapper uses,
@@ -1026,6 +1178,7 @@ impl<P: PluginExport> PluginDriver<P> {
                 ..Default::default()
             };
             output_events_block.clear();
+            output_events_block.clear_overflow();
 
             let mut transport_snap = transport_info;
             let chunk_args = ChunkedProcess {
@@ -1040,13 +1193,15 @@ impl<P: PluginExport> PluginDriver<P> {
                 param_infos: &param_infos,
                 min_subblock_samples,
             };
-            process_chunked(
+            process_chunked_with_bus_routing(
                 &mut plugin,
                 params_arc.as_ref() as &dyn Params,
                 &mut audio,
                 chunk_args,
+                bus_routing,
             );
             let _ = audio;
+            output_events_block.ensure_sorted_by_offset();
             // Narrow rendered f64 output back into the f32 `out_bufs`
             // when the plugin's `Sample = f64`. No-op otherwise.
             // SAFETY: same pointers + counts as the `build` call above.
@@ -1068,7 +1223,24 @@ impl<P: PluginExport> PluginDriver<P> {
             // wrapping. The captured offsets are still informative
             // up to that point and clamped beyond rather than
             // silently mis-attributed to early frames.
-            if self.capture.output_events {
+            let output_status = output_events_block.overflow().map_or_else(
+                || {
+                    if output_events_block.is_empty() {
+                        OutputEventStatus::Success
+                    } else if self.capture.output_events {
+                        preflight_driver_output(
+                            &output_events_block,
+                            &param_infos,
+                            midi_output_ports,
+                            block_u32,
+                        )
+                    } else {
+                        OutputEventStatus::Unsupported
+                    }
+                },
+                OutputEventStatus::BufferFull,
+            );
+            if output_status == OutputEventStatus::Success && self.capture.output_events {
                 let cursor_u32 = u32::try_from(cursor).unwrap_or(u32::MAX);
                 for ev in output_events_block.iter() {
                     let mut e = *ev;
@@ -1077,12 +1249,14 @@ impl<P: PluginExport> PluginDriver<P> {
                     // Resolve SysEx payloads now, while the block's pool
                     // is still populated (the captured `Event` only
                     // carries pool indices into a list we don't keep).
-                    if matches!(ev.body, EventBody::SysEx { .. }) {
-                        output_sysex_capture
-                            .push(output_events_block.sysex_bytes(&ev.body).to_vec());
+                    if matches!(ev.body, EventBody::SysEx { .. })
+                        && let Some(bytes) = output_events_block.sysex_bytes_checked(&ev.body)
+                    {
+                        output_sysex_capture.push(bytes.to_vec());
                     }
                 }
             }
+            output_events_block.set_output_status(output_status);
 
             // Capture per-block meters / param snapshots.
             if matches!(self.capture.meters, MeterCapture::PerBlock) {

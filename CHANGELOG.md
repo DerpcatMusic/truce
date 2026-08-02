@@ -2,6 +2,19 @@
 
 Notable changes per release.
 
+## 7.0.0
+
+Breaking: move every direct `truce*` dependency in a plugin to 7.0 together. `truce-egui` now uses egui and egui-wgpu 0.35, so plugins that name egui types in their editor code must also update their direct `egui` dependency to 0.35; the `EguiEditor`, `EditorUi`, and widget APIs otherwise keep the same shape.
+
+- `truce-egui` shares BUFFR's egui 0.35 and wgpu 29 dependency graph, so native BUFFR editor code can move onto Truce without a second incompatible egui stack.
+- Plug-ins can inspect whether the preceding output-event block succeeded, overflowed staging, met a full host queue, used an unsupported carrier, or contained invalid data; MIDI and process-emitted parameter feedback reject known incomplete, failed, or unavailable blocks before delivery across CLAP, VST3, Audio Unit, AAX, LV2, VST2, standalone, and the offline driver.
+- CLAP descriptors keep fractional fixed-step parameters loadable by exposing them as continuous host ranges while Truce still applies the plug-in's requested quantization.
+- Managed background tasks now work in hot-reload shells as well as release builds; each logic build warms its own workers before audio starts, editor work stays bound to the build that created it, and reloads cancel queued work without blocking the audio thread. Reloads stop and join retired workers instead of accumulating threads, abort cleanly when a handler cannot retire in time, and keep activated code mapped so open editors and saved state callbacks remain valid.
+- Managed background tasks can return preallocated, bounded continuations that yield fairly to other plug-ins and newly submitted work; the framework owns and cancels those continuations when their plug-in instance closes, and drops overflow instead of allocating or blocking.
+- Scheduling a managed task from `process` now performs only bounded atomic and lock-free queue operations. A non-realtime notifier owns worker wake calls and keeps retrying accepted lane-local work when the shared injector is temporarily full, so a final host block cannot strand its task. If notifier creation fails, one designated worker supplies a 1 ms fallback without waking the whole pool.
+- `ProcessContext::bus_routing` exposes bounded, allocation-free per-bus ranges without collapsing disabled or unavailable bus indices. VST3, AU, AAX, LV2, standalone, and the driver report available activation; CLAP and enabled VST2 buses report `Unknown`. AAX and AU can route only the first auxiliary input while preserving later declared indices as unavailable, and LV2 remains main-I/O-only.
+- egui editors can choose exactly which physical key presses remain captured from the DAW, receive native file hover/drop paths on Windows and macOS, and own one cancellable, polled Zenity file dialog on Linux. Focus loss and editor close finish active host parameter gestures, preserve captured key ownership through its matching release, and cancel dialogs before plug-in close callbacks run. X11 repeat pairs are normalized in the window backend so Linux key ownership follows the same contract; native Windows/macOS dialogs and Linux file drops remain unavailable until their platform lifecycle exists.
+
 ## 6.3.0
 
 - Per-format builds (`cargo truce build` / `install` / `package` / `run` / `screenshot`) keep a plugin's non-format default features instead of dropping them; `--no-default-features` opts back into a minimal build.

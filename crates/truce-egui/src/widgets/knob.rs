@@ -51,7 +51,7 @@ pub fn param_knob<P: Params + ?Sized>(
     let acc_id = ui.make_persistent_id(("truce-egui:param_knob:acc", id));
 
     if response.drag_started() {
-        state.begin_edit(id);
+        crate::lifecycle::begin_gesture(ui.ctx(), state, id);
         // Seed the accumulator at the host's current snapped value so
         // the first drag frame starts from where the user clicked.
         ui.memory_mut(|m| m.data.insert_temp(acc_id, value));
@@ -72,11 +72,11 @@ pub fn param_knob<P: Params + ?Sized>(
         };
         if (snapped - value).abs() > 1e-5 {
             value = snapped;
-            state.set_param(id, f64::from(value));
+            crate::lifecycle::set_param(ui.ctx(), state, id, f64::from(value));
         }
     }
     if response.drag_stopped() {
-        state.end_edit(id);
+        crate::lifecycle::end_gesture(ui.ctx(), state, id);
         ui.memory_mut(|m| m.data.remove_temp::<f32>(acc_id));
     }
 

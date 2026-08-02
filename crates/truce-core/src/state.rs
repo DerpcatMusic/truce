@@ -6,8 +6,8 @@
 //! without inheriting `truce-core`'s runtime dependency chain.
 
 pub use truce_utils::state::{
-    DeserializedState, StateParse, deserialize_state, hash_plugin_id, parse_state, serialize_state,
-    vst3_cid,
+    DeserializedState, StateParse, deserialize_state, hash_plugin_id, parse_state,
+    resolve_vst3_cid, serialize_state, vst3_cid,
 };
 
 /// The plugin format whose wrapper found a foreign state blob.

@@ -35,10 +35,13 @@ use std::sync::Arc;
 use truce_core::Float;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusKind;
+use truce_core::bus_routing::{BusActivation, BusRouting};
 use truce_core::cast::len_u32;
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, TransportInfo};
+use truce_core::events::{
+    EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus, TransportInfo,
+};
 use truce_core::export::PluginExport;
 use truce_core::info::PluginInfo;
 use truce_core::plugin::PluginRuntime;
@@ -237,6 +240,24 @@ unsafe impl<P: PluginExport> Send for Lv2Instance<P> {}
 // LV2 lifecycle callbacks
 // ---------------------------------------------------------------------------
 
+/// One-shot warning that a plugin's structural sidechain input is unavailable
+/// in LV2. Fires once per process so a default-disabled optional bus is not
+/// silently presented as supported just because it contributes no enabled
+/// channels to the default layout.
+fn warn_lv2_sidechain_dropped_once(channels: u32) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "[truce LV2] sidechain input ({channels} ch) unavailable: the LV2 \
+             TTL is generated from the plugin category and can't declare the \
+             sidechain ports yet. LV2 has no bus-activation callback; only \
+             ports declared lv2:connectionOptional may be left unconnected, \
+             so the plugin runs main-only rather than faking activation."
+        );
+    });
+}
+
 /// Build a `PortLayout` from a plugin instance's declared bus layout + params.
 ///
 /// Caller passes in `&P` so the layout extraction reuses the existing
@@ -250,22 +271,6 @@ unsafe impl<P: PluginExport> Send for Lv2Instance<P> {}
 /// The FFI entry points (`instantiate`, `instantiate_ui`) treat `None`
 /// as a graceful instantiation failure (log + null) rather than
 /// panicking across the host boundary.
-/// One-shot warning that a plugin's sidechain input is unavailable in
-/// LV2. Fires once per process on the first instantiation of a sidechain
-/// plugin so the author sees why the extra input is missing without the
-/// message repeating per instance.
-fn warn_lv2_sidechain_dropped_once(channels: u32) {
-    use std::sync::Once;
-    static WARNED: Once = Once::new();
-    WARNED.call_once(|| {
-        eprintln!(
-            "[truce LV2] sidechain input ({channels} ch) unavailable: the LV2 \
-             TTL is generated from the plugin category and can't declare the \
-             sidechain ports yet, so the plugin runs main-only in LV2 hosts."
-        );
-    });
-}
-
 pub fn derive_port_layout<P: PluginExport>(plugin: &P) -> Option<PortLayout> {
     // LV2 ports are fixed in the TTL and can't be reconfigured at runtime,
     // so a multi-layout plugin exposes only its first (default) layout.
@@ -288,10 +293,15 @@ pub fn derive_port_layout<P: PluginExport>(plugin: &P) -> Option<PortLayout> {
     let main_in: u32 = default_layout
         .inputs
         .iter()
-        .filter(|b| b.kind == BusKind::Main)
+        .filter(|b| b.enabled && b.kind == BusKind::Main)
         .map(|b| b.channels.channel_count())
         .sum();
-    let dropped_sidechain = default_layout.total_input_channels() - main_in;
+    let dropped_sidechain: u32 = default_layout
+        .inputs
+        .iter()
+        .filter(|b| b.kind == BusKind::Sidechain)
+        .map(|b| b.channels.channel_count())
+        .sum();
     if dropped_sidechain > 0 {
         warn_lv2_sidechain_dropped_once(dropped_sidechain);
     }
@@ -535,6 +545,7 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
 
         inst.event_list.clear();
         inst.output_events.clear();
+        inst.output_events.clear_overflow();
 
         // Emit ParamChange events for any control port that moved since last
         // run. The event carries the PLAIN value - format wrappers agree on
@@ -701,6 +712,32 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                 n_samples,
                 P::supports_in_place(),
             );
+            // LV2's generated RDF currently exposes only one flattened main
+            // input and output bus. Port connection is the only truthful
+            // process-time activation signal available here.
+            let mut bus_routing = BusRouting::new();
+            if num_in > 0 {
+                let active = s.audio_inputs.iter().any(|ptr| !ptr.is_null());
+                debug_assert!(bus_routing.push_input(
+                    num_in,
+                    if active {
+                        BusActivation::Active
+                    } else {
+                        BusActivation::Inactive
+                    },
+                ));
+            }
+            if num_out > 0 {
+                let active = s.audio_outputs.iter().any(|ptr| !ptr.is_null());
+                debug_assert!(bus_routing.push_output(
+                    num_out,
+                    if active {
+                        BusActivation::Active
+                    } else {
+                        BusActivation::Inactive
+                    },
+                ));
+            }
             inst.transport_slot.write(&transport);
             // Read the `lv2:freeWheeling` port: >= 0.5 means the host is
             // exporting offline. Null (host never connected it) or 0 is
@@ -723,14 +760,16 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
                 param_infos: &inst.param_infos,
                 min_subblock_samples: inst.min_subblock_samples,
             };
-            let _ = process_chunked(
+            let _ = process_chunked_with_bus_routing(
                 &mut inst.plugin,
                 inst.params_arc.as_ref() as &dyn Params,
                 &mut audio,
                 chunk_args,
+                bus_routing,
             );
             // End the `audio` borrow before reaching back into `scratch`.
             let _ = audio;
+            s.output_events.ensure_sorted_by_offset();
             // Narrow rendered output back to host f32 pointers when
             // the plugin's `Sample = f64`. No-op for f32 plugins.
             s.scratch.finish_widening(out_ptrs, num_out, n_samples);
@@ -762,20 +801,159 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
 
         // Write MIDI output to each connected atom sequence port,
         // routing every event to the port its `Event::port` names.
+        let mut output_status = inst
+            .output_events
+            .overflow()
+            .map_or(OutputEventStatus::Success, OutputEventStatus::BufferFull);
         let port_count = u8::try_from(inst.midi_out_ports.len()).unwrap_or(u8::MAX);
-        for (i, &out_ptr) in inst.midi_out_ports.iter().enumerate() {
-            if out_ptr.is_null() {
-                continue;
+        if output_status == OutputEventStatus::Success {
+            if port_count == 0 && !inst.output_events.is_empty() {
+                output_status = OutputEventStatus::Unsupported;
+            } else if inst.output_events.exact_len() != 0 {
+                // LV2's MIDI atom carrier has no format-neutral payload lane.
+                // Exact host payloads are authoritative, so never replay their
+                // linked typed fallback and pretend the round-trip was lossless.
+                output_status = OutputEventStatus::Unsupported;
+            } else {
+                for event in inst.output_events.iter() {
+                    if event.sample_offset >= n_samples || event.port >= port_count {
+                        output_status = OutputEventStatus::Invalid;
+                        break;
+                    }
+                    output_status = match event.body {
+                        EventBody::NoteOn {
+                            group,
+                            channel,
+                            note,
+                            velocity,
+                        }
+                        | EventBody::NoteOff {
+                            group,
+                            channel,
+                            note,
+                            velocity,
+                        } if group == 0 && channel < 16 && note < 128 && velocity < 128 => {
+                            OutputEventStatus::Success
+                        }
+                        EventBody::Aftertouch {
+                            group,
+                            channel,
+                            note,
+                            pressure,
+                        } if group == 0 && channel < 16 && note < 128 && pressure < 128 => {
+                            OutputEventStatus::Success
+                        }
+                        EventBody::ControlChange {
+                            group,
+                            channel,
+                            cc,
+                            value,
+                        } if group == 0 && channel < 16 && cc < 128 && value < 128 => {
+                            OutputEventStatus::Success
+                        }
+                        EventBody::ChannelPressure {
+                            group,
+                            channel,
+                            pressure,
+                        } if group == 0 && channel < 16 && pressure < 128 => {
+                            OutputEventStatus::Success
+                        }
+                        EventBody::PitchBend {
+                            group,
+                            channel,
+                            value,
+                        } if group == 0 && channel < 16 && value < 16_384 => {
+                            OutputEventStatus::Success
+                        }
+                        EventBody::ProgramChange {
+                            group,
+                            channel,
+                            program,
+                        } if group == 0 && channel < 16 && program < 128 => {
+                            OutputEventStatus::Success
+                        }
+                        EventBody::SysEx { .. } => inst
+                            .output_events
+                            .sysex_bytes_checked(&event.body)
+                            .filter(|bytes| bytes.iter().all(|byte| byte & 0x80 == 0))
+                            .map_or(OutputEventStatus::Invalid, |_| OutputEventStatus::Success),
+                        EventBody::NoteOn { .. }
+                        | EventBody::NoteOff { .. }
+                        | EventBody::Aftertouch { .. }
+                        | EventBody::ControlChange { .. }
+                        | EventBody::ChannelPressure { .. }
+                        | EventBody::PitchBend { .. }
+                        | EventBody::ProgramChange { .. } => OutputEventStatus::Invalid,
+                        _ => OutputEventStatus::Unsupported,
+                    };
+                    if output_status != OutputEventStatus::Success {
+                        break;
+                    }
+                }
+                if output_status == OutputEventStatus::Success {
+                    for (i, &out_ptr) in inst.midi_out_ports.iter().enumerate() {
+                        let port = u8::try_from(i).unwrap_or(u8::MAX);
+                        if out_ptr.is_null()
+                            && inst.output_events.iter().any(|event| event.port == port)
+                        {
+                            output_status = OutputEventStatus::Unsupported;
+                            break;
+                        }
+                    }
+                }
             }
-            let port = u8::try_from(i).unwrap_or(0);
-            atom::write_midi_out_sequence(
-                out_ptr,
-                &inst.output_events,
-                &inst.urid_map,
-                port,
-                port_count,
-            );
         }
+        if output_status == OutputEventStatus::Success
+            && inst.urid_map.midi_event == 0
+            && !inst.output_events.is_empty()
+        {
+            output_status = OutputEventStatus::Unsupported;
+        }
+        if output_status == OutputEventStatus::Success {
+            // Capacity is known before any port is mutated. Preflight the
+            // complete output set so a narrow later port cannot leave an
+            // earlier port published as a retry-prone prefix.
+            for (i, &out_ptr) in inst.midi_out_ports.iter().enumerate() {
+                if out_ptr.is_null() {
+                    continue;
+                }
+                let port = u8::try_from(i).unwrap_or(u8::MAX);
+                output_status = atom::preflight_midi_out_sequence(
+                    out_ptr,
+                    &inst.output_events,
+                    port,
+                    port_count,
+                );
+                if output_status != OutputEventStatus::Success {
+                    break;
+                }
+            }
+        }
+        if output_status == OutputEventStatus::Success {
+            for (i, &out_ptr) in inst.midi_out_ports.iter().enumerate() {
+                let port = u8::try_from(i).unwrap_or(u8::MAX);
+                if out_ptr.is_null() {
+                    continue;
+                }
+                let status = atom::write_midi_out_sequence(
+                    out_ptr,
+                    &inst.output_events,
+                    &inst.urid_map,
+                    port,
+                    port_count,
+                );
+                if status != OutputEventStatus::Success {
+                    output_status = status;
+                    break;
+                }
+            }
+        }
+        if output_status != OutputEventStatus::Success {
+            for &out_ptr in &inst.midi_out_ports {
+                atom::write_empty_sequence(out_ptr, &inst.urid_map);
+            }
+        }
+        inst.output_events.set_output_status(output_status);
 
         // Forward transport to the UI as a time:Position atom on the
         // notify-out port. Hosts deliver this to the UI's port_event each

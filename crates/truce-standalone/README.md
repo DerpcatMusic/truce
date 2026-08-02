@@ -33,6 +33,10 @@ This opens an audio stream on the default output device, optionally displays a
 GUI window (with the `gui` feature), and processes audio until the window is
 closed or the process is terminated.
 
+`ProcessContext::bus_routing` follows the selected `BusLayout` exactly:
+enabled buses are `Active`, while disabled declarations remain zero-width
+`Inactive` placeholders so later bus indices never shift.
+
 With `playback` enabled, the same binary doubles as a headless WAV-renderer:
 
 ```sh

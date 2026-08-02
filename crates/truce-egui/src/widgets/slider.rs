@@ -31,28 +31,36 @@ pub fn param_slider<P: Params + ?Sized>(
         let mut plain = state.get_param_plain(id).round() as i64;
         let response = ui.add(egui::Slider::new(&mut plain, min..=max).integer());
         if response.drag_started() {
-            state.begin_edit(id);
+            crate::lifecycle::begin_gesture(ui.ctx(), state, id);
         }
         if response.changed() {
             #[allow(clippy::cast_precision_loss)]
             let norm = ParamRange::Discrete { min, max }.normalize(plain as f64);
-            state.set_param(id, norm);
+            if response.dragged() || response.drag_started() {
+                crate::lifecycle::set_param(ui.ctx(), state, id, norm);
+            } else {
+                crate::lifecycle::automate(ui.ctx(), state, id, norm);
+            }
         }
         if response.drag_stopped() {
-            state.end_edit(id);
+            crate::lifecycle::end_gesture(ui.ctx(), state, id);
         }
         return response;
     }
     let mut value = state.get_param(id);
     let response = ui.add(egui::Slider::new(&mut value, 0.0..=1.0));
     if response.drag_started() {
-        state.begin_edit(id);
+        crate::lifecycle::begin_gesture(ui.ctx(), state, id);
     }
     if response.changed() {
-        state.set_param(id, f64::from(value));
+        if response.dragged() || response.drag_started() {
+            crate::lifecycle::set_param(ui.ctx(), state, id, f64::from(value));
+        } else {
+            crate::lifecycle::automate(ui.ctx(), state, id, f64::from(value));
+        }
     }
     if response.drag_stopped() {
-        state.end_edit(id);
+        crate::lifecycle::end_gesture(ui.ctx(), state, id);
     }
     response
 }

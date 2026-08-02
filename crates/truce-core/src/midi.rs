@@ -197,7 +197,7 @@ pub fn event_to_midi1(event: &EventBody) -> Option<(usize, [u8; 3])> {
 
 /// Down-convert a MIDI 2.0 channel-voice [`EventBody`] to its nearest
 /// MIDI 1.0 equivalent (lossy). Used two ways: when a plug-in *emits*
-/// 2.0 but the wrapper has no UMP transport (VST3 / VST2 / AAX / LV2),
+/// 2.0 but a wrapper explicitly opts into lossy MIDI 1.0 compatibility,
 /// and when a plug-in that did **not** opt into MIDI 2.0
 /// (`midi_input_dialect == Midi1`) *receives* 2.0 - it should see 1.0
 /// rather than have the event dropped.

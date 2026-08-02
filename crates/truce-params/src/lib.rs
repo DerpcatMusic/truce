@@ -15,10 +15,34 @@ pub use types::{
     ParamEnum,
 };
 
-/// Implementation detail - not part of the stable public API.
-/// Used by `truce-loader` to index into meter storage.
+/// Largest host-visible parameter ID. The signed-positive 31-bit
+/// domain is accepted by every supported format, including VST3.
 #[doc(hidden)]
-pub const METER_ID_BASE: u32 = 1 << 24;
+pub const PARAM_ID_MAX: u32 = 0x7fff_ffff;
+
+/// Historical mask for auto-assigned and nested parameter IDs.
+/// Keep this at 24 bits: changing it would remap existing automation
+/// and serialized state even though explicit IDs use the wider domain.
+#[doc(hidden)]
+pub const AUTO_PARAM_ID_MASK: u32 = (1 << 24) - 1;
+
+/// Preserve the historical nested-ID fold for the old 24-bit domain,
+/// while treating newly accepted wider explicit IDs as absolute.
+#[doc(hidden)]
+#[must_use]
+pub const fn rebase_nested_param_id(id: u32, base: u32) -> u32 {
+    if id <= AUTO_PARAM_ID_MASK {
+        id.wrapping_add(base) & AUTO_PARAM_ID_MASK
+    } else {
+        id
+    }
+}
+
+/// Implementation detail - not part of the stable public API.
+/// Internal meter IDs start immediately outside the host parameter
+/// domain and are used only to index meter storage.
+#[doc(hidden)]
+pub const METER_ID_BASE: u32 = PARAM_ID_MAX + 1;
 
 /// Sealing module: external crates cannot implement [`Params`] or
 /// [`ParamEnum`] directly because they can't name `Sealed`. The
@@ -103,6 +127,13 @@ pub fn format_param_value(info: &ParamInfo, value: f64) -> String {
                 std::cmp::Ordering::Equal => "C".to_string(),
                 std::cmp::Ordering::Less => format!("{}L", -pct),
                 std::cmp::Ordering::Greater => format!("{pct}R"),
+            }
+        }
+        ParamUnit::Custom(unit) => {
+            if is_int {
+                format!("{int_value}{unit}")
+            } else {
+                format!("{value:.2}{unit}")
             }
         }
         ParamUnit::None => {
