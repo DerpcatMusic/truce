@@ -45,8 +45,8 @@ use truce_core::state;
 use truce_core::tasks::AnyTaskSpawner;
 use truce_core::wrapper::{
     ParamCStrings, PluginCell, SharedPlugin, copy_c_str, default_io_channels, enter_plugin,
-    find_bus_layout, log_missing_bus_layout, max_io_channels, run_audio_block,
-    run_extern_callback_with, run_register, save_extra, shared_plugin,
+    find_bus_layout, log_missing_bus_layout, run_audio_block, run_extern_callback_with,
+    run_register, save_extra, shared_plugin,
 };
 use truce_params::MidiSource;
 use truce_params::sample::{Float, Sample};
@@ -681,8 +681,11 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
         // thread stays alloc-free. VST3 negotiates layouts at runtime
         // (setBusArrangements), so a later, wider layout than the default
         // must not grow the per-channel Vecs on the audio thread - size to
-        // `max_io_channels` like the AU / AAX wrappers, not the first layout.
-        let (num_in, num_out) = max_io_channels::<P>().unwrap_or((2, 2));
+        // the same structural width the shim gathers, including disabled
+        // optional buses that retain null/silence positions in the flat
+        // array. Active-only totals would leave `build` allocating here on
+        // the audio thread when every declared optional bus is disabled.
+        let (num_in, num_out) = max_layout_channels(&P::bus_layouts());
         audio
             .scratch
             .ensure_capacity(num_in as usize, num_out as usize, max_frames);
@@ -3303,15 +3306,18 @@ fn resolved_plugin_name(info: &PluginInfo) -> &'static str {
 /// per-bus arrays dynamically.
 const VST3_MAX_CHANNELS_PER_DIRECTION: u32 = 32;
 
-/// Largest total input and output channel counts across all declared
-/// layouts - the widest the host can negotiate, hence the widest the
-/// process path must handle.
+/// Largest structural input and output widths across all declared layouts.
+///
+/// Disabled optional buses still occupy fixed positions in the shim's
+/// process arrays, so their declared channels count toward this bound.
 fn max_layout_channels(layouts: &[BusLayout]) -> (u32, u32) {
     layouts.iter().fold((0, 0), |(mi, mo), l| {
-        (
-            mi.max(l.total_input_channels()),
-            mo.max(l.total_output_channels()),
-        )
+        let sum = |buses: &[BusConfig]| {
+            buses.iter().fold(0_u32, |channels, bus| {
+                channels.saturating_add(bus.channels.channel_count())
+            })
+        };
+        (mi.max(sum(&l.inputs)), mo.max(sum(&l.outputs)))
     })
 }
 

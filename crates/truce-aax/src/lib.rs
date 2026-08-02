@@ -515,8 +515,8 @@ pub fn register_aax<P: PluginExport>() {
             eprintln!(
                 "[truce AAX] {} default audio-bus layout cannot be represented exactly: AAX \n\
                  supports one main output and one routable auxiliary input while preserving \n\
-                 additional sidechain indices within BusRouting's 32-bus / 65,535-channel \n\
-                 bounds - plugin will not register.",
+                 additional sidechain indices, with at most 8 channels on every declared bus \n\
+                 and BusRouting's 32-bus bound - plugin will not register.",
                 std::any::type_name::<P>(),
             );
             return;
@@ -528,6 +528,11 @@ pub fn register_aax<P: PluginExport>() {
 fn aax_layout_supported(layout: &BusLayout) -> bool {
     bus_layout_fits_routing(layout)
         && layout.outputs.len() <= 1
+        && layout
+            .inputs
+            .iter()
+            .chain(&layout.outputs)
+            .all(|bus| bus.channels.channel_count() <= 8)
         && layout
             .inputs
             .first()

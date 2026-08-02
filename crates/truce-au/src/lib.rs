@@ -40,7 +40,7 @@ use truce_core::editor::{ClosureBridge, PluginContext, RawWindowHandle, SendPtr}
 // struct references on every target, so this import can't be apple-gated.
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
-use truce_core::bus::BusLayout;
+use truce_core::bus::{BusConfig, BusKind, BusLayout};
 use truce_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
 use truce_core::editor::fit_logical_size;
 use truce_core::events::{
@@ -3183,9 +3183,16 @@ pub fn register_au<P: PluginExport>() {
         }
         if au_max_aux_input_buses(&layouts) > 1 {
             eprintln!(
-                "[truce AU] {}: declares more than one auxiliary input bus. AU exposes a single \
-                 sidechain input element, so multiple aux buses can't be routed independently. \
-                 Declare at most one auxiliary (sidechain) input bus for AU. Plugin will not \
+                "[truce AU] {}: declares more than one auxiliary input bus; AU exposes only the \
+                 first auxiliary and preserves later declared bus indices as unavailable",
+                std::any::type_name::<P>(),
+            );
+        }
+        if layouts.iter().any(|layout| !au_layout_supported(layout)) {
+            eprintln!(
+                "[truce AU] {} declares a layout beyond AU's exact process topology: at most one \
+                 main output bus, 32 structurally declared channels per direction, and 32 \
+                 channels of v2 main/output plus first-sidechain staging - plugin will not \
                  register.",
                 std::any::type_name::<P>(),
             );
@@ -3212,41 +3219,98 @@ fn midi_status_byte(source: MidiSource) -> u8 {
 ///
 /// AU wires ONE sidechain width: element 1's stream format is fixed at
 /// descriptor time and isn't renegotiated when the host picks a different
-/// main layout. A layout whose sidechain width differs from the first
-/// layout's therefore can't be advertised - the host could negotiate its
-/// main width yet leave the first layout's (wrong) sidechain width wired,
-/// feeding the process callback more flat input channels than that layout
-/// declares. So only layouts matching the first layout's sidechain width
-/// are offered; the rest are dropped (with a one-line warning at the call
-/// site). The main input width is the first input bus; the sidechain width
-/// is the one remaining supported input bus.
+/// main layout. Only layouts with the default layout's bus structure,
+/// enabled auxiliary set, and auxiliary widths are advertised. The main
+/// input/output widths may vary. AU routes the first sidechain; later bus
+/// indices stay visible to the plugin as zero-width unavailable routes.
 fn au_negotiable_layouts(layouts: &[BusLayout]) -> (Vec<i16>, Vec<i16>, u32, usize) {
     fn main_in(l: &BusLayout) -> u32 {
         l.inputs.first().map_or(0, |b| b.channels.channel_count())
     }
     fn sidechain(l: &BusLayout) -> u32 {
         l.inputs
-            .iter()
-            .skip(1)
-            .map(|b| b.channels.channel_count())
-            .sum()
+            .get(1)
+            .map_or(0, |bus| bus.channels.channel_count())
     }
     // AU channel counts are small (mono..7.1.4); saturating cast is safe.
     let ch = |c: u32| i16::try_from(c).unwrap_or(0);
     let sc0 = layouts.first().map_or(0, sidechain);
-    let kept: Vec<&BusLayout> = layouts.iter().filter(|&l| sidechain(l) == sc0).collect();
+    let kept: Vec<&BusLayout> = layouts
+        .iter()
+        .filter(|layout| {
+            layouts.first().is_none_or(|default| {
+                layout.inputs.len() == default.inputs.len()
+                    && layout.outputs.len() == default.outputs.len()
+                    && layout
+                        .inputs
+                        .iter()
+                        .zip(&default.inputs)
+                        .all(|(bus, default_bus)| {
+                            bus.kind == default_bus.kind
+                                && bus.enabled == default_bus.enabled
+                                && (bus.kind == BusKind::Main
+                                    || bus.channels.channel_count()
+                                        == default_bus.channels.channel_count())
+                        })
+                    && layout
+                        .outputs
+                        .iter()
+                        .zip(&default.outputs)
+                        .all(|(bus, default_bus)| {
+                            bus.kind == default_bus.kind && bus.enabled == default_bus.enabled
+                        })
+            })
+        })
+        .collect();
     let dropped = layouts.len() - kept.len();
     let ins = kept.iter().map(|l| ch(main_in(l))).collect();
     let outs = kept.iter().map(|l| ch(l.total_output_channels())).collect();
     (ins, outs, sc0, dropped)
 }
 
+const AU_MAX_FLAT_CHANNELS: u32 = 32;
+
+fn au_layout_supported(layout: &BusLayout) -> bool {
+    let structural_width = |buses: &[BusConfig]| {
+        buses.iter().fold(0_u32, |channels, bus| {
+            channels.saturating_add(bus.channels.channel_count())
+        })
+    };
+    let main_input = layout
+        .inputs
+        .first()
+        .map_or(0, |bus| bus.channels.channel_count());
+    let first_sidechain = layout
+        .inputs
+        .get(1)
+        .map_or(0, |bus| bus.channels.channel_count());
+    let output = layout
+        .outputs
+        .first()
+        .map_or(0, |bus| bus.channels.channel_count());
+
+    layout.outputs.len() <= 1
+        && layout
+            .inputs
+            .first()
+            .is_none_or(|bus| bus.kind == BusKind::Main && bus.enabled)
+        && layout
+            .inputs
+            .iter()
+            .skip(1)
+            .all(|bus| bus.kind == BusKind::Sidechain)
+        && layout
+            .outputs
+            .first()
+            .is_none_or(|bus| bus.kind == BusKind::Main && bus.enabled)
+        && structural_width(&layout.inputs) <= AU_MAX_FLAT_CHANNELS
+        && structural_width(&layout.outputs) <= AU_MAX_FLAT_CHANNELS
+        && main_input.max(output).saturating_add(first_sidechain) <= AU_MAX_FLAT_CHANNELS
+}
+
 /// Largest number of auxiliary (non-main) input buses across all declared
-/// layouts. AU exposes a single sidechain input element (element 1), so a
-/// plugin declaring more than one aux input bus can't be represented: the
-/// host would see them merged into one wider bus and couldn't feed them
-/// independently. Registration rejects that rather than silently merge -
-/// the plugin still ships VST3/CLAP, which do support multiple aux buses.
+/// layouts. AU exposes only the first sidechain input element; additional
+/// declared indices remain present in `BusRouting` as unavailable buses.
 fn au_max_aux_input_buses(layouts: &[BusLayout]) -> usize {
     layouts
         .iter()
