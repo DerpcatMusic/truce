@@ -459,6 +459,7 @@ class TruceAUAudioUnit: AUAudioUnit {
     private static func render(
         ctx: UnsafeMutableRawPointer, cb: UnsafePointer<AuCallbacks>,
         numIn: UInt32, numOut: UInt32,
+        hasAudioOutput: Bool,
         timestamp: UnsafePointer<AudioTimeStamp>, frameCount: UInt32,
         outputData: UnsafeMutablePointer<AudioBufferList>,
         events: UnsafePointer<AURenderEvent>?, pull: AURenderPullInputBlock?,
@@ -493,6 +494,22 @@ class TruceAUAudioUnit: AUAudioUnit {
         // kAudioUnitErr_TooManyFramesToProcess guard (au_v2_shim.c).
         if frameCount > UInt32(scMaxFrames) {
             return kAudioUnitErr_TooManyFramesToProcess
+        }
+        let abl = UnsafeMutableAudioBufferListPointer(outputData)
+        if !hasAudioOutput {
+            // AUv3 requires a dummy output bus for input-only and MIDI-only
+            // units. It is transport-only: silence the host's negotiated
+            // buffers here, but never expose their arbitrary width to Rust.
+            for index in 0..<abl.count {
+                let buffer = abl[index]
+                let requestedBytes = Int(frameCount)
+                    * max(Int(buffer.mNumberChannels), 1)
+                    * MemoryLayout<Float>.size
+                let bytes = min(requestedBytes, Int(buffer.mDataByteSize))
+                if bytes > 0, let data = buffer.mData {
+                    memset(data, 0, bytes)
+                }
+            }
         }
         if numIn > 0, let pull = pull {
             var f = AudioUnitRenderActionFlags()
@@ -609,14 +626,13 @@ class TruceAUAudioUnit: AUAudioUnit {
             }
             ev = UnsafePointer(head.next)
         }
-        let abl = UnsafeMutableAudioBufferListPointer(outputData)
         let bufCount = abl.count
         // The host may run a multi-layout plugin at a narrower width than
         // its first declared layout (the descriptor's numIn / numOut), so
         // the negotiated bus - reflected in the buffer count - is the
         // authority. Clamp to it and hand the plugin the real widths, not
         // the descriptor's, so it never sees nil channel pointers.
-        let actualOut = UInt32(min(Int(numOut), bufCount))
+        let actualOut = hasAudioOutput ? UInt32(min(Int(numOut), bufCount)) : 0
         for i in 0..<32 { inPtrs[i] = nil; outPtrs[i] = nil }
         let actualIn: UInt32
         if let mainInScratch = mainInScratch {
@@ -736,7 +752,7 @@ class TruceAUAudioUnit: AUAudioUnit {
         let processResult = processNative(
             ctx, inPtrs, outPtrs, actualIn + UInt32(scActual), actualOut,
             (mainInputEnabled ? 1 : 0) | (sidechainEnabled ? 2 : 0),
-            mainOutputEnabled ? 1 : 0,
+            (hasAudioOutput && mainOutputEnabled) ? 1 : 0,
             frameCount, nativeBuf, numNative, nativeOverflow,
             paramBuf, numParam, paramOverflow, transportBuf)
         if processResult != UInt32(AU_PROCESS_OK) {
@@ -908,6 +924,7 @@ class TruceAUAudioUnit: AUAudioUnit {
         let numOut = _outputBusArray.count > 0
             ? UInt32(_outputBusArray[0].format.channelCount)
             : (g_descriptor?.pointee.num_outputs ?? 2)
+        let hasAudioOutput = (g_descriptor?.pointee.num_outputs ?? 0) > 0
         let inPtrs = UnsafeMutablePointer<UnsafePointer<Float>?>.allocate(capacity: 32)
         let outPtrs = UnsafeMutablePointer<UnsafeMutablePointer<Float>?>.allocate(capacity: 32)
         let nativeBuf = UnsafeMutablePointer<AuNativeEvent>.allocate(capacity: 256)
@@ -946,11 +963,10 @@ class TruceAUAudioUnit: AUAudioUnit {
             scCh > 0 ? AudioBufferList.allocate(maximumBuffers: scCh) : nil
 
         // Main-input staging for N-in/M-out layouts with N>M (a 2->1 sum, a
-        // 4->2 downmix). The in-place pull writes the input into the output
-        // ABL, which is only M buffers wide, so the extra input channels
-        // would be dropped. In that case pull into a dedicated scratch of
-        // numIn channels instead; numIn<=numOut keeps the zero-copy path.
-        let mainInSeparate = numIn > numOut
+        // 4->2 downmix), and for input-only units whose AUv3 output is only
+        // a transport dummy. Never pull real input into a dummy buffer that
+        // must be silenced before returning it to the host.
+        let mainInSeparate = numIn > 0 && (!hasAudioOutput || numIn > numOut)
         let mainInScratch: UnsafeMutablePointer<Float>? =
             mainInSeparate
                 ? UnsafeMutablePointer<Float>.allocate(capacity: Int(numIn) * scMaxFrames) : nil
@@ -979,6 +995,7 @@ class TruceAUAudioUnit: AUAudioUnit {
         return { _, timestamp, frameCount, _, outputData, events, pull in
             return TruceAUAudioUnit.render(
                 ctx: ctx, cb: cb, numIn: numIn, numOut: numOut,
+                hasAudioOutput: hasAudioOutput,
                 timestamp: timestamp, frameCount: frameCount,
                 outputData: outputData, events: events, pull: pull,
                 inPtrs: inPtrs, outPtrs: outPtrs, nativeBuf: nativeBuf,

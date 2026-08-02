@@ -607,7 +607,8 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
         audio.max_block_size = max_frames;
         // Match the exact AU flattening: main + first sidechain input and
         // one main output across only the layouts AU actually advertises.
-        // The AUv3 MIDI-only dummy output is included by the helper.
+        // AUv3's transport-only dummy output stays in the Swift adapter and
+        // is never exposed to Rust processing.
         let (num_in, num_out) = au_process_capacity(&P::bus_layouts());
         audio
             .scratch
@@ -3273,7 +3274,7 @@ fn au_layout_matches_topology(default: &BusLayout, layout: &BusLayout) -> bool {
 
 fn au_process_capacity(layouts: &[BusLayout]) -> (u32, u32) {
     let Some(default) = layouts.first() else {
-        return (0, 2);
+        return (0, 0);
     };
     let sidechain = default
         .inputs
@@ -3298,10 +3299,7 @@ fn au_process_capacity(layouts: &[BusLayout]) -> (u32, u32) {
                 ),
             )
         });
-    (
-        main_input.saturating_add(sidechain),
-        if output == 0 { 2 } else { output },
-    )
+    (main_input.saturating_add(sidechain), output)
 }
 
 const AU_MAX_FLAT_CHANNELS: u32 = 32;

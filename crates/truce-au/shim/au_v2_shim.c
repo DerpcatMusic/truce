@@ -1764,8 +1764,8 @@ static OSStatus au_v2_render(void *self_,
 
     // Pull input for effects. Channel counts come from the negotiated
     // per-instance stream format so a multi-layout plugin runs at the
-    // width the host selected; an audio-less plugin (num_inputs == 0)
-    // keeps 0 inputs even though its output format is a stereo dummy.
+    // width the host selected. Unlike AUv3, AUv2 does not need a dummy
+    // output bus: an input-only or MIDI-only unit keeps numOut == 0.
     uint32_t numIn = g_descriptor->num_inputs > 0 ? inst->inputFormat.mChannelsPerFrame : 0;
     uint32_t numOut = inst->outputFormat.mChannelsPerFrame;
     // The plugin sees a flat input array [main..., sidechain...], but the
