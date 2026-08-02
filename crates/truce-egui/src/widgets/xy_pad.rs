@@ -30,20 +30,20 @@ pub fn param_xy_pad<P: ?Sized>(
     let mut vy = state.get_param(id_y);
 
     if response.drag_started() {
-        state.begin_edit(id_x);
-        state.begin_edit(id_y);
+        crate::lifecycle::begin_gesture(ui.ctx(), state, id_x);
+        crate::lifecycle::begin_gesture(ui.ctx(), state, id_y);
     }
     if (response.dragged() || response.drag_started())
         && let Some(pos) = response.interact_pointer_pos()
     {
         vx = ((pos.x - pad_rect.left()) / pad_rect.width()).clamp(0.0, 1.0);
         vy = 1.0 - ((pos.y - pad_rect.top()) / pad_rect.height()).clamp(0.0, 1.0);
-        state.set_param(id_x, f64::from(vx));
-        state.set_param(id_y, f64::from(vy));
+        crate::lifecycle::set_param(ui.ctx(), state, id_x, f64::from(vx));
+        crate::lifecycle::set_param(ui.ctx(), state, id_y, f64::from(vy));
     }
     if response.drag_stopped() {
-        state.end_edit(id_x);
-        state.end_edit(id_y);
+        crate::lifecycle::end_gesture(ui.ctx(), state, id_x);
+        crate::lifecycle::end_gesture(ui.ctx(), state, id_y);
     }
 
     if ui.is_rect_visible(rect) {

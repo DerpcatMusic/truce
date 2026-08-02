@@ -7,6 +7,7 @@ Notable changes per release.
 Breaking: `truce-egui` now uses egui and egui-wgpu 0.35. Plugins that name egui types in their editor code must update their direct `egui` dependency to 0.35; the `EguiEditor`, `EditorUi`, and widget APIs otherwise keep the same shape.
 
 - `truce-egui` shares BUFFR's egui 0.35 and wgpu 29 dependency graph, so native BUFFR editor code can move onto Truce without a second incompatible egui stack.
+- egui editors can choose exactly which physical key presses remain captured from the DAW, receive native file hover/drop paths on Windows and macOS, and own one cancellable, polled Zenity file dialog on Linux. Focus loss and editor close finish active host parameter gestures, preserve captured key ownership through its matching release, and cancel dialogs before plug-in close callbacks run. X11 repeat pairs are normalized in the window backend so Linux key ownership follows the same contract; native Windows/macOS dialogs and Linux file drops remain unavailable until their platform lifecycle exists.
 
 ## 6.3.0
 

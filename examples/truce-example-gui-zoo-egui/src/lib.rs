@@ -6,11 +6,13 @@
 
 use truce::prelude::*;
 use truce_core::editor::PluginContext;
-use truce_egui::EguiEditor;
+use truce_egui::dialog::{DialogRequest, DialogResult, DialogService};
+use truce_egui::input::{Key, KeyCapture, file_drop_available, set_key_capture};
 use truce_egui::theme::{HEADER_BG, HEADER_TEXT};
 use truce_egui::widgets::{
     level_meter, param_dropdown, param_knob, param_slider, param_toggle, param_xy_pad,
 };
+use truce_egui::{EditorUi, EguiEditor};
 use truce_font::JETBRAINS_MONO;
 
 use ZooParamsParamId as P;
@@ -106,6 +108,16 @@ pub struct ZooParams {
 /// Stateless descriptor - passthrough carries no DSP state, only params.
 pub struct ZooEgui;
 
+struct ZooUi {
+    dialogs: DialogService,
+}
+
+impl EditorUi<ZooParams> for ZooUi {
+    fn ui(&mut self, ui: &mut egui::Ui, state: &PluginContext<ZooParams>) {
+        zoo_ui(ui, state, &mut self.dialogs);
+    }
+}
+
 impl PurePluginLogic for ZooEgui {
     type Params = ZooParams;
 
@@ -147,14 +159,29 @@ impl PurePluginLogic for ZooEgui {
     }
 
     fn editor(params: Arc<ZooParams>) -> Box<dyn Editor> {
-        EguiEditor::new(params.clone(), (WINDOW_W, WINDOW_H), zoo_ui)
-            .with_visuals(truce_egui::theme::dark())
-            .with_font(JETBRAINS_MONO)
-            .into_editor()
+        EguiEditor::with_ui(
+            params.clone(),
+            (WINDOW_W, WINDOW_H),
+            ZooUi {
+                dialogs: DialogService::new(),
+            },
+        )
+        .with_visuals(truce_egui::theme::dark())
+        .with_font(JETBRAINS_MONO)
+        .into_editor()
     }
 }
 
-fn zoo_ui(ui: &mut egui::Ui, state: &PluginContext<ZooParams>) {
+fn zoo_ui(ui: &mut egui::Ui, state: &PluginContext<ZooParams>, dialogs: &mut DialogService) {
+    let capture_shortcuts = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<bool>(capture_policy_id()).unwrap_or(true));
+    let policy = if capture_shortcuts {
+        KeyCapture::CaptureKeys(vec![Key::Character(" ".into()), Key::Escape])
+    } else {
+        KeyCapture::IgnoreAll
+    };
+    set_key_capture(ui.ctx(), policy);
     egui::Panel::top("header")
         .exact_size(30.0)
         .frame(egui::Frame::NONE.fill(HEADER_BG))
@@ -262,6 +289,9 @@ fn zoo_ui(ui: &mut egui::Ui, state: &PluginContext<ZooParams>) {
 
                     section(ui, "Keyboard");
                     keyboard_section(ui);
+
+                    section(ui, "Host platform");
+                    platform_section(ui, dialogs);
                 });
         });
 }
@@ -421,6 +451,80 @@ fn keyboard_section(ui: &mut egui::Ui) {
         .data_mut(|d| d.get_temp::<String>(key_id))
         .unwrap_or_else(|| "(press a key)".to_string());
     ui.label(format!("last key: {last}"));
+
+    let mut capture_shortcuts =
+        ui.data_mut(|data| data.get_temp::<bool>(capture_policy_id()).unwrap_or(true));
+    ui.checkbox(
+        &mut capture_shortcuts,
+        "Capture Space and Escape from the DAW",
+    );
+    ui.data_mut(|data| data.insert_temp(capture_policy_id(), capture_shortcuts));
+}
+
+fn capture_policy_id() -> egui::Id {
+    egui::Id::new("zoo_keyboard_capture_policy")
+}
+
+/// Copyable host-platform example: standard egui input carries inbound files,
+/// while one owned service polls and reaps the platform dialog.
+fn platform_section(ui: &mut egui::Ui, dialogs: &mut DialogService) {
+    let status_id = egui::Id::new("zoo_platform_status");
+    let dropped = if file_drop_available() {
+        ui.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.as_ref())
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        })
+    } else {
+        Vec::new()
+    };
+    if !dropped.is_empty() {
+        ui.data_mut(|data| data.insert_temp(status_id, format!("dropped: {}", dropped.join(", "))));
+    }
+
+    if let Some(result) = dialogs.try_result() {
+        let status = match result {
+            DialogResult::Selected { path, .. } => format!("selected: {}", path.display()),
+            DialogResult::Cancelled { .. } => "dialog cancelled".to_owned(),
+            DialogResult::Failed(error) => format!("dialog failed: {error}"),
+        };
+        ui.data_mut(|data| data.insert_temp(status_id, status));
+    }
+
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                DialogService::is_available() && !dialogs.is_active(),
+                egui::Button::new("Open file…"),
+            )
+            .clicked()
+        {
+            let request = DialogRequest::OpenFile {
+                title: "Truce egui file dialog".to_owned(),
+                filters: Vec::new(),
+            };
+            if let Err(error) = dialogs.request(ui.ctx(), request) {
+                ui.data_mut(|data| data.insert_temp(status_id, error.to_string()));
+            }
+        }
+        if file_drop_available() {
+            ui.label("Drop a file anywhere in this window");
+        } else {
+            ui.label("Native file drop is unavailable on this platform");
+        }
+    });
+    if dialogs.is_active() {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(50));
+    }
+    let status = ui
+        .data_mut(|data| data.get_temp::<String>(status_id))
+        .unwrap_or_else(|| "No platform event yet".to_owned());
+    ui.label(status);
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {

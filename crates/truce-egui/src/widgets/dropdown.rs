@@ -96,7 +96,7 @@ pub fn param_dropdown<P: Params + ?Sized>(
                 let norm_f32 = f32::from_f64(norm);
                 let selected = (cur_value - norm_f32).abs() < f32::EPSILON.max(1e-4);
                 if ui.selectable_label(selected, label_text).clicked() {
-                    state.automate(id, norm);
+                    crate::lifecycle::automate(ui.ctx(), state, id, norm);
                 }
             }
         });
