@@ -40,10 +40,9 @@ use truce_core::state::StateLoadError;
 use truce_core::tasks::AnyTaskSpawner;
 use truce_params::sample::Sample;
 
-/// Handlers are contractually short/nonblocking. A reload retires lanes on
-/// the watcher thread and gives in-flight work this bounded window to leave;
-/// if the deadline is missed, the old lanes reopen and the reload is aborted.
-/// Activated generations remain mapped for process lifetime regardless.
+/// Handlers are contractually short/nonblocking. A reload closes admission
+/// and gives admitted schedulers plus in-flight handlers this bounded window
+/// to leave; a missed deadline reopens the old generation unchanged.
 const TASK_RETIRE_WAIT: Duration = Duration::from_millis(250);
 
 /// The `truce_process` export's signature (state, params, buffer,
@@ -79,7 +78,9 @@ pub struct StateOrigin {
 /// shell's `Arc<Params>`). The loader keeps every activated generation
 /// mapped for the rest of the process.
 struct LogicSymbols<S: Sample> {
-    warm_tasks: fn(),
+    warm_tasks: fn() -> bool,
+    quiesce_tasks: fn(Duration) -> bool,
+    shutdown_tasks: fn(),
     build_tasks: fn(*const ()) -> Option<AnyTaskSpawner>,
     init_state: fn(*const (), Option<AnyTaskSpawner>) -> *mut (),
     drop_state: StateDropFn,
@@ -128,7 +129,9 @@ impl<S: Sample> LogicSymbols<S> {
         }
         let preserve_fn: fn() -> bool = sym!(b"truce_preserve_dsp_state", fn() -> bool);
         Some(Self {
-            warm_tasks: sym!(b"truce_warm_tasks", fn()),
+            warm_tasks: sym!(b"truce_warm_tasks", fn() -> bool),
+            quiesce_tasks: sym!(b"truce_quiesce_tasks", fn(Duration) -> bool),
+            shutdown_tasks: sym!(b"truce_shutdown_tasks", fn()),
             build_tasks: sym!(
                 b"truce_build_tasks",
                 fn(*const ()) -> Option<AnyTaskSpawner>
@@ -200,9 +203,10 @@ pub struct NativeLoader<S: Sample = f32> {
     last_hash: u32,
     /// Set to true to stop the file watcher thread.
     watcher_stop: Arc<AtomicBool>,
-    /// Old code + task generations retained until instance teardown. Their
-    /// library mappings are then intentionally kept for process lifetime:
-    /// editors, function pointers, and task workers can outlive this loader.
+    /// Old code + stopped task generations retained until instance teardown.
+    /// Their library mappings are then intentionally kept for process
+    /// lifetime because editors and state-origin pointers can outlive this
+    /// loader.
     retired_generations: Vec<RetiredGeneration>,
     load_counter: u64,
     /// Count of successful library swaps (a `reload` that actually
@@ -402,7 +406,11 @@ impl<S: Sample> NativeLoader<S> {
                 // logic dylib before `init` or `process` can schedule work.
                 // Warming the shell's separate truce-core copy would leave
                 // this generation's first audio-thread schedule cold.
-                (cand.symbols.warm_tasks)();
+                if !(cand.symbols.warm_tasks)() {
+                    log::warn!("hot-reload task-pool startup failed; refusing logic generation");
+                    discard_candidate(cand);
+                    return false;
+                }
                 self.install_tasks(cand.tasks);
                 self.library = Some(cand.library);
                 self.symbols = Some(cand.symbols);
@@ -443,10 +451,19 @@ impl<S: Sample> NativeLoader<S> {
             return false;
         };
 
-        // Close the old lanes once, before changing either the wrapper route
-        // or the active symbols. A missed deadline aborts the swap and
-        // re-opens every old lane; proceeding would allow a producer to
-        // enqueue after the queue-clear barrier.
+        // Warm the candidate's own module-local pool before touching the live
+        // generation. A failed spawn can then reject the candidate without a
+        // gap in old task service or any audio-thread startup work.
+        if !(candidate.symbols.warm_tasks)() {
+            log::warn!("hot-reload task-pool startup failed; keeping previous code loaded");
+            discard_candidate(candidate);
+            return false;
+        }
+
+        // Close old admission before changing the route or symbols. The lane
+        // gate and pool execution gate are separate linearization points: the
+        // first drains scheduling critical sections, the second prevents a
+        // worker from entering after the active-handler count reaches zero.
         if let Some(tasks) = &self.tasks
             && !tasks.retire(TASK_RETIRE_WAIT)
         {
@@ -458,16 +475,33 @@ impl<S: Sample> NativeLoader<S> {
             return false;
         }
 
-        // This call may create permanent worker threads, so it happens only
-        // after the candidate is fully verified and the old generation has
-        // retired successfully. It runs on the watcher thread, before any
-        // state init or process call can schedule onto the candidate pool.
-        (candidate.symbols.warm_tasks)();
+        if let Some(symbols) = &self.symbols
+            && !(symbols.quiesce_tasks)(TASK_RETIRE_WAIT)
+        {
+            if let Some(tasks) = &self.tasks {
+                tasks.resume();
+            }
+            log::warn!(
+                "hot-reload task handler exceeded {TASK_RETIRE_WAIT:?}; \
+                 keeping the previous logic generation active"
+            );
+            discard_candidate(candidate);
+            return false;
+        }
+
+        // No old producer can inject and no old handler can enter. Join its
+        // workers before switching generations, then discard queued work
+        // while the old code is still mapped.
+        if let Some(symbols) = &self.symbols {
+            (symbols.shutdown_tasks)();
+        }
+        if let Some(tasks) = &self.tasks {
+            tasks.close();
+        }
 
         // Every successfully activated generation remains mapped for process
-        // lifetime. An editor object or saved state-origin function pointer
-        // can outlive the loader's own fields, and a task pool's workers are
-        // intentionally permanent.
+        // lifetime because editor objects and state-origin function pointers
+        // may outlive the loader fields. Its worker threads are already gone.
         let old_tasks = self.tasks.take();
         if let Some(old) = self.library.take() {
             self.retired_generations.push(RetiredGeneration {
@@ -499,7 +533,7 @@ impl<S: Sample> NativeLoader<S> {
     }
 
     /// Allocate fresh DSP state from the current dylib. Returns the
-    /// opaque state pointer and the origin dylib's [`StateOrigin`] - the
+    /// opaque state pointer and the origin dylib's `StateOrigin` - the
     /// `drop` / `save` fns the shell keeps to free or serialize that exact
     /// allocation, since they live in this dylib's code.
     #[must_use]
@@ -672,7 +706,10 @@ impl<S: Sample> Drop for NativeLoader<S> {
             let _ = route.clear_route();
         }
         if let Some(tasks) = &self.tasks {
-            let _ = tasks.retire(TASK_RETIRE_WAIT);
+            tasks.close();
+        }
+        if let Some(symbols) = &self.symbols {
+            (symbols.shutdown_tasks)();
         }
         // The loader owns only the resolved symbol table (bare fn
         // pointers, nothing to drop); the DSP state is owned and freed
@@ -704,14 +741,15 @@ fn retain_generation_mapping(generation: RetiredGeneration) {
 fn discard_candidate<S: Sample>(candidate: Candidate<S>) {
     let Candidate {
         tasks,
-        symbols: _,
+        symbols,
         library,
         hash: _,
         mtime: _,
         temp_path,
     } = candidate;
-    // The candidate was never activated or warmed, so no worker/editor/state
-    // can refer to it. Drop task closures before unloading their code.
+    // The candidate was never activated, so no producer can reach its lanes.
+    // Stop any pool warmed during candidate validation before unloading code.
+    (symbols.shutdown_tasks)();
     drop(tasks);
     drop(library);
     let _ = std::fs::remove_file(temp_path);

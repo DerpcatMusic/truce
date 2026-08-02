@@ -25,8 +25,9 @@
 //!
 //! A static plug-in module shares one pool across its instances. Each
 //! hot-reload logic generation has its own pool because its monomorphized
-//! handlers and queue operations live in that dylib; accepted generations
-//! warm and pin that pool before processing. A plugin that never declares a
+//! handlers and queue operations live in that dylib. The loader warms the
+//! candidate pool off-thread, then closes the old lanes and joins the old
+//! workers before swapping generations. A plugin that never declares a
 //! `BackgroundTask` spawns no threads.
 //!
 //! Because the pool is shared and small (`available_parallelism() - 1`,
@@ -41,9 +42,9 @@
 use std::ffi::c_void;
 #[cfg(all(unix, not(miri)))]
 use std::ffi::{c_char, c_int};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
-use std::sync::{Arc, OnceLock, RwLock};
-use std::thread::{self, Thread};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering, fence};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
@@ -94,15 +95,12 @@ struct Sink<T: Send + 'static> {
     /// picks up whatever the bower-out was injected for, so nothing is
     /// stranded. Unused in the concurrent (default) mode.
     draining: AtomicBool,
-    /// Cleared when a hot-reload retires this lane. Scheduling stays a
-    /// single atomic read on the calling thread; already-running work may
-    /// finish under its origin dylib, while queued work is discarded.
-    accepting: AtomicBool,
-    /// Producers between the accepting check and queue push. Retirement
-    /// waits for this bounded critical section before clearing the queues.
-    schedulers: AtomicUsize,
-    /// Pool workers currently inside this sink's drain entry point.
-    active_drains: AtomicUsize,
+    /// One linearizable scheduling gate: the high bit closes the lane and
+    /// the remaining bits count producers between admission and the final
+    /// pool injection. Retirement sets the closed bit and waits for the
+    /// count to reach zero before clearing queues, so a producer can never
+    /// enqueue after that clear.
+    schedule_state: AtomicUsize,
     /// `run(task)` is `move |task| task.run(&params)`, built
     /// once when the instance registers - never per task.
     run: Box<dyn Fn(T) + Send + Sync>,
@@ -146,7 +144,6 @@ impl<T: Send + 'static> Sink<T> {
 
 impl<T: Send + 'static> Drain for Sink<T> {
     fn drain(&self) {
-        let _drain = AtomicCountGuard::new(&self.active_drains);
         // Concurrent (default) mode: a second worker may drain this sink at
         // the same time. Handlers must be reentrancy-safe (see
         // `BackgroundTask::SERIALIZED`).
@@ -193,65 +190,117 @@ struct Shared {
     injector: ArrayQueue<Arc<dyn Drain>>,
     /// Round-robin cursor for choosing which worker to wake.
     next: AtomicUsize,
+    /// One linearizable execution gate: the high bit pauses workers before
+    /// they enter a sink and the remaining bits count drains already running.
+    /// Reload can therefore pause reversibly, wait for zero active handlers,
+    /// and either resume unchanged or stop/join without a new drain racing in.
+    execution_state: AtomicUsize,
+    stopping: AtomicBool,
 }
 
 struct Pool {
     shared: Arc<Shared>,
-    workers: Vec<Thread>,
+    workers: Box<[Thread]>,
+    joins: Mutex<Option<Vec<JoinHandle<()>>>>,
 }
 
-static POOL: OnceLock<Pool> = OnceLock::new();
+const POOL_COLD: u8 = 0;
+const POOL_STARTING: u8 = 1;
+const POOL_RUNNING: u8 = 2;
+const POOL_STOPPING: u8 = 3;
+const POOL_STOPPED: u8 = 4;
 
-fn pool() -> &'static Pool {
-    POOL.get_or_init(|| {
-        let shared = Arc::new(Shared {
-            injector: ArrayQueue::new(INJECTOR_CAP),
-            next: AtomicUsize::new(0),
-        });
-        // One fewer than the core count, floored at one, so the pool
-        // never starves the audio and main threads on a small machine.
-        let n = thread::available_parallelism().map_or(1, |p| p.get().saturating_sub(1).max(1));
-        let mut workers = Vec::with_capacity(n);
-        for _ in 0..n {
-            let shared = Arc::clone(&shared);
-            match thread::Builder::new()
-                .name("truce-task-pool".into())
-                .spawn(move || worker_loop(&shared))
-            {
-                Ok(handle) => workers.push(handle.thread().clone()),
-                // A failed spawn (thread/memory exhaustion) must not panic:
-                // pool init can run behind an `extern "C"` boundary in a
-                // host that doesn't catch unwinds (VST3 / VST2 / AAX / LV2),
-                // where an unwind aborts the whole DAW. Keep whatever
-                // workers spawned; if none did, `schedule` drops tasks
-                // instead of queueing work nothing will drain.
-                Err(e) => {
-                    eprintln!("[truce] task-pool worker spawn failed: {e}");
-                    break;
-                }
+/// Module-local pool slot. Hot logic dylibs are unique generations: each is
+/// started at most once, stopped at most once, and never restarted. A raw
+/// pointer keeps the process scheduling path to one acquire load with no
+/// lock or lazy allocation; initialization and destruction are explicitly
+/// off-thread exports owned by the hot loader.
+static POOL_STATE: AtomicU8 = AtomicU8::new(POOL_COLD);
+static POOL_PTR: AtomicPtr<Pool> = AtomicPtr::new(core::ptr::null_mut());
+
+fn running_pool() -> Option<&'static Pool> {
+    if POOL_STATE.load(Ordering::Acquire) != POOL_RUNNING {
+        return None;
+    }
+    let ptr = POOL_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `start_pool` publishes a fully initialized `Box<Pool>` before
+    // the RUNNING store. Hot shutdown is called only after every managed lane
+    // is closed and its producer count is zero, so no scheduling caller can
+    // retain this reference when `shutdown_hot_reload_pool` reclaims it.
+    Some(unsafe { &*ptr })
+}
+
+fn start_pool(pin_module: bool) -> bool {
+    match POOL_STATE.compare_exchange(
+        POOL_COLD,
+        POOL_STARTING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(POOL_RUNNING) => {
+            return running_pool().is_some_and(|pool| !pool.workers.is_empty());
+        }
+        Err(POOL_STARTING) => {
+            while POOL_STATE.load(Ordering::Acquire) == POOL_STARTING {
+                thread::yield_now();
+            }
+            return running_pool().is_some_and(|pool| !pool.workers.is_empty());
+        }
+        Err(_) => return false,
+    }
+
+    let shared = Arc::new(Shared {
+        injector: ArrayQueue::new(INJECTOR_CAP),
+        next: AtomicUsize::new(0),
+        execution_state: AtomicUsize::new(0),
+        stopping: AtomicBool::new(false),
+    });
+    // One fewer than the core count, floored at one, so the pool never
+    // starves the audio and main threads on a small machine.
+    let n = thread::available_parallelism().map_or(1, |p| p.get().saturating_sub(1).max(1));
+    let mut workers = Vec::with_capacity(n);
+    let mut joins = Vec::with_capacity(n);
+    for _ in 0..n {
+        let shared = Arc::clone(&shared);
+        match thread::Builder::new()
+            .name("truce-task-pool".into())
+            .spawn(move || worker_loop(&shared))
+        {
+            Ok(handle) => {
+                workers.push(handle.thread().clone());
+                joins.push(handle);
+            }
+            // Pool startup is always off-thread, but still must not unwind
+            // across the hot loader's Rust ABI export. Keep any workers that
+            // did start; a zero-worker pool is reported as unavailable.
+            Err(e) => {
+                eprintln!("[truce] task-pool worker spawn failed: {e}");
+                break;
             }
         }
-        // The workers loop forever with no shutdown path, so pin this
-        // module in memory: a host that `dlclose`s it on last-instance
-        // teardown must not leave a parked worker to wake into unmapped
-        // code. Only once we actually have workers to protect.
-        if !workers.is_empty() {
-            pin_current_module();
-        }
-        Pool { shared, workers }
-    })
+    }
+    if pin_module && !workers.is_empty() {
+        pin_current_module();
+    }
+    let available = !workers.is_empty();
+    let pool = Box::new(Pool {
+        shared,
+        workers: workers.into_boxed_slice(),
+        joins: Mutex::new(Some(joins)),
+    });
+    POOL_PTR.store(Box::into_raw(pool), Ordering::Release);
+    POOL_STATE.store(POOL_RUNNING, Ordering::Release);
+    available
 }
 
-/// Pin the module `truce-core` is linked into (the plugin cdylib in a
-/// static build, or one hot-reload logic dylib generation) so it is never
-/// unmapped. The pool's workers loop forever - park + drain - with no
-/// shutdown path and no `JoinHandle`s; if the host `dlclose`d the module
-/// on last-instance teardown while a worker was parked, it would wake
-/// with its program counter in unmapped code and take down the DAW
-/// (Bitwig, Cubase, and JUCE hosts all unload). Pinning trades a small
-/// permanent mapping for eliminating that crash class - the standard fix
-/// for a persistent plugin helper thread. Called once, and only when the
-/// pool actually spawned workers.
+/// Pin a static plugin module so its process-lifetime shared workers can
+/// never wake into unmapped code after host teardown. Hot logic generations
+/// do not use this: their loader closes every lane, stops and joins their
+/// workers, and separately retains the mapping for editor/vtable safety.
 #[cfg(all(unix, not(miri)))]
 fn pin_current_module() {
     // Field names mirror the platform's `Dl_info`; only `dli_fname` is
@@ -318,22 +367,172 @@ fn pin_current_module() {
 #[cfg(any(miri, not(any(unix, windows))))]
 fn pin_current_module() {}
 
-/// Eagerly start this loaded module's pool on the calling thread. Static
-/// shells call this at instantiation; hot shells call the accepted logic
-/// generation's exported warmer, so the worker threads exist before the
-/// audio thread ever schedules. Without it a plugin that first schedules
-/// from `process()` (the "rebuild the filter when a knob moves" pattern,
-/// with no startup work in `init` to warm the pool) would cold-start the
-/// threads inside the audio callback. Idempotent: the pool is a singleton
-/// within this loaded module after the first call.
+/// Eagerly start a static plugin module's process-lifetime pool and pin that
+/// module. The static shell calls this off-thread before audio can schedule.
 pub fn warm_pool() {
-    let _ = pool();
+    let _ = start_pool(true);
 }
 
-fn worker_loop(shared: &Shared) -> ! {
+/// Start one hot logic generation's restart-forbidden pool off-thread.
+/// Returns false only when no worker could be created.
+#[doc(hidden)]
+#[must_use]
+pub fn warm_hot_reload_pool() -> bool {
+    start_pool(false)
+}
+
+const POOL_PAUSED: usize = 1usize << (usize::BITS - 1);
+const POOL_EXECUTOR_MASK: usize = POOL_PAUSED - 1;
+
+struct ExecutionGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ExecutionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn begin_execution(shared: &Shared) -> Option<ExecutionGuard<'_>> {
+    // One RMW is the worker-entry linearization point. An entry before the
+    // PAUSED fetch_or contributes to the count quiesce waits on; an entry
+    // after it observes the bit and retains its popped sink without calling
+    // plugin code. The guard's decrement lets an Acquire zero observation
+    // prove every admitted handler has returned.
+    let previous = shared.execution_state.fetch_add(1, Ordering::AcqRel);
+    let guard = ExecutionGuard(&shared.execution_state);
+    (previous & POOL_PAUSED == 0).then_some(guard)
+}
+
+fn wake_workers(pool: &Pool) {
+    for worker in &pool.workers {
+        worker.unpark();
+    }
+}
+
+/// Reversibly pause one hot generation before any new handler entry and wait
+/// for handlers already running to leave. A timeout restores the running pool
+/// exactly as it was; workers that already popped an injector entry retain it
+/// until resume instead of losing queued work.
+#[doc(hidden)]
+#[must_use]
+pub fn quiesce_hot_reload_pool(timeout: Duration) -> bool {
+    let Some(pool) = running_pool() else {
+        return true;
+    };
+    pool.shared
+        .execution_state
+        .fetch_or(POOL_PAUSED, Ordering::AcqRel);
+    wake_workers(pool);
+
+    let deadline = Instant::now() + timeout;
+    while pool.shared.execution_state.load(Ordering::Acquire) & POOL_EXECUTOR_MASK != 0
+        && Instant::now() < deadline
+    {
+        thread::yield_now();
+    }
+    if pool.shared.execution_state.load(Ordering::Acquire) & POOL_EXECUTOR_MASK == 0 {
+        return true;
+    }
+
+    pool.shared
+        .execution_state
+        .fetch_and(POOL_EXECUTOR_MASK, Ordering::AcqRel);
+    wake_workers(pool);
+    false
+}
+
+/// Stop and join one hot logic generation's pool. The loader calls this only
+/// after all of that generation's lanes are closed and admitted producers
+/// have left their scheduling critical sections. Never called on audio.
+#[doc(hidden)]
+pub fn shutdown_hot_reload_pool() {
     loop {
+        match POOL_STATE.load(Ordering::Acquire) {
+            POOL_COLD | POOL_STOPPED => return,
+            POOL_STARTING => thread::yield_now(),
+            POOL_RUNNING => {
+                if POOL_STATE
+                    .compare_exchange(
+                        POOL_RUNNING,
+                        POOL_STOPPING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            POOL_STOPPING => {
+                while POOL_STATE.load(Ordering::Acquire) == POOL_STOPPING {
+                    thread::yield_now();
+                }
+                return;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let ptr = POOL_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        POOL_STATE.store(POOL_STOPPED, Ordering::Release);
+        return;
+    }
+    // SAFETY: this function won the sole RUNNING -> STOPPING transition;
+    // the pointer remains owned by POOL_PTR until after all joins below.
+    let pool = unsafe { &*ptr };
+    // Reload calls `quiesce_hot_reload_pool` first. Teardown may come here
+    // directly, so close the execution gate and wait without a deadline:
+    // unloading with a live handler is unsound, while handlers are required
+    // to be short and nonblocking.
+    pool.shared
+        .execution_state
+        .fetch_or(POOL_PAUSED, Ordering::AcqRel);
+    while pool.shared.execution_state.load(Ordering::Acquire) & POOL_EXECUTOR_MASK != 0 {
+        thread::yield_now();
+    }
+    pool.shared.stopping.store(true, Ordering::Release);
+    wake_workers(pool);
+    let joins = pool
+        .joins
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_default();
+    for join in joins {
+        let _ = join.join();
+    }
+    while pool.shared.injector.pop().is_some() {}
+
+    POOL_PTR.store(core::ptr::null_mut(), Ordering::Release);
+    // SAFETY: all producers were excluded by lane closure before shutdown,
+    // every worker is joined, and the injector no longer owns a sink.
+    drop(unsafe { Box::from_raw(ptr) });
+    POOL_STATE.store(POOL_STOPPED, Ordering::Release);
+}
+
+fn worker_loop(shared: &Shared) {
+    loop {
+        if shared.stopping.load(Ordering::Acquire) {
+            return;
+        }
         while let Some(sink) = shared.injector.pop() {
-            sink.drain();
+            loop {
+                if shared.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(_executing) = begin_execution(shared) {
+                    sink.drain();
+                    break;
+                }
+                // Keep ownership of this injector entry while a reversible
+                // pause is active. On abort it runs normally; on shutdown it
+                // drops only after the stopping flag is published.
+                thread::park_timeout(PARK_TIMEOUT);
+            }
+        }
+        if shared.stopping.load(Ordering::Acquire) {
+            return;
         }
         // Nothing pending: park. A concurrent push + `unpark` either
         // beats the park (the token makes this return at once) or wakes
@@ -348,11 +547,13 @@ fn worker_loop(shared: &Shared) -> ! {
 /// injector is full so the caller can clear `scheduled` and let a later
 /// `arm` retry, rather than leaving the sink flagged-but-unqueued.
 fn schedule(sink: Arc<dyn Drain>) -> bool {
-    let pool = pool();
-    // No workers (every spawn failed at pool init): drop the task rather
-    // than queue work nothing will ever drain, matching the "queue full ->
-    // drop" policy. The caller clears `scheduled` so a later `arm` retries.
-    if pool.workers.is_empty() {
+    // Pool startup is never lazy here: static and hot shells warm off-thread
+    // before processing. A missing/stopping pool rejects instead of creating
+    // threads, allocating, locking, or logging on the caller.
+    let Some(pool) = running_pool() else {
+        return false;
+    };
+    if pool.workers.is_empty() || pool.shared.stopping.load(Ordering::Acquire) {
         return false;
     }
     if pool.shared.injector.push(sink).is_err() {
@@ -385,9 +586,8 @@ impl<T: Send + 'static> Clone for TaskSpawner<T> {
 impl<T: Send + 'static> TaskSpawner<T> {
     /// Register an instance's handler with the shared pool. `run` is the
     /// monomorphized `move |task| task.run(&params)`, built once
-    /// by the shell. The pool itself is not started until the first task
-    /// is actually scheduled, so constructing a spawner for a plugin that
-    /// never schedules costs only the (small) inbound queue.
+    /// by the shell. Static and hot shells warm the owning module's pool
+    /// off-thread before this spawner can reach `process`.
     ///
     /// The handler may run concurrently with itself for one instance; use
     /// [`Self::new_serialized`] for a handler that isn't reentrancy-safe.
@@ -410,9 +610,7 @@ impl<T: Send + 'static> TaskSpawner<T> {
                 scheduled: AtomicBool::new(false),
                 serialized,
                 draining: AtomicBool::new(false),
-                accepting: AtomicBool::new(true),
-                schedulers: AtomicUsize::new(0),
-                active_drains: AtomicUsize::new(0),
+                schedule_state: AtomicUsize::new(0),
                 run: Box::new(run),
             }),
         }
@@ -472,52 +670,48 @@ impl<T: Send + 'static> TaskSpawner<T> {
     }
 }
 
-struct AtomicCountGuard<'a>(&'a AtomicUsize);
+const LANE_CLOSED: usize = 1usize << (usize::BITS - 1);
+const LANE_PRODUCER_MASK: usize = LANE_CLOSED - 1;
 
-impl<'a> AtomicCountGuard<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self(counter)
-    }
-}
+struct ScheduleGuard<'a>(&'a AtomicUsize);
 
-impl Drop for AtomicCountGuard<'_> {
+impl Drop for ScheduleGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
 impl<T: Send + 'static> Sink<T> {
-    fn begin_schedule(&self) -> Option<AtomicCountGuard<'_>> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return None;
-        }
-        let guard = AtomicCountGuard::new(&self.schedulers);
-        self.accepting.load(Ordering::Acquire).then_some(guard)
+    fn begin_schedule(&self) -> Option<ScheduleGuard<'_>> {
+        // One RMW is the admission linearization point. If it precedes
+        // retirement's CLOSED fetch_or, retirement observes this producer in
+        // the same atomic's modification order and waits for its decrement.
+        // If it follows CLOSED, `previous` contains the bit and this producer
+        // removes its count without touching either queue. Therefore queue
+        // clearing after a zero-count observation cannot race a later push.
+        // The low-half count cannot overflow in practice: that requires at
+        // least 2^(usize::BITS-1) simultaneous scheduling callers.
+        let previous = self.schedule_state.fetch_add(1, Ordering::AcqRel);
+        let guard = ScheduleGuard(&self.schedule_state);
+        (previous & LANE_CLOSED == 0).then_some(guard)
     }
 }
 
 trait RetireLane: Send + Sync {
     fn retire(&self, deadline: Instant) -> bool;
     fn resume(&self);
+    fn close(&self);
 }
 
 impl<T: Send + 'static> RetireLane for Sink<T> {
     fn retire(&self, deadline: Instant) -> bool {
-        self.accepting.store(false, Ordering::Release);
-        while self.schedulers.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+        self.schedule_state.fetch_or(LANE_CLOSED, Ordering::AcqRel);
+        while self.schedule_state.load(Ordering::Acquire) & LANE_PRODUCER_MASK != 0
+            && Instant::now() < deadline
+        {
             thread::yield_now();
         }
-        if self.schedulers.load(Ordering::Acquire) != 0 {
-            self.resume();
-            return false;
-        }
-        while self.coalesced.pop().is_some() {}
-        while self.queue.pop().is_some() {}
-        while self.active_drains.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
-            thread::yield_now();
-        }
-        if self.active_drains.load(Ordering::Acquire) != 0 {
+        if self.schedule_state.load(Ordering::Acquire) & LANE_PRODUCER_MASK != 0 {
             self.resume();
             return false;
         }
@@ -525,7 +719,21 @@ impl<T: Send + 'static> RetireLane for Sink<T> {
     }
 
     fn resume(&self) {
-        self.accepting.store(true, Ordering::Release);
+        // Preserve any post-close rejected producers still unwinding their
+        // guard. Clearing only the bit makes abort atomic: old and new
+        // producers may proceed, and no queue clear occurred if admission
+        // itself timed out.
+        self.schedule_state
+            .fetch_and(LANE_PRODUCER_MASK, Ordering::AcqRel);
+    }
+
+    fn close(&self) {
+        self.schedule_state.fetch_or(LANE_CLOSED, Ordering::AcqRel);
+        while self.schedule_state.load(Ordering::Acquire) & LANE_PRODUCER_MASK != 0 {
+            thread::yield_now();
+        }
+        while self.coalesced.pop().is_some() {}
+        while self.queue.pop().is_some() {}
     }
 }
 
@@ -554,6 +762,12 @@ impl LaneSet {
             }
         }
         true
+    }
+
+    fn close(&self) {
+        for lane in &self.0 {
+            lane.control.close();
+        }
     }
 }
 
@@ -631,7 +845,9 @@ impl AnyTaskSpawner {
     }
 
     /// Retire the active generation without installing a replacement.
-    /// Existing typed handles reject new work; running handlers finish.
+    /// Existing typed handles reject new work. Queued and running work stays
+    /// intact until the loader separately quiesces the owning worker pool, so
+    /// an aborted reload can resume this generation without losing tasks.
     pub fn retire(&self, timeout: Duration) -> bool {
         match self.0.as_ref() {
             TaskLanes::Fixed(lanes) => lanes.retire(timeout),
@@ -639,6 +855,39 @@ impl AnyTaskSpawner {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retire(timeout),
+        }
+    }
+
+    /// Re-open lanes after a reload aborts. No-op for a routed handle's empty
+    /// generation and never used after permanent close.
+    pub fn resume(&self) {
+        match self.0.as_ref() {
+            TaskLanes::Fixed(lanes) => {
+                for lane in &lanes.0 {
+                    lane.control.resume();
+                }
+            }
+            TaskLanes::Routed(route) => {
+                let lanes = route
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for lane in &lanes.0 {
+                    lane.control.resume();
+                }
+            }
+        }
+    }
+
+    /// Permanently close all lanes and wait only for admitted scheduling
+    /// calls to leave their bounded queue/injection section. Loader teardown
+    /// follows this with off-thread worker shutdown/join.
+    pub fn close(&self) {
+        match self.0.as_ref() {
+            TaskLanes::Fixed(lanes) => lanes.close(),
+            TaskLanes::Routed(route) => route
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .close(),
         }
     }
 

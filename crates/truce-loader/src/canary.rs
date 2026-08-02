@@ -58,7 +58,10 @@ use truce_gui_types::theme::{Color, Theme};
 /// logic dylibs export `truce_build_tasks` plus `truce_warm_tasks`. A stale
 /// epoch-6 dylib has the old init signature and no task constructor, so it
 /// must be rejected before either symbol is called.
-pub const ABI_EPOCH: u32 = 7;
+/// Epoch 8: task-pool warmup reports failure and logic dylibs export bounded
+/// quiesce plus shutdown/join operations. A stale epoch-7 dylib has immortal
+/// workers and the old warmer signature, so it must be rejected before load.
+pub const ABI_EPOCH: u32 = 8;
 
 /// ABI fingerprint. Compared between shell and dylib before loading.
 ///

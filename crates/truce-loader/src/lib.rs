@@ -94,12 +94,39 @@ macro_rules! export_plugin {
     ($logic:ty, $params:ty $(, tasks: [$($task:ty),+])?) => {
         /// Start this logic generation's own task pool before any DSP call
         /// can schedule onto it. The shell calls this export on its loader
-        /// thread only after the candidate has been accepted.
+        /// thread before activation and rejects the generation if no worker
+        /// can be created.
         #[unsafe(no_mangle)]
-        pub fn truce_warm_tasks() {
+        pub fn truce_warm_tasks() -> bool {
+            #[allow(unused_mut)]
+            let mut ready = true;
             $(
                 let _ = ::core::marker::PhantomData::<($($task,)+)>;
-                $crate::__macro_deps::truce_core::tasks::warm_pool();
+                ready = $crate::__macro_deps::truce_core::tasks::warm_hot_reload_pool();
+            )?
+            ready
+        }
+
+        /// Pause this generation at a worker-entry boundary. A timeout is
+        /// reversible: the pool resumes without losing its queued work.
+        #[unsafe(no_mangle)]
+        pub fn truce_quiesce_tasks(timeout: ::std::time::Duration) -> bool {
+            #[allow(unused_mut)]
+            let mut quiescent = true;
+            $(
+                let _ = ::core::marker::PhantomData::<($($task,)+)>;
+                quiescent = $crate::__macro_deps::truce_core::tasks::quiesce_hot_reload_pool(timeout);
+            )?
+            quiescent
+        }
+
+        /// Stop and join this generation's worker pool. The loader closes all
+        /// task lanes before calling this off-thread.
+        #[unsafe(no_mangle)]
+        pub fn truce_shutdown_tasks() {
+            $(
+                let _ = ::core::marker::PhantomData::<($($task,)+)>;
+                $crate::__macro_deps::truce_core::tasks::shutdown_hot_reload_pool();
             )?
         }
 

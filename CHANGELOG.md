@@ -9,7 +9,7 @@ Breaking: move every direct `truce*` dependency in a plugin to 7.0 together. `tr
 - `truce-egui` shares BUFFR's egui 0.35 and wgpu 29 dependency graph, so native BUFFR editor code can move onto Truce without a second incompatible egui stack.
 - Plug-ins can inspect whether the preceding output-event block succeeded, overflowed staging, met a full host queue, used an unsupported carrier, or contained invalid data; MIDI and process-emitted parameter feedback reject known incomplete, failed, or unavailable blocks before delivery across CLAP, VST3, Audio Unit, AAX, LV2, VST2, standalone, and the offline driver.
 - CLAP descriptors keep fractional fixed-step parameters loadable by exposing them as continuous host ranges while Truce still applies the plug-in's requested quantization.
-- Managed background tasks now work in hot-reload shells as well as release builds; each logic build warms its own workers before audio starts, editor work stays bound to the build that created it, and reloads cancel queued work without blocking the audio thread. Activated hot-reload builds stay mapped for the host process lifetime so in-flight work and open editors cannot call unloaded code.
+- Managed background tasks now work in hot-reload shells as well as release builds; each logic build warms its own workers before audio starts, editor work stays bound to the build that created it, and reloads cancel queued work without blocking the audio thread. Reloads stop and join retired workers instead of accumulating threads, abort cleanly when a handler cannot retire in time, and keep activated code mapped so open editors and saved state callbacks remain valid.
 
 ## 6.3.0
 
