@@ -8,7 +8,12 @@
 //! allocating or blocking, and a pool worker drains them. Feedback to
 //! the audio thread stays the plugin's job through shared `#[skip]`
 //! channels - the pool owns only the worker threads and the inbound
-//! queue.
+//! queue. One lightweight non-realtime notifier owns wake syscalls and retries
+//! accepted lane-local work that could not enter the bounded global injector;
+//! scheduling from `process` remains atomics and lock-free queues only.
+//! A handler that returns a continuation yields after one pass; workers
+//! alternate that lane-owned tail with newly submitted work and with other
+//! ready instances instead of looping one long catch-up job in place.
 //!
 //! ## Concurrency
 //!
@@ -38,12 +43,13 @@
 
 // Gated on `not(miri)` to match `pin_current_module`, which is a no-op
 // under Miri (no dynamic loader to pin), so these FFI types aren't used.
+use std::collections::VecDeque;
 #[cfg(all(any(unix, windows), not(miri)))]
 use std::ffi::c_void;
 #[cfg(all(unix, not(miri)))]
 use std::ffi::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering, fence};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
@@ -61,16 +67,45 @@ pub const TASK_QUEUE_PREALLOC: usize = 256;
 /// Sized well past any realistic simultaneous-instance count.
 const INJECTOR_CAP: usize = 4096;
 
-/// How long a worker parks before a defensive re-check. Wakes are
-/// explicit (`unpark` after a push), so this only bounds the worst case
-/// if an `unpark` is ever missed.
+/// Ordinary worker defensive timeout. If notifier startup fails, exactly one
+/// designated worker uses [`NOTIFIER_INTERVAL`] instead; the others keep this
+/// long park so fallback does not become a thundering herd.
 const PARK_TIMEOUT: Duration = Duration::from_secs(1);
+/// One non-realtime notifier polls the atomic scheduling epoch at this rate,
+/// retries lanes that missed the bounded injector, and owns all wake syscalls.
+const NOTIFIER_INTERVAL: Duration = Duration::from_millis(1);
+/// Serialized contention owns a real injector entry, but must not spin on it
+/// while the current bounded handler finishes.
+const BUSY_RETRY_TIMEOUT: Duration = Duration::from_millis(1);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    Done,
+    Deferred,
+    Busy,
+}
 
 /// A drainable instance queue, type-erased so the one pool holds many
 /// task types at once.
 trait Drain: Send + Sync {
-    fn drain(&self);
+    /// Run one fair drain turn and report whether the worker owns a later
+    /// continuation turn or collided with this serialized lane's handler.
+    fn drain(&self) -> DrainOutcome;
+    /// Claim one off-thread retry request and arm this lane for injection.
+    fn claim_retry(&self) -> bool;
+    /// Restore a claimed retry after the bounded injector was still full.
+    fn retry_failed(&self);
 }
+
+/// Lanes register off-thread when their spawner is built. The notifier scans
+/// weak handles only, so registry membership never extends an instance's life.
+static REGISTERED_LANES: Mutex<Vec<Weak<dyn Drain>>> = Mutex::new(Vec::new());
+/// Audio/editor scheduling publishes only this atomic epoch; the notifier owns
+/// `Thread::unpark` and every retry of a full/unavailable injector.
+static NOTIFY_EPOCH: AtomicUsize = AtomicUsize::new(0);
+/// Sticky module-local hint: the notifier clears it only for one retry scan
+/// and republishes it when the injector is still saturated.
+static RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Per-instance inbound queue plus the monomorphized handler. Shared
 /// (`Arc`) between the schedulers (audio thread / editor / init, via
@@ -83,17 +118,25 @@ struct Sink<T: Send + 'static> {
     /// requests between two drains collapses to one execution instead of
     /// running one build per intermediate target.
     coalesced: ArrayQueue<T>,
+    /// Preallocated lane-owned tails returned by managed handlers. Overflow
+    /// drops the newest returned tail instead of allocating or blocking.
+    continuation: ArrayQueue<T>,
+    /// Alternates lane-owned continuation work with newly submitted work so
+    /// neither source can starve the other.
+    prefer_continuation: AtomicBool,
     /// Coalesces wake-ups: set when this sink is already queued in the
     /// injector, so a burst of pushes injects it once.
     scheduled: AtomicBool,
+    /// Set when a local task was accepted but its lane could not enter the
+    /// bounded global injector. Cleared only by the non-realtime retry owner.
+    retry_requested: AtomicBool,
     /// Serialized ("one-slot") mode: when set, at most one worker runs
     /// `run` for this sink at a time. `false` (default) lets a second
     /// worker drain concurrently for throughput.
     serialized: bool,
     /// Exclusive-drain guard for [`Self::serialized`]. A worker that finds
-    /// it already held bows out; the holder's re-check loop in `drain`
-    /// picks up whatever the bower-out was injected for, so nothing is
-    /// stranded. Unused in the concurrent (default) mode.
+    /// it already held defers its injector entry instead of spinning or
+    /// draining again in the current turn. Unused in concurrent mode.
     draining: AtomicBool,
     /// One linearizable scheduling gate: the high bit closes the lane and
     /// the remaining bits count producers between admission and the final
@@ -103,7 +146,7 @@ struct Sink<T: Send + 'static> {
     schedule_state: AtomicUsize,
     /// `run(task)` is `move |task| task.run(&params)`, built
     /// once when the instance registers - never per task.
-    run: Box<dyn Fn(T) + Send + Sync>,
+    run: Box<dyn Fn(T) -> Option<T> + Send + Sync>,
 }
 
 impl<T: Send + 'static> Sink<T> {
@@ -111,14 +154,31 @@ impl<T: Send + 'static> Sink<T> {
     /// shared worker (which would strand every other instance's tasks).
     /// `run`/`task` are effectively unwind-safe: `run` is `&`-borrowed and
     /// a poisoned task is simply dropped.
-    fn run_one(&self, task: T) {
+    fn run_one(&self, task: T) -> bool {
+        if self.schedule_state.load(Ordering::Acquire) & LANE_CLOSED != 0 {
+            return false;
+        }
         let run = &self.run;
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(task)));
+        let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(task)))
+            .ok()
+            .flatten();
+        if let Some(next) = next {
+            // Closing an instance never waits for handler duration. Only the
+            // bounded tail publication enters the lane gate: close either
+            // precedes it and rejects the continuation, or follows it, waits
+            // for this short section, and clears the published tail.
+            let Some(_publishing) = self.begin_schedule() else {
+                return false;
+            };
+            self.continuation.push(next).is_ok()
+        } else {
+            false
+        }
     }
 }
 
 impl<T: Send + 'static> Sink<T> {
-    /// Clear `scheduled`, then run every currently-queued task once. The
+    /// Clear `scheduled`, then run one fair task turn. The
     /// clear-before-drain + `SeqCst` fence is the stranding-avoidance
     /// handshake: a task pushed mid-drain re-arms the sink (its `arm` swap
     /// sees `scheduled == false`) instead of being stranded. Release/AcqRel
@@ -126,30 +186,37 @@ impl<T: Send + 'static> Sink<T> {
     /// without the `SeqCst` store + fence a worker could clear the flag, read
     /// the queue empty, and a concurrent producer could push a task and read
     /// the flag still `true` - stranding it. Only `SeqCst` forbids that.
-    fn drain_queues(&self) {
+    fn drain_queues(&self) -> bool {
         self.scheduled.store(false, Ordering::SeqCst);
         fence(Ordering::SeqCst);
-        // The coalesced slot held only the newest target, so a burst of
-        // `spawn_coalescing` calls since the last drain runs once here, not
-        // once per intermediate target.
-        if let Some(task) = self.coalesced.pop() {
-            self.run_one(task);
+        let continuation = || self.continuation.pop();
+        let submitted = || self.coalesced.pop().or_else(|| self.queue.pop());
+        let task = if self.prefer_continuation.fetch_xor(true, Ordering::Relaxed) {
+            continuation().or_else(submitted)
+        } else {
+            submitted().or_else(continuation)
+        };
+        if let Some(task) = task {
+            let _ = self.run_one(task);
         }
-        // FIFO tasks each run.
-        while let Some(task) = self.queue.pop() {
-            self.run_one(task);
-        }
+        fence(Ordering::SeqCst);
+        let pending =
+            !self.queue.is_empty() || !self.coalesced.is_empty() || !self.continuation.is_empty();
+        pending && !self.scheduled.swap(true, Ordering::SeqCst)
     }
 }
 
 impl<T: Send + 'static> Drain for Sink<T> {
-    fn drain(&self) {
+    fn drain(&self) -> DrainOutcome {
         // Concurrent (default) mode: a second worker may drain this sink at
         // the same time. Handlers must be reentrancy-safe (see
         // `BackgroundTask::SERIALIZED`).
         if !self.serialized {
-            self.drain_queues();
-            return;
+            return if self.drain_queues() {
+                DrainOutcome::Deferred
+            } else {
+                DrainOutcome::Done
+            };
         }
         // Serialized ("one-slot") mode: run the handler for this instance on
         // at most one worker at a time. A worker that finds the guard held
@@ -157,44 +224,82 @@ impl<T: Send + 'static> Drain for Sink<T> {
         // handshake below stays the sole no-stranding signal, exactly as in
         // the concurrent path.
         if self.draining.swap(true, Ordering::Acquire) {
-            return;
+            return DrainOutcome::Busy;
         }
-        loop {
-            self.drain_queues();
-            self.draining.store(false, Ordering::Release);
-            fence(Ordering::SeqCst);
-            // Re-check the *scheduled flag*, not the queue: a producer that
-            // armed during the drain set it with a SeqCst swap ordered after
-            // `drain_queues`'s SeqCst clear, so we either observe it here and
-            // re-drain, or its swap saw our clear and injected a fresh drain.
-            // (Reading the queue instead would race - a plain queue load
-            // isn't synchronized with the producer's push, so it could miss a
-            // task a re-injection carried and strand it.) `drain_queues`
-            // clears the flag each pass, so the loop makes progress and can't
-            // spin: at most one extra empty drain after the last arm.
-            if !self.scheduled.load(Ordering::SeqCst) {
-                return;
-            }
-            // Work remains. Re-take the guard and drain again; if another
-            // worker took it first, that worker now owns the remainder.
-            if self.draining.swap(true, Ordering::Acquire) {
-                return;
-            }
+        let reinject = self.drain_queues();
+        self.draining.store(false, Ordering::Release);
+        if reinject {
+            DrainOutcome::Deferred
+        } else {
+            DrainOutcome::Done
         }
     }
+
+    fn claim_retry(&self) -> bool {
+        if !self.retry_requested.swap(false, Ordering::AcqRel)
+            || self.schedule_state.load(Ordering::Acquire) & LANE_CLOSED != 0
+        {
+            return false;
+        }
+        fence(Ordering::SeqCst);
+        !self.scheduled.swap(true, Ordering::SeqCst)
+    }
+
+    fn retry_failed(&self) {
+        self.scheduled.store(false, Ordering::SeqCst);
+        if self.schedule_state.load(Ordering::Acquire) & LANE_CLOSED == 0 {
+            self.retry_requested.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn register_lane(sink: &Arc<dyn Drain>) {
+    REGISTERED_LANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Arc::downgrade(sink));
+}
+
+/// Retry every accepted lane that previously missed the global injector.
+/// Called only by non-realtime pool threads.
+fn retry_registered(shared: &Shared) -> (usize, bool) {
+    let mut injected = 0_usize;
+    let mut remaining = false;
+    REGISTERED_LANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|weak| {
+            let Some(sink) = weak.upgrade() else {
+                return false;
+            };
+            if sink.claim_retry() {
+                match shared.injector.push(sink) {
+                    Ok(()) => injected = injected.saturating_add(1),
+                    Err(sink) => {
+                        sink.retry_failed();
+                        remaining = true;
+                    }
+                }
+            }
+            true
+        });
+    (injected, remaining)
 }
 
 /// Worker-visible pool state: the injector of ready sinks. Held in an
 /// `Arc` so every worker closure can reach it.
 struct Shared {
     injector: ArrayQueue<Arc<dyn Drain>>,
-    /// Round-robin cursor for choosing which worker to wake.
-    next: AtomicUsize,
+    /// Non-realtime notifier's round-robin wake cursor.
+    next_worker: AtomicUsize,
     /// One linearizable execution gate: the high bit pauses workers before
     /// they enter a sink and the remaining bits count drains already running.
     /// Reload can therefore pause reversibly, wait for zero active handlers,
     /// and either resume unchanged or stop/join without a new drain racing in.
     execution_state: AtomicUsize,
+    /// Published off-thread after notifier startup. The first worker is the
+    /// sole short-poll fallback while this remains false.
+    notifier_running: AtomicBool,
     stopping: AtomicBool,
 }
 
@@ -202,6 +307,8 @@ struct Pool {
     shared: Arc<Shared>,
     workers: Box<[Thread]>,
     joins: Mutex<Option<Vec<JoinHandle<()>>>>,
+    notifier: Option<Thread>,
+    notifier_join: Mutex<Option<JoinHandle<()>>>,
 }
 
 const POOL_COLD: u8 = 0;
@@ -255,8 +362,9 @@ fn start_pool(pin_module: bool) -> bool {
 
     let shared = Arc::new(Shared {
         injector: ArrayQueue::new(INJECTOR_CAP),
-        next: AtomicUsize::new(0),
+        next_worker: AtomicUsize::new(0),
         execution_state: AtomicUsize::new(0),
+        notifier_running: AtomicBool::new(false),
         stopping: AtomicBool::new(false),
     });
     // One fewer than the core count, floored at one, so the pool never
@@ -264,11 +372,11 @@ fn start_pool(pin_module: bool) -> bool {
     let n = thread::available_parallelism().map_or(1, |p| p.get().saturating_sub(1).max(1));
     let mut workers = Vec::with_capacity(n);
     let mut joins = Vec::with_capacity(n);
-    for _ in 0..n {
+    for index in 0..n {
         let shared = Arc::clone(&shared);
         match thread::Builder::new()
             .name("truce-task-pool".into())
-            .spawn(move || worker_loop(&shared))
+            .spawn(move || worker_loop(&shared, index == 0))
         {
             Ok(handle) => {
                 workers.push(handle.thread().clone());
@@ -286,11 +394,27 @@ fn start_pool(pin_module: bool) -> bool {
     if pin_module && !workers.is_empty() {
         pin_current_module();
     }
+    let notifier_join = if workers.is_empty() {
+        None
+    } else {
+        let notifier_workers = workers.clone();
+        let notifier_shared = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("truce-task-notifier".into())
+            .spawn(move || notifier_loop(&notifier_shared, &notifier_workers))
+            .ok()
+    };
+    shared
+        .notifier_running
+        .store(notifier_join.is_some(), Ordering::Release);
+    let notifier = notifier_join.as_ref().map(|handle| handle.thread().clone());
     let available = !workers.is_empty();
     let pool = Box::new(Pool {
         shared,
         workers: workers.into_boxed_slice(),
         joins: Mutex::new(Some(joins)),
+        notifier,
+        notifier_join: Mutex::new(notifier_join),
     });
     POOL_PTR.store(Box::into_raw(pool), Ordering::Release);
     POOL_STATE.store(POOL_RUNNING, Ordering::Release);
@@ -493,6 +617,17 @@ pub fn shutdown_hot_reload_pool() {
     }
     pool.shared.stopping.store(true, Ordering::Release);
     wake_workers(pool);
+    if let Some(notifier) = &pool.notifier {
+        notifier.unpark();
+    }
+    if let Some(join) = pool
+        .notifier_join
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        let _ = join.join();
+    }
     let joins = pool
         .joins
         .lock()
@@ -511,18 +646,75 @@ pub fn shutdown_hot_reload_pool() {
     POOL_STATE.store(POOL_STOPPED, Ordering::Release);
 }
 
-fn worker_loop(shared: &Shared) {
+fn notifier_loop(shared: &Shared, workers: &[Thread]) {
+    let mut observed = NOTIFY_EPOCH.load(Ordering::Acquire);
+    let mut first_pass = true;
+    loop {
+        thread::park_timeout(NOTIFIER_INTERVAL);
+        if shared.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let current = NOTIFY_EPOCH.load(Ordering::Acquire);
+        let retry_hint = RETRY_PENDING.swap(false, Ordering::AcqRel);
+        let (retried, retry_remaining) = if retry_hint {
+            retry_registered(shared)
+        } else {
+            (0, false)
+        };
+        if retry_remaining {
+            RETRY_PENDING.store(true, Ordering::Release);
+        }
+        if first_pass || retried != 0 || current != observed {
+            first_pass = false;
+            observed = current;
+            wake_ready_workers(shared, workers);
+        }
+    }
+}
+
+fn wake_ready_workers(shared: &Shared, workers: &[Thread]) {
+    let count = shared.injector.len().min(workers.len());
+    if count == 0 {
+        return;
+    }
+    let start = shared.next_worker.fetch_add(count, Ordering::Relaxed);
+    for offset in 0..count {
+        workers[(start.wrapping_add(offset)) % workers.len()].unpark();
+    }
+}
+
+fn worker_loop(shared: &Shared, notifier_fallback: bool) {
+    let mut deferred = VecDeque::new();
+    let mut prefer_injector = true;
     loop {
         if shared.stopping.load(Ordering::Acquire) {
             return;
         }
-        while let Some(sink) = shared.injector.pop() {
+        let next_sink = if prefer_injector {
+            shared.injector.pop().or_else(|| deferred.pop_front())
+        } else {
+            deferred.pop_front().or_else(|| shared.injector.pop())
+        };
+        if let Some(sink) = next_sink {
+            prefer_injector = !prefer_injector;
             loop {
                 if shared.stopping.load(Ordering::Acquire) {
                     return;
                 }
-                if let Some(_executing) = begin_execution(shared) {
-                    sink.drain();
+                if let Some(executing) = begin_execution(shared) {
+                    let outcome = sink.drain();
+                    drop(executing);
+                    match outcome {
+                        DrainOutcome::Done => {}
+                        DrainOutcome::Deferred => deferred.push_back(sink),
+                        DrainOutcome::Busy => {
+                            deferred.push_back(sink);
+                            prefer_injector = true;
+                            if shared.injector.is_empty() {
+                                thread::park_timeout(BUSY_RETRY_TIMEOUT);
+                            }
+                        }
+                    }
                     break;
                 }
                 // Keep ownership of this injector entry while a reversible
@@ -530,22 +722,37 @@ fn worker_loop(shared: &Shared) {
                 // drops only after the stopping flag is published.
                 thread::park_timeout(PARK_TIMEOUT);
             }
+            continue;
         }
         if shared.stopping.load(Ordering::Acquire) {
             return;
         }
-        // Nothing pending: park. A concurrent push + `unpark` either
-        // beats the park (the token makes this return at once) or wakes
-        // us; `PARK_TIMEOUT` is a belt-and-suspenders re-check.
-        thread::park_timeout(PARK_TIMEOUT);
+        // A notifier-start failure still has a bounded, non-spinning fallback:
+        // one designated worker retries registered lanes every millisecond.
+        let retry_hint = RETRY_PENDING.swap(false, Ordering::AcqRel);
+        let (retried, retry_remaining) = if retry_hint {
+            retry_registered(shared)
+        } else {
+            (0, false)
+        };
+        if retry_remaining {
+            RETRY_PENDING.store(true, Ordering::Release);
+        }
+        if retried != 0 || !shared.injector.is_empty() {
+            continue;
+        }
+        let timeout = if notifier_fallback && !shared.notifier_running.load(Ordering::Acquire) {
+            NOTIFIER_INTERVAL
+        } else {
+            PARK_TIMEOUT
+        };
+        thread::park_timeout(timeout);
     }
 }
 
-/// Enqueue a ready sink and wake a worker. Wait-free: `injector.push`
-/// is lock-free and `unpark` is a bounded, non-blocking wake (the same
-/// primitive the manual worker pattern uses). Returns `false` if the
-/// injector is full so the caller can clear `scheduled` and let a later
-/// `arm` retry, rather than leaving the sink flagged-but-unqueued.
+/// Enqueue a ready sink without waking the OS. The caller performs only the
+/// bounded lock-free push and an atomic epoch publication; a non-realtime
+/// notifier owns worker wake syscalls and missed-injector retries.
 fn schedule(sink: Arc<dyn Drain>) -> bool {
     // Pool startup is never lazy here: static and hot shells warm off-thread
     // before processing. A missing/stopping pool rejects instead of creating
@@ -559,9 +766,11 @@ fn schedule(sink: Arc<dyn Drain>) -> bool {
     if pool.shared.injector.push(sink).is_err() {
         return false;
     }
-    let i = pool.shared.next.fetch_add(1, Ordering::Relaxed) % pool.workers.len();
-    pool.workers[i].unpark();
     true
+}
+
+fn notify_scheduler() {
+    NOTIFY_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 /// A cheap-to-clone handle for scheduling background tasks onto the
@@ -592,28 +801,57 @@ impl<T: Send + 'static> TaskSpawner<T> {
     /// The handler may run concurrently with itself for one instance; use
     /// [`Self::new_serialized`] for a handler that isn't reentrancy-safe.
     pub fn new(run: impl Fn(T) + Send + Sync + 'static) -> Self {
-        Self::with_mode(run, false)
+        Self::with_mode(
+            move |task| {
+                run(task);
+                None
+            },
+            false,
+        )
     }
 
     /// Like [`Self::new`], but the pool runs the handler for a given
     /// instance one at a time ("one-slot" mode). The shell selects this
     /// when the plugin's `BackgroundTask::SERIALIZED` is `true`.
     pub fn new_serialized(run: impl Fn(T) + Send + Sync + 'static) -> Self {
+        Self::with_mode(
+            move |task| {
+                run(task);
+                None
+            },
+            true,
+        )
+    }
+
+    /// Register a handler that may return its task as one fair continuation.
+    /// The pool owns that tail, runs one bounded pass per injector turn, and
+    /// cancels it when the instance lane closes. Tail storage is preallocated
+    /// to [`TASK_QUEUE_PREALLOC`]; overflow drops the additional tail.
+    pub fn new_managed(run: impl Fn(T) -> Option<T> + Send + Sync + 'static) -> Self {
+        Self::with_mode(run, false)
+    }
+
+    /// Serialized form of [`Self::new_managed`].
+    pub fn new_managed_serialized(run: impl Fn(T) -> Option<T> + Send + Sync + 'static) -> Self {
         Self::with_mode(run, true)
     }
 
-    fn with_mode(run: impl Fn(T) + Send + Sync + 'static, serialized: bool) -> Self {
-        Self {
-            sink: Arc::new(Sink {
-                queue: ArrayQueue::new(TASK_QUEUE_PREALLOC),
-                coalesced: ArrayQueue::new(1),
-                scheduled: AtomicBool::new(false),
-                serialized,
-                draining: AtomicBool::new(false),
-                schedule_state: AtomicUsize::new(0),
-                run: Box::new(run),
-            }),
-        }
+    fn with_mode(run: impl Fn(T) -> Option<T> + Send + Sync + 'static, serialized: bool) -> Self {
+        let sink = Arc::new(Sink {
+            queue: ArrayQueue::new(TASK_QUEUE_PREALLOC),
+            coalesced: ArrayQueue::new(1),
+            continuation: ArrayQueue::new(TASK_QUEUE_PREALLOC),
+            prefer_continuation: AtomicBool::new(true),
+            scheduled: AtomicBool::new(false),
+            retry_requested: AtomicBool::new(false),
+            serialized,
+            draining: AtomicBool::new(false),
+            schedule_state: AtomicUsize::new(0),
+            run: Box::new(run),
+        });
+        let erased = Arc::clone(&sink) as Arc<dyn Drain>;
+        register_lane(&erased);
+        Self { sink }
     }
 
     /// Enqueue a task, running it on the pool as soon as a worker is
@@ -661,11 +899,11 @@ impl<T: Send + 'static> TaskSpawner<T> {
         if !self.sink.scheduled.swap(true, Ordering::SeqCst) {
             let sink: Arc<dyn Drain> = Arc::clone(&self.sink) as Arc<dyn Drain>;
             if !schedule(sink) {
-                // Injector full: we flagged the sink but couldn't queue it.
-                // Clear the flag so the next `arm` re-attempts injection
-                // instead of skipping on a stale `true`.
                 self.sink.scheduled.store(false, Ordering::SeqCst);
+                self.sink.retry_requested.store(true, Ordering::Release);
+                RETRY_PENDING.store(true, Ordering::Release);
             }
+            notify_scheduler();
         }
     }
 }
@@ -734,6 +972,9 @@ impl<T: Send + 'static> RetireLane for Sink<T> {
         }
         while self.coalesced.pop().is_some() {}
         while self.queue.pop().is_some() {}
+        while self.continuation.pop().is_some() {}
+        self.retry_requested.store(false, Ordering::Release);
+        self.scheduled.store(false, Ordering::SeqCst);
     }
 }
 
@@ -745,6 +986,12 @@ struct ErasedLane {
 }
 
 struct LaneSet(Box<[ErasedLane]>);
+
+impl Drop for LaneSet {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
 
 impl LaneSet {
     fn retire(&self, timeout: Duration) -> bool {

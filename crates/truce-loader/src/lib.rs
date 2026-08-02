@@ -153,16 +153,16 @@ macro_rules! export_plugin {
                     let run = {
                         let params = Arc::clone(&params);
                         move |task| {
-                            <$task as $crate::__macro_deps::truce_plugin::BackgroundTask>::run(
+                            <$task as $crate::__macro_deps::truce_plugin::BackgroundTask>::run_once(
                                 task,
                                 &params,
-                            );
+                            )
                         }
                     };
                     let spawner = if <$task as $crate::__macro_deps::truce_plugin::BackgroundTask>::SERIALIZED {
-                        $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new_serialized(run)
+                        $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new_managed_serialized(run)
                     } else {
-                        $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new(run)
+                        $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new_managed(run)
                     };
                     bundle.push(spawner);
                 )+

@@ -566,6 +566,9 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
 
 impl<P: Params, S: Sample> Drop for HotShell<P, S> {
     fn drop(&mut self) {
+        if let Some(tasks) = &self.tasks {
+            tasks.close();
+        }
         // Free the DSP state through the dylib that produced it (its
         // `Drop` glue lives there). Every activated generation remains mapped
         // for process lifetime, including after this loader is dropped.
