@@ -22,7 +22,7 @@ pub fn param_toggle<P: ?Sized>(
 
     if response.clicked() {
         let new_value = if is_on { 0.0 } else { 1.0 };
-        state.automate(id, new_value);
+        crate::lifecycle::automate(ui.ctx(), state, id, new_value);
     }
 
     if ui.is_rect_visible(rect) {

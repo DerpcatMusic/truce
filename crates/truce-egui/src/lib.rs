@@ -22,9 +22,12 @@
 // drives the UIView + CADisplayLink + CAMetalLayer host on iOS.
 // `renderer.rs` (egui-wgpu wrapper) is shared - it has both a
 // baseview-window and a raw-CAMetalLayer constructor.
+pub mod dialog;
 #[cfg(not(target_os = "ios"))]
 pub mod editor;
 pub mod font;
+pub mod input;
+mod lifecycle;
 pub mod platform;
 #[cfg(target_os = "windows")]
 mod render_thread;

@@ -218,6 +218,7 @@ platform contract; every other format is unviable there.
 - **Presets** — factory presets from a directory of TOML files, shipped to every format's native preset system at install; `cargo truce preset` converts between formats and pulls presets saved in your DAW back into the library
 - **Flexible GUI frameworks** — Built-in widgets, egui, iced, slint, vizia, or raw window handle
 - **Resizable editors** — `.resizable(true).min_size(_).max_size(_)` on any backend, round-tripped through CLAP `gui_set_size`, VST3 `IPlugView::onSize`, AU view-frame change, and LV2 `ui:resize`
+- **egui desktop integration** — selective physical-key capture with native X11 repeat normalization, native file hover/drop input on Windows/macOS, and an owned, cancellable Zenity dialog lifecycle on Linux
 - **Declarative params** — `#[derive(Params)]` + `#[param(...)]` with linear/log/skewed/reversed ranges, linear/exp/log smoothing, units, and sample-accurate automation by default
 - **Background work** - offload graph builds, FFTs, or file reads onto a shared, bounded worker pool with `BackgroundTask`; each task type picks concurrent or serialized (one-slot) execution. `AudioTap` streams samples off the audio thread for analyzers and meters, drop-on-full so a stall never desyncs channels
 - **`truce::plugin!`** — one macro generates all format exports + GUI + state serialization
@@ -311,4 +312,3 @@ light, stacked, and mini variants plus copy-paste snippets at
 <p>
   <a href="https://truce.audio/"><img src="https://truce.audio/branding/truce-mini.svg" alt="Truce" height="34"></a>
 </p>
-
