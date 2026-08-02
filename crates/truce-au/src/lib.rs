@@ -73,8 +73,8 @@ use truce_core::ump::{
 };
 use truce_core::wrapper::{
     ParamCStrings, PluginCell, SharedPlugin, copy_c_str, default_io_channels, enter_plugin,
-    log_missing_bus_layout, max_io_channels, run_audio_block, run_extern_callback_with,
-    run_register, save_extra, shared_plugin,
+    log_missing_bus_layout, run_audio_block, run_extern_callback_with, run_register, save_extra,
+    shared_plugin,
 };
 use truce_params::{MidiSource, ParamFlags, ParamInfo, Params};
 
@@ -605,10 +605,10 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
         let max_frames = (max_frames as usize).max(1024);
         audio.sample_rate = sample_rate;
         audio.max_block_size = max_frames;
-        // Size scratch to the widest declared layout: the host can switch
-        // a multi-layout plugin to any of them via the stream format, and
-        // the process buffers must not outgrow this allocation.
-        let (num_in, num_out) = max_io_channels::<P>().unwrap_or((2, 2));
+        // Match the exact AU flattening: main + first sidechain input and
+        // one main output across only the layouts AU actually advertises.
+        // The AUv3 MIDI-only dummy output is included by the helper.
+        let (num_in, num_out) = au_process_capacity(&P::bus_layouts());
         audio
             .scratch
             .ensure_capacity(num_in as usize, num_out as usize, max_frames);
@@ -3238,34 +3238,70 @@ fn au_negotiable_layouts(layouts: &[BusLayout]) -> (Vec<i16>, Vec<i16>, u32, usi
     let kept: Vec<&BusLayout> = layouts
         .iter()
         .filter(|layout| {
-            layouts.first().is_none_or(|default| {
-                layout.inputs.len() == default.inputs.len()
-                    && layout.outputs.len() == default.outputs.len()
-                    && layout
-                        .inputs
-                        .iter()
-                        .zip(&default.inputs)
-                        .all(|(bus, default_bus)| {
-                            bus.kind == default_bus.kind
-                                && bus.enabled == default_bus.enabled
-                                && (bus.kind == BusKind::Main
-                                    || bus.channels.channel_count()
-                                        == default_bus.channels.channel_count())
-                        })
-                    && layout
-                        .outputs
-                        .iter()
-                        .zip(&default.outputs)
-                        .all(|(bus, default_bus)| {
-                            bus.kind == default_bus.kind && bus.enabled == default_bus.enabled
-                        })
-            })
+            layouts
+                .first()
+                .is_none_or(|default| au_layout_matches_topology(default, layout))
         })
         .collect();
     let dropped = layouts.len() - kept.len();
     let ins = kept.iter().map(|l| ch(main_in(l))).collect();
     let outs = kept.iter().map(|l| ch(l.total_output_channels())).collect();
     (ins, outs, sc0, dropped)
+}
+
+fn au_layout_matches_topology(default: &BusLayout, layout: &BusLayout) -> bool {
+    layout.inputs.len() == default.inputs.len()
+        && layout.outputs.len() == default.outputs.len()
+        && layout
+            .inputs
+            .iter()
+            .zip(&default.inputs)
+            .all(|(bus, default_bus)| {
+                bus.kind == default_bus.kind
+                    && bus.enabled == default_bus.enabled
+                    && (bus.kind == BusKind::Main
+                        || bus.channels.channel_count() == default_bus.channels.channel_count())
+            })
+        && layout
+            .outputs
+            .iter()
+            .zip(&default.outputs)
+            .all(|(bus, default_bus)| {
+                bus.kind == default_bus.kind && bus.enabled == default_bus.enabled
+            })
+}
+
+fn au_process_capacity(layouts: &[BusLayout]) -> (u32, u32) {
+    let Some(default) = layouts.first() else {
+        return (0, 2);
+    };
+    let sidechain = default
+        .inputs
+        .get(1)
+        .map_or(0, |bus| bus.channels.channel_count());
+    let (main_input, output) = layouts
+        .iter()
+        .filter(|layout| au_layout_matches_topology(default, layout))
+        .fold((0_u32, 0_u32), |(max_in, max_out), layout| {
+            (
+                max_in.max(
+                    layout
+                        .inputs
+                        .first()
+                        .map_or(0, |bus| bus.channels.channel_count()),
+                ),
+                max_out.max(
+                    layout
+                        .outputs
+                        .first()
+                        .map_or(0, |bus| bus.channels.channel_count()),
+                ),
+            )
+        });
+    (
+        main_input.saturating_add(sidechain),
+        if output == 0 { 2 } else { output },
+    )
 }
 
 const AU_MAX_FLAT_CHANNELS: u32 = 32;

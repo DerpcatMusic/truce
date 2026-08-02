@@ -42,8 +42,8 @@ use truce_core::state;
 use truce_core::tasks::AnyTaskSpawner;
 use truce_core::wrapper::{
     ParamCStrings, PluginCell, SharedPlugin, copy_c_str, enter_plugin, first_bus_layout,
-    log_missing_bus_layout, max_io_channels, run_audio_block, run_extern_callback_with,
-    run_register, save_extra, shared_plugin,
+    log_missing_bus_layout, run_audio_block, run_extern_callback_with, run_register, save_extra,
+    shared_plugin,
 };
 use truce_params::{ParamFlags, ParamInfo, ParamRange, Params};
 
@@ -576,6 +576,41 @@ fn aax_main_input_channels(layout: &BusLayout) -> u32 {
         .inputs
         .first()
         .map_or(0, |bus| bus.channels.channel_count())
+}
+
+fn aax_process_capacity(layouts: &[BusLayout]) -> (u32, u32) {
+    let Some(default) = layouts.first() else {
+        return (2, 2);
+    };
+    let sidechain = default
+        .inputs
+        .get(1)
+        .map_or(0, |bus| bus.channels.channel_count());
+    let (main_input, output) = layouts
+        .iter()
+        .filter(|layout| aax_layout_matches_topology(default, layout))
+        .fold((0_u32, 0_u32), |(max_in, max_out), layout| {
+            (
+                max_in.max(aax_main_input_channels(layout)),
+                max_out.max(
+                    layout
+                        .outputs
+                        .first()
+                        .map_or(0, |bus| bus.channels.channel_count()),
+                ),
+            )
+        });
+    let input = if main_input == 0 {
+        output.max(2)
+    } else {
+        main_input
+    };
+    let output = if output == 0 {
+        if main_input == 0 { 2 } else { 1 }
+    } else {
+        output
+    };
+    (input.saturating_add(sidechain), output)
 }
 
 fn aax_descriptor_layouts<P: PluginExport>(default: &BusLayout) -> (*const i16, *const i16, u32) {
@@ -1214,11 +1249,10 @@ pub unsafe fn _reset<P: PluginExport>(
         let max_frames = (max_frames as usize).max(1024);
         audio.sample_rate = sample_rate;
         audio.max_block_size = max_frames;
-        // Size scratch to the widest declared layout: a multi-layout plugin
-        // gets one AAX component per stem, and this instance may be any of
-        // them, so pre-allocating for the max keeps `_process` off the audio
-        // thread's allocator when the stem is wider than the first layout.
-        let (num_in, num_out) = max_io_channels::<P>().unwrap_or((2, 2));
+        // Match AAX's exact flattening across compatible components: main +
+        // first sidechain input, one main output, and the dummy audio stems
+        // synthesized for audio-less and output-only plugins.
+        let (num_in, num_out) = aax_process_capacity(&P::bus_layouts());
         audio
             .scratch
             .ensure_capacity(num_in as usize, num_out as usize, max_frames);
