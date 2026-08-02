@@ -57,6 +57,13 @@ impl<P: Params + ?Sized> EditorUi<P> for NopUi<P> {
 /// clippy's complexity budget without losing the `Send` bound.
 type StateChangedFn<P> = Box<dyn FnMut(&PluginContext<P>) + Send>;
 
+/// Context setup that runs before egui's first frame and after context rebuilds.
+///
+/// This is intentionally broader than [`EguiEditor::with_font`]: plugins with
+/// named font families, image loaders, or other egui context-owned resources
+/// need to install them before their first `Ui` is built.
+pub(crate) type ContextSetup = Arc<dyn Fn(&egui::Context) + Send + Sync>;
+
 /// Wraps an `EditorUi` with an additional `state_changed` callback.
 struct WithStateChanged<P: Params + ?Sized> {
     inner: Box<dyn EditorUi<P>>,
@@ -112,6 +119,7 @@ pub struct EguiEditor<P: Params + ?Sized> {
     ui: Arc<Mutex<Box<dyn EditorUi<P>>>>,
     visuals: Option<egui::Visuals>,
     font: Option<&'static [u8]>,
+    context_setup: Option<ContextSetup>,
     /// Resize-capability flag exposed via `Editor::can_resize`.
     /// Defaults to `false`; egui plugins that have been designed
     /// with a flexible panel layout (and want hosts to draw
@@ -183,6 +191,7 @@ impl<P: Params + 'static> EguiEditor<P> {
             ui: Arc::new(Mutex::new(Box::new(ui_fn))),
             visuals: None,
             font: None,
+            context_setup: None,
             scale: EditorScale::new(truce_gui::backing_scale()),
             use_system_scale: false,
             host_scale_set: false,
@@ -207,6 +216,7 @@ impl<P: Params + 'static> EguiEditor<P> {
             ui: Arc::new(Mutex::new(Box::new(ui))),
             visuals: None,
             font: None,
+            context_setup: None,
             scale: EditorScale::new(truce_gui::backing_scale()),
             use_system_scale: false,
             host_scale_set: false,
@@ -331,6 +341,21 @@ impl<P: Params + 'static> EguiEditor<P> {
         self.font = Some(font_data);
         self
     }
+
+    /// Install egui context-owned resources before the first frame.
+    ///
+    /// The callback is also invoked when the renderer recreates its context
+    /// after device loss and by the headless screenshot path. Use this for
+    /// named font families or other resources that must exist before any
+    /// `Ui` text is laid out.
+    #[must_use]
+    pub fn with_context_setup(
+        mut self,
+        setup: impl Fn(&egui::Context) + Send + Sync + 'static,
+    ) -> Self {
+        self.context_setup = Some(Arc::new(setup));
+        self
+    }
 }
 
 #[inline]
@@ -439,6 +464,7 @@ struct EguiWindowHandler<P: Params + ?Sized> {
     /// Kept to rebuild on device loss: the custom font and visuals applied to
     /// a freshly recreated `egui::Context`.
     font: Option<&'static [u8]>,
+    context_setup: Option<ContextSetup>,
     visuals: egui::Visuals,
     /// Cached param IDs + the last-seen normalized values, polled each
     /// frame to detect host automation / preset recall. The UI closure
@@ -635,6 +661,9 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
         egui_ctx.set_visuals(self.visuals.clone());
         if let Some(font_data) = self.font {
             crate::font::apply_font(&egui_ctx, font_data);
+        }
+        if let Some(setup) = &self.context_setup {
+            setup(&egui_ctx);
         }
         self.lifecycle.install(&egui_ctx);
         self.egui_ctx = egui_ctx;
@@ -1632,6 +1661,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
         let visuals = self.visuals.clone().unwrap_or_else(crate::theme::dark);
         egui_ctx.set_visuals(visuals.clone());
         let font = self.font;
+        let context_setup = self.context_setup.clone();
 
         // Refresh the shared scale from the parent window - on macOS
         // the parent's NSWindow may live on a non-main display whose
@@ -1751,6 +1781,9 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
                 if let Some(font_data) = font {
                     crate::font::apply_font(&egui_ctx, font_data);
                 }
+                if let Some(setup) = &context_setup {
+                    setup(&egui_ctx);
+                }
 
                 // baseview's `on_frame` drives the frame loop, but it no
                 // longer paints unconditionally every tick: the handler's
@@ -1786,6 +1819,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
                     last_cursor_pos: egui::Pos2::ZERO,
                     device_lost,
                     font,
+                    context_setup,
                     visuals: handler_visuals,
                     param_ids,
                     param_snapshot,
@@ -1904,6 +1938,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
             self.size,
             pixels_per_point,
             self.font,
+            self.context_setup.clone(),
             self.visuals.clone(),
             move |root_ui, state| {
                 ui.lock()
