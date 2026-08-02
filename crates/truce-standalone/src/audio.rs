@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use truce_core::buffer::RawBufferScratch;
-use truce_core::bus_routing::{BusActivation, BusRouting};
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layout_fits_routing};
 use truce_core::cast::{sample_count_usize, sample_rate_u32};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -627,6 +627,15 @@ pub fn start_audio<P: PluginExport>(opts: &Options) -> Result<AudioHandles<P>, B
     // match its output width but falls back to the device default (the
     // plugin output then maps onto whatever channels the device gives).
     let layout_index = selected_layout_index::<P>(opts);
+    if let Some(layout) = P::bus_layouts().get(layout_index)
+        && !bus_layout_fits_routing(layout)
+    {
+        return Err(format!(
+            "selected bus layout {layout_index} exceeds BusRouting's limit of 32 buses per \
+             direction and 65,535 channels per bus"
+        )
+        .into());
+    }
     let (num_in, num_out, num_main_in) = layout_at_index::<P>(layout_index);
     let requested_channels = u16::try_from(num_out).ok().filter(|&c| c > 0);
     let config: cpal::StreamConfig =
@@ -1152,6 +1161,18 @@ fn output_worker<P: PluginExport>(
                 }
             }
             OutputCmd::SetLayout { index } => {
+                let layouts = P::bus_layouts();
+                let Some(layout) = layouts.get(index) else {
+                    eprintln!("bus-layout: index {index} is not declared");
+                    continue;
+                };
+                if !bus_layout_fits_routing(layout) {
+                    eprintln!(
+                        "bus-layout: index {index} exceeds BusRouting's limit of 32 buses per \
+                         direction and 65,535 channels per bus"
+                    );
+                    continue;
+                }
                 let host = cpal::default_host();
                 let name = res.current_name.lock().ok().and_then(|g| g.clone());
                 let device = match name.as_deref() {
@@ -1772,7 +1793,7 @@ fn bus_routing_at_index<P: PluginExport>(idx: usize) -> BusRouting {
         } else {
             0
         };
-        let _ = routing.push_input(channels, state);
+        assert!(routing.push_input(channels, state));
     }
     for bus in layout.outputs {
         let state = if bus.enabled {
@@ -1785,7 +1806,7 @@ fn bus_routing_at_index<P: PluginExport>(idx: usize) -> BusRouting {
         } else {
             0
         };
-        let _ = routing.push_output(channels, state);
+        assert!(routing.push_output(channels, state));
     }
     routing
 }

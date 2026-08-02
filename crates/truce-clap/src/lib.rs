@@ -101,7 +101,7 @@ use clap_sys::version::CLAP_VERSION;
 use truce_core::TransportSlot;
 use truce_core::buffer::AudioBuffer;
 use truce_core::bus::ChannelConfig;
-use truce_core::bus_routing::{BusActivation, BusRouting};
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
 use truce_core::cast::{len_u32, size_of_u32};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -711,24 +711,28 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
         audio.bus_routing = BusRouting::new();
         if let Some(layout) = layouts.get(selected) {
             for bus in &layout.inputs {
-                let _ = audio.bus_routing.push_input(
+                if !audio.bus_routing.push_input(
                     if bus.enabled {
                         bus.channels.channel_count()
                     } else {
                         0
                     },
                     BusActivation::Unknown,
-                );
+                ) {
+                    return false;
+                }
             }
             for bus in &layout.outputs {
-                let _ = audio.bus_routing.push_output(
+                if !audio.bus_routing.push_output(
                     if bus.enabled {
                         bus.channels.channel_count()
                     } else {
                         0
                     },
                     BusActivation::Unknown,
-                );
+                ) {
+                    return false;
+                }
             }
         }
         let mode = ProcessMode::from_u8(data.render_mode.load(Ordering::Relaxed));
@@ -5028,6 +5032,15 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
     // extern "C" caller is bare, so a panic would abort the host. A null
     // return tells the host construction failed.
     run_extern_callback_with::<P, *const clap_plugin>("CLAP", "create", ptr::null(), || {
+        let layouts = P::bus_layouts();
+        if !bus_layouts_fit_routing(&layouts) {
+            eprintln!(
+                "[truce CLAP] {} declares an audio-bus topology beyond BusRouting's limit of 32 \
+                 buses per direction and 65,535 channels per bus - instance creation refused.",
+                std::any::type_name::<P>(),
+            );
+            return ptr::null();
+        }
         let instance = P::create();
         let info = P::info();
         let plugin_id_hash = state::hash_plugin_id(info.clap_id);
@@ -5047,7 +5060,6 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         // amortizes the cost into instance creation, where it belongs.
         // Read before `info` is moved into the struct literal below.
         let midi_input_ports = info.midi_input_ports;
-        let layouts = P::bus_layouts();
         let max_in = layouts
             .iter()
             .map(|l| l.total_input_channels() as usize)

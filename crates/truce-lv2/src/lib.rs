@@ -718,25 +718,25 @@ pub unsafe fn run<P: PluginExport>(handle: *mut Lv2Instance<P>, n_samples: u32) 
             let mut bus_routing = BusRouting::new();
             if num_in > 0 {
                 let active = s.audio_inputs.iter().any(|ptr| !ptr.is_null());
-                let _ = bus_routing.push_input(
+                debug_assert!(bus_routing.push_input(
                     num_in,
                     if active {
                         BusActivation::Active
                     } else {
                         BusActivation::Inactive
                     },
-                );
+                ));
             }
             if num_out > 0 {
                 let active = s.audio_outputs.iter().any(|ptr| !ptr.is_null());
-                let _ = bus_routing.push_output(
+                debug_assert!(bus_routing.push_output(
                     num_out,
                     if active {
                         BusActivation::Active
                     } else {
                         BusActivation::Inactive
                     },
-                );
+                ));
             }
             inst.transport_slot.write(&transport);
             // Read the `lv2:freeWheeling` port: >= 0.5 means the host is

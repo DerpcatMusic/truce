@@ -1,11 +1,37 @@
 use std::ops::Range;
 
+use crate::bus::BusLayout;
+
 /// Maximum number of audio buses tracked in either direction for one block.
 ///
-/// Truce's fixed-buffer adapters already cap flattened audio I/O at 32
-/// channels per direction, so a 32-bus snapshot covers every topology they
-/// can represent without allocating in `process()`.
+/// This is a public topology limit, not a truncation point. Format adapters
+/// must reject or filter layouts beyond it before activation; the process
+/// path stays bounded and allocation-free.
 pub const MAX_AUDIO_BUSES: usize = 32;
+
+/// Return whether a declared layout can be represented exactly by
+/// [`BusRouting`].
+///
+/// Adapters call this while registering or selecting layouts so an oversized
+/// topology is refused before the audio thread. The per-bus channel bound
+/// follows the snapshot's compact `u16` storage.
+#[must_use]
+pub fn bus_layout_fits_routing(layout: &BusLayout) -> bool {
+    layout.inputs.len() <= MAX_AUDIO_BUSES
+        && layout.outputs.len() <= MAX_AUDIO_BUSES
+        && layout
+            .inputs
+            .iter()
+            .chain(&layout.outputs)
+            .all(|bus| u16::try_from(bus.channels.channel_count()).is_ok())
+}
+
+/// Return whether every declared layout can be represented exactly by
+/// [`BusRouting`].
+#[must_use]
+pub fn bus_layouts_fit_routing(layouts: &[BusLayout]) -> bool {
+    layouts.iter().all(bus_layout_fits_routing)
+}
 
 /// What the current adapter can truthfully say about one bus this block.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

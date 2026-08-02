@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
-use truce_core::bus_routing::{BusActivation, BusRouting};
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
 #[cfg(feature = "wav")]
 use truce_core::cast::sample_rate_u32;
 use truce_core::cast::{len_u32, sample_count_usize};
@@ -883,6 +883,11 @@ impl<P: PluginExport> PluginDriver<P> {
                 .map_or(0, |l| l.total_output_channels() as usize);
             if outs > 0 { outs } else { 2 }
         });
+        assert!(
+            bus_layouts_fit_routing(&P::bus_layouts()),
+            "truce-driver: plugin bus topology exceeds BusRouting's limit of 32 buses per \
+             direction and 65,535 channels per bus"
+        );
 
         // 3. Setup closure (most general). Receives the resolved
         // `SetupContext` so it can size per-channel state, branch on
@@ -934,7 +939,7 @@ impl<P: PluginExport> PluginDriver<P> {
                 .sum::<usize>();
             if declared_inputs == num_in {
                 for bus in layout.inputs {
-                    let _ = bus_routing.push_input(
+                    assert!(bus_routing.push_input(
                         if bus.enabled {
                             bus.channels.channel_count()
                         } else {
@@ -945,12 +950,12 @@ impl<P: PluginExport> PluginDriver<P> {
                         } else {
                             BusActivation::Inactive
                         },
-                    );
+                    ));
                 }
             }
             if declared_outputs == channels {
                 for bus in layout.outputs {
-                    let _ = bus_routing.push_output(
+                    assert!(bus_routing.push_output(
                         if bus.enabled {
                             bus.channels.channel_count()
                         } else {
@@ -961,7 +966,7 @@ impl<P: PluginExport> PluginDriver<P> {
                         } else {
                             BusActivation::Inactive
                         },
-                    );
+                    ));
                 }
             }
         }

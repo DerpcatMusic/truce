@@ -27,7 +27,10 @@ pub mod wrapper;
 
 pub use buffer::{AudioBuffer, RawBufferScratch};
 pub use bus::{BusConfig, BusKind, BusLayout, ChannelConfig};
-pub use bus_routing::{BusActivation, BusRoute, BusRouting, MAX_AUDIO_BUSES};
+pub use bus_routing::{
+    BusActivation, BusRoute, BusRouting, MAX_AUDIO_BUSES, bus_layout_fits_routing,
+    bus_layouts_fit_routing,
+};
 pub use config::{AudioConfig, ProcessMode};
 pub use editor::{Editor, EditorBuilder, IntoEditor, PluginContext};
 pub use events::{

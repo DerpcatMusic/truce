@@ -13,7 +13,7 @@ use std::slice;
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
-use truce_core::bus_routing::{BusActivation, BusRouting};
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layout_fits_routing};
 use truce_core::cast::{len_u32, sample_pos_i64};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -331,7 +331,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let mut bus_routing = BusRouting::new();
             if let Some(layout) = P::bus_layouts().into_iter().next() {
                 for bus in layout.inputs {
-                    let _ = bus_routing.push_input(
+                    assert!(bus_routing.push_input(
                         if bus.enabled {
                             bus.channels.channel_count()
                         } else {
@@ -342,10 +342,10 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                         } else {
                             BusActivation::Inactive
                         },
-                    );
+                    ));
                 }
                 for bus in layout.outputs {
-                    let _ = bus_routing.push_output(
+                    assert!(bus_routing.push_output(
                         if bus.enabled {
                             bus.channels.channel_count()
                         } else {
@@ -356,7 +356,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                         } else {
                             BusActivation::Inactive
                         },
-                    );
+                    ));
                 }
             }
             let param_infos = plugin.params().param_infos();
@@ -1555,6 +1555,14 @@ pub fn register_vst2<P: PluginExport>() {
             log_missing_bus_layout::<P>("VST2");
             return;
         };
+        if !bus_layout_fits_routing(&layout) {
+            eprintln!(
+                "[truce VST2] {} declares a default audio-bus topology beyond BusRouting's limit \
+                 of 32 buses per direction and 65,535 channels per bus - plugin will not register.",
+                std::any::type_name::<P>(),
+            );
+            return;
+        }
         register_vst2_inner::<P>(&layout);
     });
 }

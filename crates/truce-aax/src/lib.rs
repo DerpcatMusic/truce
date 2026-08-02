@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
-use truce_core::bus::BusLayout;
-use truce_core::bus_routing::{BusActivation, BusRouting, MAX_AUDIO_BUSES};
+use truce_core::bus::{BusKind, BusLayout};
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layout_fits_routing};
 use truce_core::cast::{len_u32, sample_pos_i64};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -144,9 +144,8 @@ pub struct TruceAaxDescriptor {
     pub layout_in_channels: *const i16,
     pub layout_out_channels: *const i16,
     pub num_layouts: u32,
-    /// First sidechain input width from the default layout. `> 0` makes the
-    /// template register AAX's single side-chain port; later declared
-    /// sidechain buses remain zero-width and unavailable.
+    /// Sidechain input width shared by every advertised layout. `> 0` makes
+    /// the template register AAX's single side-chain port.
     pub sidechain_in_channels: u32,
 }
 
@@ -512,8 +511,101 @@ pub fn register_aax<P: PluginExport>() {
             log_missing_bus_layout::<P>("AAX");
             return;
         };
+        if !aax_layout_supported(&layout) {
+            eprintln!(
+                "[truce AAX] {} default audio-bus layout cannot be represented exactly: AAX \n\
+                 supports one main output and one routable auxiliary input while preserving \n\
+                 additional sidechain indices within BusRouting's 32-bus / 65,535-channel \n\
+                 bounds - plugin will not register.",
+                std::any::type_name::<P>(),
+            );
+            return;
+        }
         register_aax_inner::<P>(&layout);
     });
+}
+
+fn aax_layout_supported(layout: &BusLayout) -> bool {
+    bus_layout_fits_routing(layout)
+        && layout.outputs.len() <= 1
+        && layout
+            .inputs
+            .first()
+            .is_none_or(|bus| bus.kind == BusKind::Main)
+        && layout
+            .inputs
+            .iter()
+            .skip(1)
+            .all(|bus| bus.kind == BusKind::Sidechain)
+        && layout
+            .outputs
+            .first()
+            .is_none_or(|bus| bus.kind == BusKind::Main)
+}
+
+fn aax_layout_matches_topology(default: &BusLayout, layout: &BusLayout) -> bool {
+    aax_layout_supported(layout)
+        && layout.inputs.len() == default.inputs.len()
+        && layout.outputs.len() == default.outputs.len()
+        && layout
+            .inputs
+            .iter()
+            .zip(&default.inputs)
+            .all(|(bus, default_bus)| {
+                bus.kind == default_bus.kind
+                    && bus.enabled == default_bus.enabled
+                    && (bus.kind == BusKind::Main
+                        || bus.channels.channel_count() == default_bus.channels.channel_count())
+            })
+        && layout
+            .outputs
+            .iter()
+            .zip(&default.outputs)
+            .all(|(bus, default_bus)| {
+                bus.kind == default_bus.kind && bus.enabled == default_bus.enabled
+            })
+}
+
+fn aax_main_input_channels(layout: &BusLayout) -> u32 {
+    layout
+        .inputs
+        .first()
+        .map_or(0, |bus| bus.channels.channel_count())
+}
+
+fn aax_descriptor_layouts<P: PluginExport>(default: &BusLayout) -> (*const i16, *const i16, u32) {
+    let layouts = P::bus_layouts();
+    let compatible: Vec<&BusLayout> = layouts
+        .iter()
+        .filter(|candidate| aax_layout_matches_topology(default, candidate))
+        .collect();
+    if compatible.len() != layouts.len() {
+        eprintln!(
+            "[truce AAX] {}: ignored {} layout(s) whose main/aux topology differs from the \n\
+             default AAX component topology",
+            std::any::type_name::<P>(),
+            layouts.len() - compatible.len(),
+        );
+    }
+    if layouts.len() <= 1 {
+        return (std::ptr::null(), std::ptr::null(), 0);
+    }
+
+    let ch = |channels: u32| i16::try_from(channels).unwrap_or(0);
+    let ins: Vec<i16> = compatible
+        .iter()
+        .map(|layout| ch(aax_main_input_channels(layout)))
+        .collect();
+    let outs: Vec<i16> = compatible
+        .iter()
+        .map(|layout| ch(layout.total_output_channels()))
+        .collect();
+    let count = len_u32(ins.len());
+    (
+        Box::leak(ins.into_boxed_slice()).as_ptr(),
+        Box::leak(outs.into_boxed_slice()).as_ptr(),
+        count,
+    )
 }
 
 fn register_aax_inner<P: PluginExport>(layout: &BusLayout) {
@@ -570,12 +662,14 @@ fn register_aax_inner<P: PluginExport>(layout: &BusLayout) {
         // AAX registers the main input stem; a sidechain is a separate
         // mono side-chain port, so the stem width is the main bus alone,
         // not the summed total. Non-sidechain plugins have main == total.
-        let main_in_of = |l: &BusLayout| l.inputs.first().map_or(0, |b| b.channels.channel_count());
         let sidechain_in = layout
             .inputs
             .get(1)
             .map_or(0, |bus| bus.channels.channel_count());
-        let (aax_inputs, aax_outputs) = match (main_in_of(layout), layout.total_output_channels()) {
+        let (aax_inputs, aax_outputs) = match (
+            aax_main_input_channels(layout),
+            layout.total_output_channels(),
+        ) {
             (0, 0) => (2, 2),              // pure MIDI effect → stereo passthrough
             (0, out) => (out.max(2), out), // output-only instrument → match output
             (in_, out) => (in_, out),
@@ -632,23 +726,8 @@ fn register_aax_inner<P: PluginExport>(layout: &BusLayout) {
         // and the legacy mono/stereo describe (which also covers the
         // audio-less synthesis in `default_io_channels`). The leaked
         // arrays live for the process, like the descriptor.
-        let layouts = P::bus_layouts();
-        let (layout_in_channels, layout_out_channels, num_layouts) = if layouts.len() > 1 {
-            let ch = |c: u32| i16::try_from(c).unwrap_or(0);
-            let ins: Vec<i16> = layouts.iter().map(|l| ch(main_in_of(l))).collect();
-            let outs: Vec<i16> = layouts
-                .iter()
-                .map(|l| ch(l.total_output_channels()))
-                .collect();
-            let n = len_u32(ins.len());
-            (
-                Box::leak(ins.into_boxed_slice()).as_ptr(),
-                Box::leak(outs.into_boxed_slice()).as_ptr(),
-                n,
-            )
-        } else {
-            (std::ptr::null(), std::ptr::null(), 0)
-        };
+        let (layout_in_channels, layout_out_channels, num_layouts) =
+            aax_descriptor_layouts::<P>(layout);
 
         let descriptor = TruceAaxDescriptor {
             name,
@@ -1038,15 +1117,17 @@ pub unsafe fn _create<P: PluginExport>() -> *mut std::ffi::c_void {
             plugin.init();
             let info = P::info();
             let layouts = P::bus_layouts();
-            let input_bus_count = layouts
-                .first()
-                .map_or(0, |layout| layout.inputs.len().min(MAX_AUDIO_BUSES));
-            let output_bus_count = layouts
-                .first()
-                .map_or(0, |layout| layout.outputs.len().min(MAX_AUDIO_BUSES));
-            let sidechain_channels = layouts
-                .first()
-                .and_then(|layout| layout.inputs.get(1))
+            let Some(layout) = layouts.first() else {
+                return std::ptr::null_mut();
+            };
+            if !aax_layout_supported(layout) {
+                return std::ptr::null_mut();
+            }
+            let input_bus_count = layout.inputs.len();
+            let output_bus_count = layout.outputs.len();
+            let sidechain_channels = layout
+                .inputs
+                .get(1)
                 .map_or(0, |bus| bus.channels.channel_count());
             let param_infos = plugin.params().param_infos();
             let params_arc = plugin.params_arc();
@@ -1408,7 +1489,7 @@ pub unsafe fn _process_native<P: PluginExport>(
                 } else {
                     BusActivation::Active
                 };
-                let _ = bus_routing.push_input(channels, activation);
+                debug_assert!(bus_routing.push_input(channels, activation));
             }
             for index in 0..inst.output_bus_count {
                 let channels = if index == 0 { num_out } else { 0 };
@@ -1417,7 +1498,7 @@ pub unsafe fn _process_native<P: PluginExport>(
                 } else {
                     BusActivation::Active
                 };
-                let _ = bus_routing.push_output(channels, activation);
+                debug_assert!(bus_routing.push_output(channels, activation));
             }
             let transport = if !transport_ptr.is_null() && (*transport_ptr).valid != 0 {
                 let t = &*transport_ptr;

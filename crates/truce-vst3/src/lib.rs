@@ -14,7 +14,9 @@ use std::slice;
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::{BusConfig, BusKind, BusLayout};
-use truce_core::bus_routing::{BusActivation, BusRouting, MAX_AUDIO_BUSES};
+use truce_core::bus_routing::{
+    BusActivation, BusRouting, MAX_AUDIO_BUSES, bus_layouts_fit_routing,
+};
 use truce_core::cast::{len_u32, sample_pos_i64};
 use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
@@ -1279,39 +1281,37 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
         );
         let mut bus_routing = BusRouting::new();
         if !input_bus_channels.is_null() {
-            for (index, &channels) in slice::from_raw_parts(
-                input_bus_channels,
-                (num_input_buses as usize).min(MAX_AUDIO_BUSES),
-            )
-            .iter()
-            .enumerate()
+            debug_assert!((num_input_buses as usize) <= MAX_AUDIO_BUSES);
+            for (index, &channels) in
+                slice::from_raw_parts(input_bus_channels, num_input_buses as usize)
+                    .iter()
+                    .enumerate()
             {
-                let _ = bus_routing.push_input(
+                debug_assert!(bus_routing.push_input(
                     channels,
                     if input_bus_active & (1_u32 << index) == 0 {
                         BusActivation::Inactive
                     } else {
                         BusActivation::Active
                     },
-                );
+                ));
             }
         }
         if !output_bus_channels.is_null() {
-            for (index, &channels) in slice::from_raw_parts(
-                output_bus_channels,
-                (num_output_buses as usize).min(MAX_AUDIO_BUSES),
-            )
-            .iter()
-            .enumerate()
+            debug_assert!((num_output_buses as usize) <= MAX_AUDIO_BUSES);
+            for (index, &channels) in
+                slice::from_raw_parts(output_bus_channels, num_output_buses as usize)
+                    .iter()
+                    .enumerate()
             {
-                let _ = bus_routing.push_output(
+                debug_assert!(bus_routing.push_output(
                     channels,
                     if output_bus_active & (1_u32 << index) == 0 {
                         BusActivation::Inactive
                     } else {
                         BusActivation::Active
                     },
-                );
+                ));
             }
         }
 
@@ -3324,7 +3324,16 @@ pub fn register_vst3<P: PluginExport>() {
             log_missing_bus_layout::<P>("VST3");
             return;
         };
-        let (max_in, max_out) = max_layout_channels(&P::bus_layouts());
+        let layouts = P::bus_layouts();
+        if !bus_layouts_fit_routing(&layouts) {
+            eprintln!(
+                "[truce VST3] {} declares an audio-bus topology beyond BusRouting's limit of 32 \
+                 buses per direction and 65,535 channels per bus - plugin will not register.",
+                std::any::type_name::<P>(),
+            );
+            return;
+        }
+        let (max_in, max_out) = max_layout_channels(&layouts);
         if max_in > VST3_MAX_CHANNELS_PER_DIRECTION || max_out > VST3_MAX_CHANNELS_PER_DIRECTION {
             eprintln!(
                 "[truce VST3] {} declares up to {max_in} input / {max_out} output channels, \
@@ -3334,7 +3343,7 @@ pub fn register_vst3<P: PluginExport>() {
             );
             return;
         }
-        if !vst3_topology_consistent(&P::bus_layouts()) {
+        if !vst3_topology_consistent(&layouts) {
             eprintln!(
                 "[truce VST3] {} declares bus layouts that differ in input/output bus count or \
                  kind. VST3 fixes one bus topology per plugin - only channel widths may vary \

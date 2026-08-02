@@ -41,7 +41,7 @@ use truce_core::editor::{ClosureBridge, PluginContext, RawWindowHandle, SendPtr}
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
 use truce_core::bus::BusLayout;
-use truce_core::bus_routing::{BusActivation, BusRouting, MAX_AUDIO_BUSES};
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
 use truce_core::editor::fit_logical_size;
 use truce_core::events::{
     AuEventMetadata, EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
@@ -479,12 +479,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             plugin.init();
             let info = P::info();
             let layouts = P::bus_layouts();
-            let input_bus_count = layouts
-                .first()
-                .map_or(0, |layout| layout.inputs.len().min(MAX_AUDIO_BUSES));
-            let output_bus_count = layouts
-                .first()
-                .map_or(0, |layout| layout.outputs.len().min(MAX_AUDIO_BUSES));
+            let input_bus_count = layouts.first().map_or(0, |layout| layout.inputs.len());
+            let output_bus_count = layouts.first().map_or(0, |layout| layout.outputs.len());
             let sidechain_channels = layouts
                 .first()
                 .and_then(|layout| layout.inputs.get(1))
@@ -1251,7 +1247,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
             } else {
                 activation(bus_active.map(|m| m.0), index)
             };
-            let _ = bus_routing.push_input(channels, state);
+            debug_assert!(bus_routing.push_input(channels, state));
         }
         for index in 0..inst.output_bus_count {
             let channels = if index == 0 { num_output_channels } else { 0 };
@@ -1260,7 +1256,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
             } else {
                 activation(bus_active.map(|m| m.1), index)
             };
-            let _ = bus_routing.push_output(channels, state);
+            debug_assert!(bus_routing.push_output(channels, state));
         }
 
         let transport = if !transport_ptr.is_null() && (*transport_ptr).valid != 0 {
@@ -3176,7 +3172,16 @@ pub fn register_au<P: PluginExport>() {
             log_missing_bus_layout::<P>("AU");
             return;
         };
-        if au_max_aux_input_buses(&P::bus_layouts()) > 1 {
+        let layouts = P::bus_layouts();
+        if !bus_layouts_fit_routing(&layouts) {
+            eprintln!(
+                "[truce AU] {} declares an audio-bus topology beyond BusRouting's limit of 32 \
+                 buses per direction and 65,535 channels per bus - plugin will not register.",
+                std::any::type_name::<P>(),
+            );
+            return;
+        }
+        if au_max_aux_input_buses(&layouts) > 1 {
             eprintln!(
                 "[truce AU] {}: declares more than one auxiliary input bus. AU exposes a single \
                  sidechain input element, so multiple aux buses can't be routed independently. \
