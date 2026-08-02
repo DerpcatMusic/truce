@@ -8,6 +8,8 @@
 use truce_core::editor::PluginContext;
 use truce_params::Params;
 
+use crate::editor::ContextSetup;
+
 /// Headless render path shared by `EguiEditor::screenshot()` and any
 /// future ad-hoc callers in this crate. Kept `pub(crate)` - external
 /// callers should go through the `Editor::screenshot()` trait.
@@ -29,6 +31,7 @@ pub(crate) fn render_with_state<P: Params + ?Sized>(
     size: (u32, u32),
     pixels_per_point: f32,
     font: Option<&'static [u8]>,
+    context_setup: Option<ContextSetup>,
     visuals: Option<egui::Visuals>,
     ui_fn: impl Fn(&mut egui::Ui, &PluginContext<P>),
 ) -> Option<(Vec<u8>, u32, u32)> {
@@ -38,6 +41,9 @@ pub(crate) fn render_with_state<P: Params + ?Sized>(
 
     if let Some(font_data) = font {
         crate::font::apply_font(&ctx, font_data);
+    }
+    if let Some(setup) = context_setup {
+        setup(&ctx);
     }
 
     // Run the egui frame
