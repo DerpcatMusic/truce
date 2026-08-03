@@ -25,6 +25,8 @@
 pub mod dialog;
 #[cfg(not(target_os = "ios"))]
 pub mod editor;
+#[cfg(target_os = "linux")]
+pub mod external_drag;
 pub mod font;
 pub mod input;
 mod lifecycle;

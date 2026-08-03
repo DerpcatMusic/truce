@@ -20,6 +20,8 @@ use crate::platform::ParentWindow;
 use crate::render_thread::{FramePacket, RenderThread};
 #[cfg(not(target_os = "windows"))]
 use crate::renderer::EguiRenderer;
+#[cfg(target_os = "linux")]
+use matari_audio_drag_and_drop::{Controller as DragController, FileSet, SessionEvent};
 use truce_gui::EditorScale;
 
 /// Trait for stateful egui UI implementations.
@@ -457,6 +459,8 @@ struct EguiWindowHandler<P: Params + ?Sized> {
     /// without the editor and baseview fighting over the scale.
     host_driven_scale: bool,
     last_cursor_pos: egui::Pos2,
+    #[cfg(target_os = "linux")]
+    drag_controller: DragController,
     /// Raised by the renderer's device-lost callback (or a swallowed render
     /// panic). Polled in `on_frame`, which rebuilds the renderer + recreates
     /// the `egui::Context` so the font atlas re-uploads to the fresh device.
@@ -883,6 +887,9 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
                 .ui(ui, context);
         });
 
+        #[cfg(target_os = "linux")]
+        self.process_external_drag(window);
+
         let repaint_delay = output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -899,6 +906,63 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
         );
 
         repaint_delay
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_external_drag(&mut self, window: &mut Window<'_>) {
+        if let Some(paths) = crate::external_drag::take_request(&self.egui_ctx) {
+            let files = match FileSet::try_from_paths(paths) {
+                Ok(files) => files,
+                Err(error) => {
+                    crate::external_drag::push_event(
+                        &self.egui_ctx,
+                        crate::external_drag::Event::Failed {
+                            message: error.to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            // The native X11 route is committed by the baseview callback. The
+            // initiating button press remains authoritative until release.
+            let mut adapter = DragWindowAdapter { window };
+            if let Err(error) = self.drag_controller.start_outbound(&mut adapter, files) {
+                crate::external_drag::push_event(
+                    &self.egui_ctx,
+                    crate::external_drag::Event::Failed {
+                        message: error.to_string(),
+                    },
+                );
+            }
+        }
+        for event in self.drag_controller.update().into_events() {
+            let mapped = match event {
+                SessionEvent::OutboundStarted { session, route } => {
+                    crate::external_drag::Event::Started {
+                        session: session.get(),
+                        route,
+                    }
+                }
+                SessionEvent::DataRequested { session } => {
+                    crate::external_drag::Event::DataRequested {
+                        session: session.get(),
+                    }
+                }
+                SessionEvent::DropPerformed { session } => {
+                    crate::external_drag::Event::DropPerformed {
+                        session: session.get(),
+                    }
+                }
+                SessionEvent::OutboundTerminal { session, outcome } => {
+                    crate::external_drag::Event::Terminal {
+                        session: session.get(),
+                        outcome,
+                    }
+                }
+                _ => continue,
+            };
+            crate::external_drag::push_event(&self.egui_ctx, mapped);
+        }
     }
 
     /// Poll params into the snapshot, returning whether any moved since
@@ -937,6 +1001,57 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
             || self
                 .next_paint_at
                 .is_some_and(|t| std::time::Instant::now() >= t)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct DragAdapterError(String);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for DragAdapterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for DragAdapterError {}
+
+#[cfg(target_os = "linux")]
+struct DragWindowAdapter<'window, 'inner> {
+    window: &'window mut Window<'inner>,
+}
+
+#[cfg(target_os = "linux")]
+impl matari_audio_drag_and_drop::ToolkitAdapter for DragWindowAdapter<'_, '_> {
+    type Error = DragAdapterError;
+
+    fn outbound_route(&self) -> Option<matari_audio_drag_and_drop::SessionRoute> {
+        self.window.can_schedule_matari_x11_drag().then_some(
+            matari_audio_drag_and_drop::SessionRoute {
+                protocol: matari_audio_drag_and_drop::NativeProtocol::Xdnd,
+                source: matari_audio_drag_and_drop::SourceContext::EmbeddedX11,
+            },
+        )
+    }
+
+    fn schedule_outbound(
+        &mut self,
+        ticket: matari_audio_drag_and_drop::StartTicket,
+    ) -> Result<(), matari_audio_drag_and_drop::RejectedStart<Self::Error>> {
+        self.window
+            .schedule_matari_x11_drag(ticket)
+            .map_err(|rejected| rejected.map_error(|error| DragAdapterError(error.to_string())))
+    }
+
+    fn drive_inbound(
+        &mut self,
+        _handler: &mut dyn matari_audio_drag_and_drop::InboundHandler,
+    ) -> Result<matari_audio_drag_and_drop::InboundDisposition, Self::Error> {
+        Err(DragAdapterError(
+            "inbound drag is driven by baseview events".to_owned(),
+        ))
     }
 }
 
@@ -1817,6 +1932,8 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
                     last_applied_scale: scale,
                     host_driven_scale,
                     last_cursor_pos: egui::Pos2::ZERO,
+                    #[cfg(target_os = "linux")]
+                    drag_controller: DragController::new(),
                     device_lost,
                     font,
                     context_setup,
