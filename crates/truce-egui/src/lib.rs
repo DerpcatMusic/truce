@@ -24,6 +24,8 @@
 // baseview-window and a raw-CAMetalLayer constructor.
 #[cfg(not(target_os = "ios"))]
 pub mod editor;
+#[cfg(target_os = "linux")]
+pub mod external_drag;
 pub mod font;
 pub mod platform;
 #[cfg(target_os = "windows")]

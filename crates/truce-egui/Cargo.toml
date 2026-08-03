@@ -27,6 +27,9 @@ log = "0.4"
 [target.'cfg(not(target_os = "ios"))'.dependencies]
 baseview = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+matari-audio-drag-and-drop = { git = "https://github.com/DerpcatMusic/matari-audio-drag-and-drop", rev = "889920dd2fba62e432b696c231647dedf8b8f9c2" }
+
 # `wgpu/metal` is gated on the Apple targets because
 # `from_metal_layer` in `renderer.rs` references
 # `SurfaceTargetUnsafe::CoreAnimationLayer`, which only exists when
