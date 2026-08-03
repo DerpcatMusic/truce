@@ -1,5 +1,17 @@
 # truce-egui
 
+## Outbound file drag
+
+On Linux, an editor UI can call `truce_egui::external_drag::request_file()`
+with an absolute, already-rendered export path. The baseview event loop starts
+the Matari XDND session only while the initiating primary-pointer gesture is
+still owned by that editor; `drain_events()` exposes the native lifecycle.
+
+The current baseview backend has no AppKit/OLE outbound adapter and no native
+Wayland event-authority path. Those targets intentionally do not expose this
+module until their event loops can provide the same initiating-event contract;
+there is no parent-window or timer fallback.
+
 egui GUI backend for truce audio plugins.
 
 ## Overview
