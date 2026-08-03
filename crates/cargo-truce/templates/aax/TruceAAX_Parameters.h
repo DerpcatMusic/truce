@@ -3,6 +3,7 @@
 #include "AAX_CMonolithicParameters.h"
 #include "AAX_IMIDINode.h"
 #include "TruceAAX_Bridge.h"
+#include <vector>
 
 // Extended render-info struct used by TruceAAX_Describe.cpp's hand-built
 // component descriptor.
@@ -82,10 +83,8 @@ private:
     // cache we'd serialize the full state blob twice per save.
     // `mutable` because both methods are const per the AAX SDK.
     mutable std::vector<uint8_t> mPendingChunk;
-    // Sample rate captured at EffectInit; used by RenderAudio's
-    // defensive re-reset path when a host delivers a block larger
-    // than `mMaxBlockSize`.
-    double mSampleRate = 44100.0;
+    // Maximum block size preallocated in EffectInit. A larger host block
+    // fails closed instead of growing scratch on the audio thread.
     uint32_t mMaxBlockSize = 0;
     // Channel counts of the stem format this instance was instantiated
     // with, read from the controller in EffectInit. A plugin declaring
@@ -102,6 +101,10 @@ private:
     // EffectInit so RenderAudio stays alloc-free; shared read-only across
     // every silent channel.
     std::vector<float> mSilence;
+    // Fixed-capacity native MIDI transaction scratch. Reserved in EffectInit;
+    // RenderAudio only clears and appends within these bounds.
+    std::vector<TruceAaxNativeEvent> mNativeEvents;
+    std::vector<uint8_t> mNativeSysex;
     // Last latency (samples) pushed to the host via SetSignalLatency.
     // -1 sentinel so the first TimerWakeup always reports, even if the
     // plugin's latency is 0. Touched only on the host idle thread.

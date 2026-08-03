@@ -40,6 +40,10 @@ wrapper-boundary conversion done internally. The driver's public
 input / output buffers are always `f32` (host-wire); the plugin's
 `process()` sees `AudioBuffer<P::Sample>`.
 
+The driver's `ProcessContext::bus_routing` preserves every declared bus index.
+Enabled buses occupy the flattened buffer and report `Active`; disabled buses
+are zero-width `Inactive` placeholders.
+
 ## Example
 
 ```rust

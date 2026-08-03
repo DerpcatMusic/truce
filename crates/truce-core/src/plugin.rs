@@ -82,6 +82,16 @@ pub trait PluginRuntime: Send + 'static {
     where
         Self: Sized;
 
+    /// Exact VST3 class ID declared by the plugin, or `None` to use
+    /// the historical ID derived from [`Self::info`].
+    #[must_use]
+    fn vst3_class_id() -> Option<[u8; 16]>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// Supported bus layouts. The host picks one. Default: the standard
     /// audio effect - stereo and mono.
     #[must_use]

@@ -51,6 +51,22 @@ pub(crate) struct Config {
     /// Empty = per-plugin output only (today's behaviour).
     #[serde(default, rename = "suite")]
     pub(crate) suites: Vec<SuiteDef>,
+    /// Exact VST3 class IDs resolved from `truce.toml`, kept outside
+    /// the public shared `PluginDef` struct-literal shape.
+    #[serde(skip)]
+    vst3_class_ids: Vec<(String, [u8; 16])>,
+}
+
+impl Config {
+    pub(crate) fn vst3_cid(&self, plugin: &PluginDef) -> [u8; 16] {
+        let explicit = self
+            .vst3_class_ids
+            .iter()
+            .find(|(crate_name, _)| crate_name == &plugin.crate_name)
+            .map(|(_, class_id)| *class_id);
+        let id = truce_build::plugin_id(&self.vendor.id, &plugin.bundle_id);
+        truce_utils::state::resolve_vst3_cid(explicit, &id)
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -602,13 +618,14 @@ pub(crate) fn load_config() -> std::result::Result<Config, CargoTruceError> {
         .into());
     }
     let content = fs::read_to_string(&path)?;
-    let config: Config = toml::from_str(&content)?;
+    let mut config: Config = toml::from_str(&content)?;
     if config.plugin.is_empty() {
         return Err("No [[plugin]] entries in truce.toml".into());
     }
     // Reject contradictory MIDI keys here so every install/package/
     // validate path fails with the plugin named, mirroring the
     // compile error truce-derive raises for the same config.
+    let vst3_class_ids = truce_build::load_vst3_class_ids(&path)?;
     for p in &config.plugin {
         if let Err(msg) = truce_build::validate_bundle_id(&p.bundle_id) {
             return Err(format!("[[plugin]] `{}`: {msg}", p.crate_name).into());
@@ -627,6 +644,7 @@ pub(crate) fn load_config() -> std::result::Result<Config, CargoTruceError> {
             return Err(format!("[[plugin]] `{}`: {msg}", p.crate_name).into());
         }
     }
+    config.vst3_class_ids = vst3_class_ids;
     Ok(config)
 }
 

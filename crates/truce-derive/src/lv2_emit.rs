@@ -37,7 +37,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use syn::Type;
 use truce_build::lv2::Lv2Param;
-use truce_params::METER_ID_BASE;
+use truce_params::AUTO_PARAM_ID_MASK;
 
 /// Write the per-struct sidecar. Best-effort; errors don't fail the
 /// build (a missing sidecar will surface later when
@@ -348,16 +348,17 @@ fn aggregate(
     // `offset_ids` does, so this flattened table agrees with
     // `param_infos()`.
     let hash_scheme = toml.get("scheme").and_then(toml::Value::as_str) != Some("ordinal");
-    let mask = METER_ID_BASE - 1;
+    let mask = AUTO_PARAM_ID_MASK;
 
-    // Own params carry struct-local ids; fold them into the parent's id
-    // space by `id_base` (additive + mask, matching `offset_ids`).
+    // Historical-domain IDs fold into the parent's space; wider
+    // explicit IDs are absolute, matching runtime `offset_ids` and
+    // static `param_infos_static` exactly.
     let mut own_count = 0u32;
     if let Some(toml::Value::Array(arr)) = toml.get("param") {
         for entry in arr {
             let mut p = parse_param_entry(entry, sidecar_dir)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
-            p.id = (p.id + id_base) & mask;
+            p.id = truce_params::rebase_nested_param_id(p.id, id_base);
             if let Some(field) = entry.get("field").and_then(toml::Value::as_str) {
                 fields.push((p.id, field.to_string()));
             }
@@ -511,6 +512,13 @@ fn parse_range_value(
     use truce_build::lv2::Lv2Range;
     if let Some(inner) = s.strip_prefix("linear(").and_then(|x| x.strip_suffix(')')) {
         let (lo, hi) = parse_pair_f64(inner)?;
+        return Ok(Lv2Range::Linear { min: lo, max: hi });
+    }
+    // LV2 control ports cannot express an arbitrary floating step interval in
+    // their range metadata. Preserve the numeric bounds; runtime snapping
+    // still occurs in the parameter implementation.
+    if let Some(inner) = s.strip_prefix("stepped(").and_then(|x| x.strip_suffix(')')) {
+        let (lo, hi) = parse_leading_pair_f64(inner)?;
         return Ok(Lv2Range::Linear { min: lo, max: hi });
     }
     if let Some(inner) = s.strip_prefix("log(").and_then(|x| x.strip_suffix(')')) {

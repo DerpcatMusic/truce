@@ -152,9 +152,10 @@ AAX_Result TruceAAX_Parameters::EffectInit() {
     Controller()->GetSampleRate(&sr);
     mMaxBlockSize = 8192;
     g_bridge.reset(mRustCtx, (double)sr, mMaxBlockSize);
-    mSampleRate = (double)sr;
     // Silence for unpatched/missing input channels (see mSilence).
     mSilence.assign(mMaxBlockSize, 0.0f);
+    mNativeEvents.reserve(TRUCE_AAX_NATIVE_EVENT_CAP);
+    mNativeSysex.reserve(TRUCE_AAX_SYSEX_POOL_CAP);
 
     // Channel counts come from the stem format this instance was
     // instantiated with, not the descriptor (which carries only the
@@ -334,17 +335,17 @@ void TruceAAX_Parameters::RenderAudio(
     // Get audio buffers
     int32_t bufferSize = *ioRenderInfo->mNumSamples;
 
-    // Defensive: if the host violates the 8192-sample cap declared
-    // in EffectInit, re-reset the plugin so its internal scratch
-    // can fit the new block. This will glitch the audio - but a
-    // glitch is recoverable; reading past the end of an allocated
-    // buffer is not.
+    // A host block beyond the declared cap cannot be made safe by resetting
+    // here: reset and scratch growth allocate on the audio thread. Fail closed
+    // with silence; a compliant host never takes this path.
     if (bufferSize > 0 && (uint32_t)bufferSize > mMaxBlockSize) {
-        mMaxBlockSize = (uint32_t)bufferSize;
-        g_bridge.reset(mRustCtx, mSampleRate, mMaxBlockSize);
-        // Keep the silence buffer block-sized (the host already broke its
-        // own cap, so this one-off reallocation rides with the reset).
-        mSilence.assign(mMaxBlockSize, 0.0f);
+        if (ioRenderInfo->mAudioOutputs) {
+            for (uint32_t ch = 0; ch < mNumOutputChannels; ch++) {
+                float* output = ioRenderInfo->mAudioOutputs[ch];
+                if (output) std::memset(output, 0, (size_t)bufferSize * sizeof(float));
+            }
+        }
+        return;
     }
 
     // Build channel pointers. This instance's channel count comes from
@@ -356,7 +357,7 @@ void TruceAAX_Parameters::RenderAudio(
     constexpr uint32_t kMaxChannels = 8; // 7.1 DTS, the widest main stem we register
     // The input array carries the appended sidechain after the main
     // channels, so it needs room for a full-width main PLUS the declared
-    // sidechain width. Sizing it to kMaxChannels alone silently dropped the
+    // first sidechain-bus width. Sizing it to kMaxChannels alone silently dropped the
     // sidechain of a 7.1 main (numIn already == kMaxChannels), feeding Rust
     // fewer channels than the negotiated layout - an out-of-range read the
     // Rust bridge panics on, leaving the track permanently silent. The
@@ -376,18 +377,19 @@ void TruceAAX_Parameters::RenderAudio(
     // Append the AAX side-chain after the main input channels, so the
     // plugin sees flat channel indexing (main then sidechain). Pro Tools
     // side-chain is always mono; duplicate it across the plugin's declared
-    // sidechain width so a stereo-sidechain plugin gets it on both
-    // channels. `*mSideChainP` is 0 when no side-chain source is patched -
-    // the plugin still negotiated the wider layout, so feed block-sized
-    // silence for the declared sidechain width rather than leaving numIn
-    // short (reading an absent sidechain channel is an out-of-range panic
-    // in the Rust bridge). The `!mSilence.empty()` guard keeps a null out
-    // of `inputs` if EffectInit never sized the buffer.
+    // first sidechain bus's width so a stereo-sidechain plugin gets it on both
+    // channels. AddSideChainIn's per-block channel index is AAX's only
+    // realtime activation signal: 0 means no source is patched. Keep the
+    // declared topology stable, but feed silence until the host supplies a
+    // positive index. The `!mSilence.empty()` guard keeps a null out of
+    // `inputs` if EffectInit never sized the buffer.
+    bool sidechainActive = false;
     if (g_descriptor.sidechain_in_channels > 0 && !mSilence.empty()) {
         auto* extInfo = reinterpret_cast<TruceAaxExtendedRenderInfo*>(ioRenderInfo);
         const float* scBuf = nullptr;
         if (ioRenderInfo->mAudioInputs && extInfo->mSideChainP && *extInfo->mSideChainP != 0)
             scBuf = ioRenderInfo->mAudioInputs[*extInfo->mSideChainP];
+        sidechainActive = scBuf != nullptr;
         for (uint32_t c = 0;
              c < g_descriptor.sidechain_in_channels && numIn < kMaxInputs;
              c++) {
@@ -400,108 +402,125 @@ void TruceAAX_Parameters::RenderAudio(
             outputs[ch] = ioRenderInfo->mAudioOutputs[ch];
     }
 
-    // Collect MIDI events for instruments and note effects (anything
-    // that registered a LocalInput MIDI node in Describe). The cap
-    // at 4096 packets per render block is far above any realistic
-    // density (Pro Tools typically delivers tens to low hundreds
-    // even for dense polyphonic recordings) and is stack-allocated
-    // (4096 × 8 B = 32 KB) so the audio thread never heap-allocates.
-    constexpr uint32_t kMidiBufferCap = 4096;
-    TruceAaxMidiEvent midiEvents[kMidiBufferCap];
-    uint32_t midiCount = 0;
-
-    // Per-block SysEx reassembly scratch. AAX's `AAX_CMidiPacket`
-    // holds up to 4 bytes; long `SysEx` messages span consecutive
-    // packets framed by `0xF0` start / `0xF7` end (per `AAX.h:605`).
-    // 64 KiB is enough for firmware-update-shaped payloads; longer
-    // messages get truncated at the limit and dropped to keep the
-    // audio thread allocation-free.
-    constexpr uint32_t kSysExScratchCap = 64 * 1024;
-    uint8_t sysexScratch[kSysExScratchCap];
-    uint32_t sysexLen = 0;
+    // Build one ordered native event transaction. The two vectors were
+    // reserved in EffectInit and never grow beyond their fixed bounds here.
+    mNativeEvents.clear();
+    mNativeSysex.clear();
+    uint32_t inputStatus = TRUCE_AAX_EVENT_END;
     bool sysexInProgress = false;
+    uint32_t sysexStart = 0;
     uint32_t sysexDeltaFrames = 0;
-    bool sysexOverflowed = false;
+
+    auto shortMessageLength = [](uint8_t status) -> uint32_t {
+        if (status >= 0x80 && status <= 0xEF) {
+            const uint8_t type = status & 0xF0;
+            return (type == 0xC0 || type == 0xD0) ? 2u : 3u;
+        }
+        switch (status) {
+            case 0xF1: case 0xF3: return 2;
+            case 0xF2: return 3;
+            case 0xF6: case 0xF8: case 0xFA: case 0xFB:
+            case 0xFC: case 0xFE: case 0xFF: return 1;
+            default: return 0;
+        }
+    };
+
+    auto appendSysex = [&]() -> bool {
+        if (mNativeEvents.size() >= TRUCE_AAX_NATIVE_EVENT_CAP) return false;
+        TruceAaxNativeEvent event = {};
+        event.sample_offset = sysexDeltaFrames;
+        event.kind = TRUCE_AAX_NATIVE_EVENT_SYSEX;
+        event.data_len = (uint32_t)mNativeSysex.size() - sysexStart;
+        event.sysex = event.data_len == 0 ? nullptr : mNativeSysex.data() + sysexStart;
+        mNativeEvents.push_back(event);
+        return true;
+    };
 
     if (g_descriptor.wants_input_midi && ioRenderInfo->mInputNode) {
         AAX_IMIDINode* midiNode = ioRenderInfo->mInputNode;
         if (midiNode) {
             AAX_CMidiStream* stream = midiNode->GetNodeBuffer();
             if (stream && stream->mBufferSize > 0) {
-                // Walk `pkt.mData[start..mLength]` as `SysEx` data
-                // bytes. On `0xF7`: emit (if no overflow) and reset
-                // state. On any other status byte: drop the
-                // in-progress message and reset (mid-`SysEx` status
-                // is a host spec violation; rest of the packet is
-                // discarded). Otherwise accumulate into
-                // `sysexScratch` until the cap is reached
-                // (overflow flag latches so the eventual `0xF7` is
-                // a drop, not a partial push).
+                uint32_t previousTimestamp = 0;
+                bool haveTimestamp = false;
                 auto ingestSysexBytes = [&](const AAX_CMidiPacket& pkt, uint32_t start) {
                     for (uint32_t j = start; j < pkt.mLength; j++) {
                         uint8_t b = pkt.mData[j];
                         if (b == 0xF7) {
-                            if (!sysexOverflowed && g_bridge.push_sysex_input) {
-                                g_bridge.push_sysex_input(mRustCtx,
-                                    sysexDeltaFrames, sysexScratch, sysexLen);
-                            }
+                            if (j + 1 != pkt.mLength || !appendSysex())
+                                inputStatus = j + 1 != pkt.mLength
+                                    ? TRUCE_AAX_EVENT_INVALID : TRUCE_AAX_EVENT_QUEUE_FULL;
                             sysexInProgress = false;
-                            sysexLen = 0;
-                            sysexOverflowed = false;
-                            return;
+                            return inputStatus == TRUCE_AAX_EVENT_END;
                         }
                         if (b & 0x80) {
                             sysexInProgress = false;
-                            sysexLen = 0;
-                            sysexOverflowed = false;
-                            return;
+                            inputStatus = TRUCE_AAX_EVENT_INVALID;
+                            return false;
                         }
-                        if (sysexLen < kSysExScratchCap) {
-                            sysexScratch[sysexLen++] = b;
-                        } else {
-                            sysexOverflowed = true;
+                        if (mNativeSysex.size() >= TRUCE_AAX_SYSEX_POOL_CAP) {
+                            inputStatus = TRUCE_AAX_EVENT_QUEUE_FULL;
+                            sysexInProgress = false;
+                            return false;
                         }
+                        mNativeSysex.push_back(b);
                     }
+                    return true;
                 };
 
                 for (uint32_t i = 0; i < stream->mBufferSize; i++) {
                     const AAX_CMidiPacket& pkt = stream->mBuffer[i];
-                    if (pkt.mLength < 1) continue;
+                    if (inputStatus != TRUCE_AAX_EVENT_END) break;
+                    if (pkt.mLength < 1 || pkt.mLength > 4 ||
+                        pkt.mTimestamp >= (uint32_t)bufferSize ||
+                        (haveTimestamp && pkt.mTimestamp < previousTimestamp)) {
+                        inputStatus = TRUCE_AAX_EVENT_INVALID;
+                        break;
+                    }
+                    previousTimestamp = pkt.mTimestamp;
+                    haveTimestamp = true;
                     const uint8_t status = pkt.mData[0];
-                    // SysEx start: status `0xF0` in the first byte of
-                    // a packet. Subsequent packets carry only data
-                    // bytes until a `0xF7` terminator. Per the AAX
-                    // SDK each `AAX_CMidiPacket` is one message - so
-                    // once we enter either `SysEx` branch the whole
-                    // packet belongs to it (channel-voice is the
-                    // explicit `else`).
                     if (sysexInProgress) {
                         ingestSysexBytes(pkt, 0);
                         continue;
                     }
                     if (status == 0xF0) {
                         sysexInProgress = true;
-                        sysexLen = 0;
-                        sysexOverflowed = false;
+                        sysexStart = (uint32_t)mNativeSysex.size();
                         sysexDeltaFrames = pkt.mTimestamp;
-                        // Single-packet `SysEx` (ends with `0xF7` in
-                        // the same packet) is handled by
-                        // `ingestSysexBytes` discovering `0xF7` in
-                        // its walk.
                         ingestSysexBytes(pkt, 1);
                         continue;
                     }
-                    if (midiCount < kMidiBufferCap) {
-                        midiEvents[midiCount].delta_frames = pkt.mTimestamp;
-                        midiEvents[midiCount].status = pkt.mData[0];
-                        midiEvents[midiCount].data1 = pkt.mLength > 1 ? pkt.mData[1] : 0;
-                        midiEvents[midiCount].data2 = pkt.mLength > 2 ? pkt.mData[2] : 0;
-                        midiEvents[midiCount]._pad = 0;
-                        midiCount++;
+                    const uint32_t expected = shortMessageLength(status);
+                    bool valid = expected == pkt.mLength;
+                    for (uint32_t j = 1; valid && j < pkt.mLength; j++)
+                        valid = (pkt.mData[j] & 0x80) == 0;
+                    if (!valid) {
+                        inputStatus = TRUCE_AAX_EVENT_INVALID;
+                        break;
                     }
+                    if (mNativeEvents.size() >= TRUCE_AAX_NATIVE_EVENT_CAP) {
+                        inputStatus = TRUCE_AAX_EVENT_QUEUE_FULL;
+                        break;
+                    }
+                    TruceAaxNativeEvent event = {};
+                    event.sample_offset = pkt.mTimestamp;
+                    event.kind = TRUCE_AAX_NATIVE_EVENT_MIDI1;
+                    event.data_len = pkt.mLength;
+                    for (uint32_t j = 0; j < pkt.mLength; j++) event.midi[j] = pkt.mData[j];
+                    mNativeEvents.push_back(event);
                 }
+                if (inputStatus == TRUCE_AAX_EVENT_END && sysexInProgress)
+                    inputStatus = TRUCE_AAX_EVENT_INVALID;
             }
         }
+    }
+
+    // Event ingestion is transactional: never hand the plugin a valid prefix
+    // when the rest of the host block overflowed or was malformed.
+    if (inputStatus != TRUCE_AAX_EVENT_END) {
+        mNativeEvents.clear();
+        mNativeSysex.clear();
     }
 
     // Query Pro Tools transport. Each getter is independent so the
@@ -562,13 +581,23 @@ void TruceAAX_Parameters::RenderAudio(
         }
     }
 
-    // Call the Rust processing function
-    g_bridge.process(mRustCtx,
+    // Call the strict Rust processing function. A non-END status means the
+    // MIDI transaction did not round-trip, so no plugin MIDI output follows.
+    uint32_t processStatus = g_bridge.process_native(mRustCtx,
         inputs, outputs,
         numIn, numOut,
+        (ioRenderInfo->mAudioInputs ? 1u : 0u) | (sidechainActive ? 2u : 0u),
+        ioRenderInfo->mAudioOutputs ? 1u : 0u,
         (uint32_t)bufferSize,
-        midiEvents, midiCount,
+        mNativeEvents.data(), (uint32_t)mNativeEvents.size(), inputStatus,
         transport.valid ? &transport : nullptr);
+    if (processStatus != TRUCE_AAX_EVENT_END) {
+        // DSP may still have produced output before the input transaction
+        // failed. Close this block's output lifecycle without publishing it;
+        // Rust preserves a more authoritative staging overflow if present.
+        g_bridge.finish_output_events(mRustCtx, TRUCE_AAX_EVENT_INVALID);
+        return;
+    }
 
     // Drain plugin-emitted MIDI to the host. The component descriptor
     // built in `TruceAAX_Describe.cpp` registered an extra `LocalOutput`
@@ -578,63 +607,59 @@ void TruceAAX_Parameters::RenderAudio(
     // the inherited fields, plus one extra slot for `mOutputNode`).
     auto* extendedInfo = reinterpret_cast<TruceAaxExtendedRenderInfo*>(ioRenderInfo);
     AAX_IMIDINode* outputNode = extendedInfo->mOutputNode;
+    g_bridge.begin_output_events(mRustCtx, (uint32_t)bufferSize);
     if (outputNode) {
-        uint32_t outCount = g_bridge.output_event_count(mRustCtx);
-        for (uint32_t i = 0; i < outCount; i++) {
-            TruceAaxMidiEvent ev = {};
-            g_bridge.output_event_at(mRustCtx, i, &ev);
-            AAX_CMidiPacket pkt = {};
-            pkt.mTimestamp = ev.delta_frames;
-            pkt.mLength = 3;
-            pkt.mData[0] = ev.status;
-            pkt.mData[1] = ev.data1;
-            pkt.mData[2] = ev.data2;
-            // Two-byte messages (Program Change, Channel Pressure)
-            // ignore mData[2]; the SDK packet carries up to 4 bytes
-            // and Pro Tools reads only mLength bytes regardless.
-            const uint8_t st = ev.status & 0xF0;
-            if (st == 0xC0 || st == 0xD0) pkt.mLength = 2;
-            outputNode->PostMIDIPacket(&pkt);
-        }
+        for (;;) {
+            TruceAaxNativeEvent event = {};
+            uint32_t status = g_bridge.next_output_event(mRustCtx, &event);
+            if (status == TRUCE_AAX_EVENT_END) {
+                g_bridge.finish_output_events(mRustCtx, TRUCE_AAX_EVENT_EMITTED);
+                break;
+            }
+            if (status != TRUCE_AAX_EVENT_EMITTED) {
+                g_bridge.finish_output_events(mRustCtx, status);
+                return;
+            }
 
-        // Output SysEx: per AAX_Enums.h:1160, "There are no buffer
-        // size limitations for output of SysEx messages." We frame
-        // each event (`0xF0` + inner bytes + `0xF7`) and fragment
-        // into a sequence of ≤4-byte packets sharing one timestamp.
-        if (g_bridge.output_sysex_count) {
-            uint32_t sxCount = g_bridge.output_sysex_count(mRustCtx);
-            for (uint32_t i = 0; i < sxCount; i++) {
-                uint32_t delta = 0;
-                const uint8_t* bytes = nullptr;
-                uint32_t len = 0;
-                g_bridge.output_sysex_at(mRustCtx, i, &delta, &bytes, &len);
-                if (!bytes && len > 0) continue;
-
-                // Build framed stream on the fly without buffering
-                // the whole message - chunk loop reads the next byte
-                // from one of three sources (start marker, payload,
-                // end marker) based on position.
-                uint32_t totalLen = len + 2;     // +2 for 0xF0 / 0xF7
-                uint32_t pos = 0;
-                auto byteAt = [&](uint32_t p) -> uint8_t {
-                    if (p == 0)              return 0xF0;
-                    if (p == totalLen - 1)   return 0xF7;
-                    return bytes[p - 1];
-                };
-                while (pos < totalLen) {
-                    AAX_CMidiPacket pkt = {};
-                    pkt.mTimestamp = delta;
-                    uint32_t chunk = totalLen - pos;
-                    if (chunk > 4) chunk = 4;
-                    pkt.mLength = chunk;
-                    for (uint32_t j = 0; j < chunk; j++) {
-                        pkt.mData[j] = byteAt(pos + j);
-                    }
-                    outputNode->PostMIDIPacket(&pkt);
-                    pos += chunk;
+            if (event.kind == TRUCE_AAX_NATIVE_EVENT_MIDI1) {
+                AAX_CMidiPacket pkt = {};
+                pkt.mTimestamp = event.sample_offset;
+                pkt.mLength = event.data_len;
+                for (uint32_t j = 0; j < event.data_len; j++) pkt.mData[j] = event.midi[j];
+                if (outputNode->PostMIDIPacket(&pkt) != AAX_SUCCESS) {
+                    g_bridge.finish_output_events(mRustCtx, TRUCE_AAX_EVENT_QUEUE_FULL);
+                    return;
                 }
+                continue;
+            }
+
+            // AAX represents SysEx as a consecutive run of <=4-byte packets.
+            // Frame the exact inner payload and emit the whole logical event
+            // before advancing the Rust cursor, preserving event order.
+            const uint32_t totalLen = event.data_len + 2;
+            uint32_t pos = 0;
+            while (pos < totalLen) {
+                AAX_CMidiPacket pkt = {};
+                pkt.mTimestamp = event.sample_offset;
+                pkt.mLength = totalLen - pos < 4 ? totalLen - pos : 4;
+                for (uint32_t j = 0; j < pkt.mLength; j++) {
+                    const uint32_t p = pos + j;
+                    pkt.mData[j] = p == 0 ? 0xF0
+                        : (p + 1 == totalLen ? 0xF7 : event.sysex[p - 1]);
+                }
+                if (outputNode->PostMIDIPacket(&pkt) != AAX_SUCCESS) {
+                    g_bridge.finish_output_events(mRustCtx, TRUCE_AAX_EVENT_QUEUE_FULL);
+                    return;
+                }
+                pos += pkt.mLength;
             }
         }
+    } else {
+        TruceAaxNativeEvent event = {};
+        uint32_t status = g_bridge.next_output_event(mRustCtx, &event);
+        if (status == TRUCE_AAX_EVENT_EMITTED)
+            status = TRUCE_AAX_EVENT_UNSUPPORTED;
+        g_bridge.finish_output_events(mRustCtx, status);
     }
 }
 

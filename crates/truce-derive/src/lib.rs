@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use syn::ext::IdentExt;
 use syn::{Data, DeriveInput, Expr, Fields, Lit, Type, TypePath, UnOp};
 use truce_build::{Config, PluginDef};
-use truce_params::METER_ID_BASE;
+use truce_params::{AUTO_PARAM_ID_MASK, METER_ID_BASE};
 
 mod lv2_emit;
 
@@ -250,6 +250,9 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
         }
     };
     let preset_user_dir = opt_str(&plugin.presets.as_ref().and_then(|c| c.user_dir.clone()));
+    let description = opt_str(&plugin.description);
+    let clap_manual_url = opt_str(&plugin.clap_manual_url);
+    let clap_support_url = opt_str(&plugin.clap_support_url);
     let vst3_name = opt_str(&plugin.vst3_name);
     let clap_name = opt_str(&plugin.clap_name);
     let vst2_name = opt_str(&plugin.vst2_name);
@@ -265,6 +268,7 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
         quote! { &[#(#items),*] }
     };
     let legacy = plugin.legacy_state.as_ref();
+    let clap_features = str_slice(&plugin.clap_features);
     let legacy_au_keys = str_slice(legacy.map_or(&[][..], |l| &l.au_keys));
     let legacy_lv2_uris = str_slice(legacy.map_or(&[][..], |l| &l.lv2_uris));
     let legacy_aax_chunk_ids = str_slice(legacy.map_or(&[][..], |l| &l.aax_chunk_ids));
@@ -297,6 +301,10 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
                 url: #url,
                 version: #version,
                 category: #category,
+                description: #description,
+                clap_manual_url: #clap_manual_url,
+                clap_support_url: #clap_support_url,
+                clap_features: #clap_features,
                 accepts_midi_in: #accepts_midi_in,
                 emits_midi: #emits_midi,
                 midi_input_dialect: #midi_input_dialect,
@@ -332,6 +340,32 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// Generate the optional exact VST3 class ID for the current plugin.
+#[doc(hidden)]
+#[proc_macro]
+pub fn plugin_vst3_class_id(_input: TokenStream) -> TokenStream {
+    let (_config, pkg_name, truce_toml_path) = match try_resolve_plugin() {
+        Ok(value) => value,
+        Err(msg) => {
+            return syn::Error::new(proc_macro2::Span::call_site(), msg)
+                .to_compile_error()
+                .into();
+        }
+    };
+    match truce_build::load_vst3_class_ids(&truce_toml_path) {
+        Ok(ids) => match ids
+            .into_iter()
+            .find(|(crate_name, _)| crate_name == &pkg_name)
+        {
+            Some((_, bytes)) => quote! { Some([#(#bytes),*]) }.into(),
+            None => quote! { None }.into(),
+        },
+        Err(msg) => syn::Error::new(proc_macro2::Span::call_site(), msg)
+            .to_compile_error()
+            .into(),
+    }
 }
 
 /// Emit `manifest.ttl` + `plugin.ttl` for the plugin whose root params
@@ -863,7 +897,7 @@ fn parse_id_scheme(attrs: &[syn::Attribute]) -> Result<IdScheme, syn::Error> {
 }
 
 /// Deterministic FNV-1a hash of a field name, masked into the
-/// parameter id space (`0..METER_ID_BASE`). Pure integer arithmetic
+/// historical 24-bit auto-ID space. Pure integer arithmetic
 /// over the name bytes, so the value is identical across toolchains,
 /// targets, and runs - the property a persisted parameter id needs.
 /// `pub(crate)` so the LV2 sidecar aggregator (`lv2_emit`) flattens
@@ -876,7 +910,7 @@ pub(crate) fn name_hash_id(name: &str) -> u32 {
         h ^= u32::from(b);
         h = h.wrapping_mul(FNV_PRIME);
     }
-    h & (METER_ID_BASE - 1)
+    h & AUTO_PARAM_ID_MASK
 }
 
 /// Full 32-bit FNV-1a of a field name - the keyed `#[derive(State)]`
@@ -1221,6 +1255,33 @@ fn parse_range_tokens(range: &str) -> proc_macro2::TokenStream {
         let (min, max) = (f64_lit(min), f64_lit(max));
         return quote! { ::truce::params::ParamRange::Linear { min: #min, max: #max } };
     }
+    if let Some(inner) = range
+        .strip_prefix("stepped(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.len() != 3 {
+            return bad(format!(
+                "stepped range needs three arguments `stepped(min, max, step)`, got `stepped({inner})`"
+            ));
+        }
+        let Ok(min) = parts[0].parse::<f64>() else {
+            return bad(format!("stepped range min `{}` is not a number", parts[0]));
+        };
+        let Ok(max) = parts[1].parse::<f64>() else {
+            return bad(format!("stepped range max `{}` is not a number", parts[1]));
+        };
+        let Ok(step) = parts[2].parse::<f64>() else {
+            return bad(format!("stepped range step `{}` is not a number", parts[2]));
+        };
+        if !min.is_finite() || !max.is_finite() || !step.is_finite() || min >= max || step <= 0.0 {
+            return bad(format!(
+                "stepped range needs finite min < max and step > 0, got `stepped({min}, {max}, {step})`"
+            ));
+        }
+        let (min, max, step) = (f64_lit(min), f64_lit(max), f64_lit(step));
+        return quote! { ::truce::params::ParamRange::Stepped { min: #min, max: #max, step: #step } };
+    }
     if let Some(inner) = range.strip_prefix("log(").and_then(|s| s.strip_suffix(')')) {
         let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
         if parts.len() != 2 {
@@ -1310,7 +1371,7 @@ fn parse_range_tokens(range: &str) -> proc_macro2::TokenStream {
     }
     bad(format!(
         "unknown range `{range}` - supported: linear(min, max), log(min, max), \
-         skewed(min, max, factor), sym_skewed(min, max, factor, center), \
+         stepped(min, max, step), skewed(min, max, factor), sym_skewed(min, max, factor, center), \
          discrete(min, max), enum(count), reversed(<range>)"
     ))
 }
@@ -1334,7 +1395,7 @@ fn range_bounds(range: &str) -> Option<(f64, f64)> {
         let hi = parts.get(1)?.parse::<f64>().ok()?;
         Some((lo.min(hi), lo.max(hi)))
     };
-    for prefix in ["linear(", "log(", "skewed(", "sym_skewed("] {
+    for prefix in ["linear(", "stepped(", "log(", "skewed(", "sym_skewed("] {
         if let Some(inner) = range.strip_prefix(prefix).and_then(|s| s.strip_suffix(')')) {
             return leading_pair(inner);
         }
@@ -1394,6 +1455,9 @@ fn default_range_error(f: &ParamField) -> Option<String> {
 
 /// Parse a unit string into `ParamUnit` tokens.
 fn parse_unit_tokens(unit: &str) -> proc_macro2::TokenStream {
+    if let Some(suffix) = unit.strip_prefix("custom:") {
+        return quote! { ::truce::params::ParamUnit::Custom(#suffix) };
+    }
     match unit {
         "dB" | "Db" | "db" => quote! { ::truce::params::ParamUnit::Db },
         "Hz" | "hz" => quote! { ::truce::params::ParamUnit::Hz },
@@ -1409,8 +1473,9 @@ fn parse_unit_tokens(unit: &str) -> proc_macro2::TokenStream {
         // to `ParamUnit::None` and surface only as "0.5" instead of
         // "0.5 Hz" in the host.
         other => {
-            let msg =
-                format!("unknown unit `{other}` - supported: dB, Hz, ms, s, %, st, pan, deg, none");
+            let msg = format!(
+                "unknown unit `{other}` - supported: dB, Hz, ms, s, %, st, pan, deg, none, custom:<suffix>"
+            );
             quote! { compile_error!(#msg) }
         }
     }
@@ -1422,6 +1487,9 @@ fn parse_flags_tokens(flags: &str) -> proc_macro2::TokenStream {
     for flag in flags.split('|').map(|s| s.trim().to_lowercase()) {
         match flag.as_str() {
             "automatable" => parts.push(quote! { ::truce::params::ParamFlags::AUTOMATABLE }),
+            "non_automatable" => {
+                parts.push(quote! { ::truce::params::ParamFlags::empty() });
+            }
             "hidden" => parts.push(quote! { ::truce::params::ParamFlags::HIDDEN }),
             "readonly" => parts.push(quote! { ::truce::params::ParamFlags::READONLY }),
             "bypass" => parts.push(quote! { ::truce::params::ParamFlags::IS_BYPASS }),
@@ -1437,7 +1505,7 @@ fn parse_flags_tokens(flags: &str) -> proc_macro2::TokenStream {
             "" => {}
             other => {
                 let msg = format!(
-                    "unknown param flag `{other}` - supported: automatable, hidden, \
+                    "unknown param flag `{other}` - supported: automatable, non_automatable, hidden, \
                      readonly, bypass, modulatable, modulatable_per_note",
                 );
                 return quote! { compile_error!(#msg) };
@@ -1797,21 +1865,19 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     }
 
     // --- Auto-assign meter IDs ---
-    // Meters live in a dedicated high-range starting at 2^24 so they
-    // can never collide with auto-assigned param IDs (which fill from
-    // 0 upward). Storage indexes as `meter_array[id - METER_ID_BASE]`.
+    // Meters live outside the signed-positive 31-bit host parameter
+    // domain. Storage indexes as `meter_array[id - METER_ID_BASE]`.
     // `METER_ID_BASE` is imported from `truce_params` at proc-macro
     // build time so the value can't drift between crates.
     for (next_meter, m) in (METER_ID_BASE..).zip(meter_fields.iter_mut()) {
         m.id = Some(next_meter);
     }
 
-    // --- Compile-time validation: duplicate IDs + range overlap ---
+    // --- Compile-time validation: duplicate IDs + host-safe range ---
     //
     // Checks:
     //  1. No two params share an ID.
-    //  2. No explicit param ID lands in the meter range (≥ METER_ID_BASE).
-    //     Auto-assigned params can't hit this - you'd need 16M fields.
+    //  2. Every explicit param ID is in the host-safe 31-bit domain.
     //  3. No param ID collides with any meter ID (follows from #2 when
     //     both checks pass, but surfaced separately for a clearer error).
     {
@@ -1820,8 +1886,9 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             if let Some(id) = f.attrs.id {
                 if id >= METER_ID_BASE {
                     let msg = format!(
-                        "Parameter ID {id} is in the meter range (≥ {METER_ID_BASE}). \
-                         Param IDs must be < {METER_ID_BASE}."
+                        "Parameter ID {id} is outside the host-safe 31-bit range. \
+                         Param IDs must be <= {}.",
+                        ::truce_params::PARAM_ID_MAX
                     );
                     return syn::Error::new_spanned(&ast, msg).to_compile_error().into();
                 }
@@ -2028,8 +2095,10 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                         <#ty as ::truce::params::Params>::param_infos_static()
                             .into_iter()
                             .map(|mut __info| {
-                                __info.id =
-                                    (__info.id + __base) & (::truce::params::METER_ID_BASE - 1);
+                                __info.id = ::truce::params::rebase_nested_param_id(
+                                    __info.id,
+                                    __base,
+                                );
                                 __info
                             }),
                     );
@@ -2417,20 +2486,20 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // Fold `id_base` into every parameter id in this subtree: own
     // params directly, nested groups by recursing with the same base
     // (their own local spans were already applied at construction).
-    // The fold is `(id + base) & (METER_ID_BASE - 1)` - additive so the
-    // ordinal scheme's contiguous ranges are preserved exactly (sums
-    // stay well under `METER_ID_BASE`), masked so the hash scheme's
-    // wide ids and salts wrap back into the param range. Meters keep
-    // their dedicated id range and aren't shifted. Always emitted so a
-    // parent can rebase any nested child, leaf or not.
+    // Historical-domain IDs fold as `(id + base) & AUTO_PARAM_ID_MASK`,
+    // preserving every existing ordinal/hash/nested ID. Wider explicit
+    // IDs are absolute and stay unchanged through every parent. Meters
+    // keep their dedicated id range and aren't shifted. Always emitted
+    // so a parent can rebase any nested child, leaf or not.
     let own_param_idents: Vec<_> = param_fields.iter().map(|f| &f.ident).collect();
     let offset_ids_impl = quote! {
         impl #struct_name {
             #[doc(hidden)]
             pub fn offset_ids(&mut self, id_base: u32) {
-                #(self.#own_param_idents.info.id =
-                    (self.#own_param_idents.info.id + id_base)
-                        & (::truce::params::METER_ID_BASE - 1);)*
+                #(self.#own_param_idents.info.id = ::truce::params::rebase_nested_param_id(
+                    self.#own_param_idents.info.id,
+                    id_base,
+                );)*
                 #(self.#nested_idents.offset_ids(id_base);)*
             }
         }

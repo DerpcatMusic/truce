@@ -120,7 +120,7 @@ mod prelude_impl {
         PluginContext, PluginExport, PluginInfo, ProcessContext, ProcessMode, ProcessStatus,
         TransportInfo,
     };
-    pub use truce_derive::{ParamEnum, Params, State, plugin_info};
+    pub use truce_derive::{ParamEnum, Params, State, plugin_info, plugin_vst3_class_id};
     // `PluginLogic` itself is *not* re-exported here - each prelude
     // chooses its own leaf trait (`PluginLogic` for f32, aliased
     // `PluginLogic64 as PluginLogic` for f64) so plugin authors write

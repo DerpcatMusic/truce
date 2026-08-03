@@ -369,6 +369,7 @@ macro_rules! export_static {
     (
         params: $params:ty,
         info: $info:expr,
+        $(vst3_class_id: $vst3_class_id:expr,)?
         logic: $logic:ty,
         $(tasks: [$($task:ty),+],)?
     ) => {
@@ -406,6 +407,15 @@ macro_rules! export_static {
             {
                 $info
             }
+
+            $(
+                fn vst3_class_id() -> Option<[u8; 16]>
+                where
+                    Self: Sized,
+                {
+                    $vst3_class_id
+                }
+            )?
 
             fn bus_layouts() -> Vec<$crate::__macro_deps::truce_core::bus::BusLayout>
             where

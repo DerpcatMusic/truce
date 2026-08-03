@@ -43,6 +43,8 @@ welcome_bmp = "static/truce-welcome.bmp"
 #
 #   clap_name = "..."
 #   vst3_name = "..."
+#   # Optional exact 16-byte VST3 class ID; 32 hex characters.
+#   vst3_class_id = "00112233445566778899aabbccddeeff"
 #   vst2_name = "..."
 #   au_name   = "..."
 #   au3_name  = "..."
