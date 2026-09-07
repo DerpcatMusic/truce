@@ -16,14 +16,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use truce_params::METER_ID_BASE;
 
 /// Number of meter slots. Meters count upward from
-/// [`METER_ID_BASE`]; 256 per plugin is far above any real surface.
+/// [`METER_ID_BASE`], outside the host parameter domain; 256 per
+/// plugin is far above any real surface.
 const NUM_SLOTS: usize = 256;
 
 /// Fixed array of f32-bit atomic meter slots, indexed by meter id.
 ///
 /// Writers (the shells' `meter_fn`, called from `process()`) and
 /// readers (editor `get_meter` closures) address slots by the meter's
-/// param-space id (`METER_ID_BASE + index`); ids outside the slot
+/// internal id (`METER_ID_BASE + index`); ids outside the slot
 /// range read as `0.0` and write as a no-op, so a stale or
 /// out-of-range id can't panic on either thread.
 pub struct MeterStore {

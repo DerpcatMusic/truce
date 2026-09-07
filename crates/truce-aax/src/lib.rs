@@ -19,17 +19,22 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use truce_core::TransportSlot;
 use truce_core::buffer::RawBufferScratch;
-use truce_core::bus::BusLayout;
+use truce_core::bus::{BusKind, BusLayout};
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layout_fits_routing};
 use truce_core::cast::{len_u32, sample_pos_i64};
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
 use truce_core::editor::EditorBuilder;
 use truce_core::editor::{ClosureBridge, Editor, PluginContext, RawWindowHandle};
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, TransportInfo};
+use truce_core::events::{
+    EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
+    ExactEventMetadata, ExactEventQualifiers, LosslessEventCursor, LosslessEventRef,
+    OutputEventStatus, RawMidi1, TransportInfo,
+};
 use truce_core::export::PluginExport;
 use truce_core::info::{PluginCategory, PluginInfo, resolve_name_override};
 use truce_core::meters::MeterStore;
-use truce_core::midi::{decode_short_message, downconvert_to_midi1, pitch_bend_to_bytes};
+use truce_core::midi::{decode_short_message, event_to_midi1};
 use truce_core::plugin::PluginRuntime;
 use truce_core::rt::{RtSection, audit};
 use truce_core::snapshot::SnapshotSlot;
@@ -37,8 +42,8 @@ use truce_core::state;
 use truce_core::tasks::AnyTaskSpawner;
 use truce_core::wrapper::{
     ParamCStrings, PluginCell, SharedPlugin, copy_c_str, enter_plugin, first_bus_layout,
-    log_midi_ports_clamped, log_missing_bus_layout, max_io_channels, run_audio_block,
-    run_extern_callback_with, run_register, save_extra, shared_plugin,
+    log_missing_bus_layout, run_audio_block, run_extern_callback_with, run_register, save_extra,
+    shared_plugin,
 };
 use truce_params::{ParamFlags, ParamInfo, ParamRange, Params};
 
@@ -85,7 +90,7 @@ pub const TRUCE_AAX_RANGE_CUSTOM: u8 = 3;
 /// `Reversed(Discrete/Enum)` stays a stepped param with a reversed taper.
 fn aax_range_type(range: &ParamRange) -> u8 {
     match range {
-        ParamRange::Linear { .. } => TRUCE_AAX_RANGE_LINEAR,
+        ParamRange::Linear { .. } | ParamRange::Stepped { .. } => TRUCE_AAX_RANGE_LINEAR,
         // Skew shapes have no native AAX taper; a reversed range's
         // `1 - inner.normalize` has none either. Both route through the
         // custom taper (truce's own normalize/denormalize).
@@ -139,9 +144,8 @@ pub struct TruceAaxDescriptor {
     pub layout_in_channels: *const i16,
     pub layout_out_channels: *const i16,
     pub num_layouts: u32,
-    /// Total sidechain (non-main) input width from the first layout. `> 0`
-    /// makes the describe template register an AAX side-chain port; the
-    /// render appends that (mono) channel after the main inputs.
+    /// Sidechain input width shared by every advertised layout. `> 0` makes
+    /// the template register AAX's single side-chain port.
     pub sidechain_in_channels: u32,
 }
 
@@ -203,17 +207,41 @@ pub struct TruceAaxParamInfo {
     pub _pad: [u8; 7],
 }
 
+pub const TRUCE_AAX_NATIVE_EVENT_MIDI1: u8 = 1;
+pub const TRUCE_AAX_NATIVE_EVENT_SYSEX: u8 = 2;
+
+pub const TRUCE_AAX_EVENT_END: u32 = 0;
+pub const TRUCE_AAX_EVENT_EMITTED: u32 = 1;
+pub const TRUCE_AAX_EVENT_UNSUPPORTED: u32 = 2;
+pub const TRUCE_AAX_EVENT_INVALID: u32 = 3;
+pub const TRUCE_AAX_EVENT_QUEUE_FULL: u32 = 4;
+
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct TruceAaxMidiEvent {
-    pub delta_frames: u32,
-    pub status: u8,
-    pub data1: u8,
-    pub data2: u8,
-    // Trailing 1-byte pad keeping the struct's 8-byte alignment to
-    // match `TruceAaxMidiEvent` in `truce_aax_bridge.h`.
-    #[allow(clippy::pub_underscore_fields)]
-    pub _pad: u8,
+pub struct TruceAaxNativeEvent {
+    pub sample_offset: u32,
+    pub port: u16,
+    pub kind: u8,
+    pub reserved: u8,
+    pub data_len: u32,
+    pub midi: [u8; 3],
+    pub pad: u8,
+    pub sysex: *const u8,
+}
+
+impl Default for TruceAaxNativeEvent {
+    fn default() -> Self {
+        Self {
+            sample_offset: 0,
+            port: 0,
+            kind: 0,
+            reserved: 0,
+            data_len: 0,
+            midi: [0; 3],
+            pad: 0,
+            sysex: std::ptr::null(),
+        }
+    }
 }
 
 /// Transport snapshot filled by the AAX template's `RenderAudio` from
@@ -289,6 +317,11 @@ struct AaxInstance<P: PluginExport> {
     param_infos: Vec<ParamInfo>,
     /// `min_subblock_samples` from `truce.toml`'s `[automation]`.
     min_subblock_samples: u32,
+    midi_input_ports: u8,
+    midi_output_ports: u8,
+    input_bus_count: usize,
+    output_bus_count: usize,
+    sidechain_channels: u32,
     plugin_id_hash: u64,
     /// Audio + lifecycle-owned per-block scratch. Behind a `PluginCell` so
     /// every callback reaches it through a shared `&AaxInstance` - never a
@@ -339,14 +372,10 @@ struct AaxInstance<P: PluginExport> {
 /// Audio + lifecycle-owned per-block scratch (see [`AaxInstance::audio`]).
 struct AaxAudio<P: PluginExport> {
     event_list: EventList,
-    /// Set when `_push_sysex_input` has queued `SysEx` for the current
-    /// `_render` block. `RenderAudio` reassembles `SysEx` from the MIDI
-    /// packet stream and pushes it before calling into Rust, so the
-    /// render must not blindly clear `event_list` or it wipes the
-    /// queued `SysEx`. The first push of a block clears + sets this;
-    /// the render consumes it instead of re-clearing.
-    sysex_inputs_pending: bool,
     output_events: EventList,
+    native_output_cursor: LosslessEventCursor,
+    native_output_num_frames: u32,
+    native_output_status: u32,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     sub_event_scratch: EventList,
     sample_rate: f64,
@@ -482,8 +511,141 @@ pub fn register_aax<P: PluginExport>() {
             log_missing_bus_layout::<P>("AAX");
             return;
         };
+        if !aax_layout_supported(&layout) {
+            eprintln!(
+                "[truce AAX] {} default audio-bus layout cannot be represented exactly: AAX \n\
+                 supports one main output and one routable auxiliary input while preserving \n\
+                 additional sidechain indices, with at most 8 channels on every declared bus \n\
+                 and BusRouting's 32-bus bound - plugin will not register.",
+                std::any::type_name::<P>(),
+            );
+            return;
+        }
         register_aax_inner::<P>(&layout);
     });
+}
+
+fn aax_layout_supported(layout: &BusLayout) -> bool {
+    bus_layout_fits_routing(layout)
+        && layout.outputs.len() <= 1
+        && layout
+            .inputs
+            .iter()
+            .chain(&layout.outputs)
+            .all(|bus| bus.channels.channel_count() <= 8)
+        && layout
+            .inputs
+            .first()
+            .is_none_or(|bus| bus.kind == BusKind::Main)
+        && layout
+            .inputs
+            .iter()
+            .skip(1)
+            .all(|bus| bus.kind == BusKind::Sidechain)
+        && layout
+            .outputs
+            .first()
+            .is_none_or(|bus| bus.kind == BusKind::Main)
+}
+
+fn aax_layout_matches_topology(default: &BusLayout, layout: &BusLayout) -> bool {
+    aax_layout_supported(layout)
+        && layout.inputs.len() == default.inputs.len()
+        && layout.outputs.len() == default.outputs.len()
+        && layout
+            .inputs
+            .iter()
+            .zip(&default.inputs)
+            .all(|(bus, default_bus)| {
+                bus.kind == default_bus.kind
+                    && bus.enabled == default_bus.enabled
+                    && (bus.kind == BusKind::Main
+                        || bus.channels.channel_count() == default_bus.channels.channel_count())
+            })
+        && layout
+            .outputs
+            .iter()
+            .zip(&default.outputs)
+            .all(|(bus, default_bus)| {
+                bus.kind == default_bus.kind && bus.enabled == default_bus.enabled
+            })
+}
+
+fn aax_main_input_channels(layout: &BusLayout) -> u32 {
+    layout
+        .inputs
+        .first()
+        .map_or(0, |bus| bus.channels.channel_count())
+}
+
+fn aax_process_capacity(layouts: &[BusLayout]) -> (u32, u32) {
+    let Some(default) = layouts.first() else {
+        return (2, 2);
+    };
+    let sidechain = default
+        .inputs
+        .get(1)
+        .map_or(0, |bus| bus.channels.channel_count());
+    let (main_input, output) = layouts
+        .iter()
+        .filter(|layout| aax_layout_matches_topology(default, layout))
+        .fold((0_u32, 0_u32), |(max_in, max_out), layout| {
+            (
+                max_in.max(aax_main_input_channels(layout)),
+                max_out.max(
+                    layout
+                        .outputs
+                        .first()
+                        .map_or(0, |bus| bus.channels.channel_count()),
+                ),
+            )
+        });
+    let input = if main_input == 0 {
+        output.max(2)
+    } else {
+        main_input
+    };
+    let output = if output == 0 {
+        if main_input == 0 { 2 } else { 1 }
+    } else {
+        output
+    };
+    (input.saturating_add(sidechain), output)
+}
+
+fn aax_descriptor_layouts<P: PluginExport>(default: &BusLayout) -> (*const i16, *const i16, u32) {
+    let layouts = P::bus_layouts();
+    let compatible: Vec<&BusLayout> = layouts
+        .iter()
+        .filter(|candidate| aax_layout_matches_topology(default, candidate))
+        .collect();
+    if compatible.len() != layouts.len() {
+        eprintln!(
+            "[truce AAX] {}: ignored {} layout(s) whose main/aux topology differs from the \n\
+             default AAX component topology",
+            std::any::type_name::<P>(),
+            layouts.len() - compatible.len(),
+        );
+    }
+    if layouts.len() <= 1 {
+        return (std::ptr::null(), std::ptr::null(), 0);
+    }
+
+    let ch = |channels: u32| i16::try_from(channels).unwrap_or(0);
+    let ins: Vec<i16> = compatible
+        .iter()
+        .map(|layout| ch(aax_main_input_channels(layout)))
+        .collect();
+    let outs: Vec<i16> = compatible
+        .iter()
+        .map(|layout| ch(layout.total_output_channels()))
+        .collect();
+    let count = len_u32(ins.len());
+    (
+        Box::leak(ins.into_boxed_slice()).as_ptr(),
+        Box::leak(outs.into_boxed_slice()).as_ptr(),
+        count,
+    )
 }
 
 fn register_aax_inner<P: PluginExport>(layout: &BusLayout) {
@@ -540,23 +702,34 @@ fn register_aax_inner<P: PluginExport>(layout: &BusLayout) {
         // AAX registers the main input stem; a sidechain is a separate
         // mono side-chain port, so the stem width is the main bus alone,
         // not the summed total. Non-sidechain plugins have main == total.
-        let main_in_of = |l: &BusLayout| l.inputs.first().map_or(0, |b| b.channels.channel_count());
-        let sidechain_in: u32 = layout
+        let sidechain_in = layout
             .inputs
-            .iter()
-            .skip(1)
-            .map(|b| b.channels.channel_count())
-            .sum();
-        let (aax_inputs, aax_outputs) = match (main_in_of(layout), layout.total_output_channels()) {
+            .get(1)
+            .map_or(0, |bus| bus.channels.channel_count());
+        let (aax_inputs, aax_outputs) = match (
+            aax_main_input_channels(layout),
+            layout.total_output_channels(),
+        ) {
             (0, 0) => (2, 2),              // pure MIDI effect → stereo passthrough
             (0, out) => (out.max(2), out), // output-only instrument → match output
             (in_, out) => (in_, out),
         };
 
-        // AAX carries a single MIDI stream per direction; clamp a
-        // multi-port declaration to one and warn.
-        log_midi_ports_clamped("AAX", "input", info.midi_input_ports);
-        log_midi_ports_clamped("AAX", "output", info.midi_output_ports);
+        // AAX carries one native MIDI stream. Port zero stays exact;
+        // events addressed to another declared port are reported as
+        // unsupported by the strict adapter instead of being rerouted.
+        if info.midi_input_ports > 1 {
+            eprintln!(
+                "[truce AAX] plugin declares {} MIDI input ports; native AAX input carries only port 0",
+                info.midi_input_ports
+            );
+        }
+        if info.midi_output_ports > 1 {
+            eprintln!(
+                "[truce AAX] plugin declares {} MIDI output ports; nonzero output ports are unsupported",
+                info.midi_output_ports
+            );
+        }
 
         // Legacy chunk fourccs, capped to the descriptor's fixed
         // capacity. `>4`-byte or short ids are skipped rather than
@@ -593,23 +766,8 @@ fn register_aax_inner<P: PluginExport>(layout: &BusLayout) {
         // and the legacy mono/stereo describe (which also covers the
         // audio-less synthesis in `default_io_channels`). The leaked
         // arrays live for the process, like the descriptor.
-        let layouts = P::bus_layouts();
-        let (layout_in_channels, layout_out_channels, num_layouts) = if layouts.len() > 1 {
-            let ch = |c: u32| i16::try_from(c).unwrap_or(0);
-            let ins: Vec<i16> = layouts.iter().map(|l| ch(main_in_of(l))).collect();
-            let outs: Vec<i16> = layouts
-                .iter()
-                .map(|l| ch(l.total_output_channels()))
-                .collect();
-            let n = len_u32(ins.len());
-            (
-                Box::leak(ins.into_boxed_slice()).as_ptr(),
-                Box::leak(outs.into_boxed_slice()).as_ptr(),
-                n,
-            )
-        } else {
-            (std::ptr::null(), std::ptr::null(), 0)
-        };
+        let (layout_in_channels, layout_out_channels, num_layouts) =
+            aax_descriptor_layouts::<P>(layout);
 
         let descriptor = TruceAaxDescriptor {
             name,
@@ -758,66 +916,55 @@ macro_rules! export_aax {
                 ::truce_aax::_latency::<$plugin_type>(ctx)
             }
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn truce_aax_process(
+            pub unsafe extern "C" fn truce_aax_process_native(
                 ctx: *mut ::std::ffi::c_void,
                 inputs: *const *const f32,
                 outputs: *mut *mut f32,
                 num_in: u32,
                 num_out: u32,
+                input_bus_active: u32,
+                output_bus_active: u32,
                 num_frames: u32,
-                events: *const ::truce_aax::TruceAaxMidiEvent,
+                events: *const ::truce_aax::TruceAaxNativeEvent,
                 num_events: u32,
+                input_status: u32,
                 transport: *const ::truce_aax::TruceAaxTransportSnapshot,
-            ) {
-                ::truce_aax::_process::<$plugin_type>(
-                    ctx, inputs, outputs, num_in, num_out, num_frames, events, num_events,
-                    transport,
-                );
-            }
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn truce_aax_output_event_count(
-                ctx: *mut ::std::ffi::c_void,
             ) -> u32 {
-                ::truce_aax::_output_event_count::<$plugin_type>(ctx)
-            }
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn truce_aax_output_event_at(
-                ctx: *mut ::std::ffi::c_void,
-                index: u32,
-                out: *mut ::truce_aax::TruceAaxMidiEvent,
-            ) {
-                ::truce_aax::_output_event_at::<$plugin_type>(ctx, index, out);
-            }
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn truce_aax_push_sysex_input(
-                ctx: *mut ::std::ffi::c_void,
-                delta_frames: u32,
-                bytes: *const u8,
-                len: u32,
-            ) {
-                ::truce_aax::_push_sysex_input::<$plugin_type>(ctx, delta_frames, bytes, len);
-            }
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn truce_aax_output_sysex_count(
-                ctx: *mut ::std::ffi::c_void,
-            ) -> u32 {
-                ::truce_aax::_output_sysex_count::<$plugin_type>(ctx)
-            }
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn truce_aax_output_sysex_at(
-                ctx: *mut ::std::ffi::c_void,
-                index: u32,
-                out_delta_frames: *mut u32,
-                out_bytes: *mut *const u8,
-                out_len: *mut u32,
-            ) {
-                ::truce_aax::_output_sysex_at::<$plugin_type>(
+                ::truce_aax::_process_native::<$plugin_type>(
                     ctx,
-                    index,
-                    out_delta_frames,
-                    out_bytes,
-                    out_len,
-                );
+                    inputs,
+                    outputs,
+                    num_in,
+                    num_out,
+                    input_bus_active,
+                    output_bus_active,
+                    num_frames,
+                    events,
+                    num_events,
+                    input_status,
+                    transport,
+                )
+            }
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn truce_aax_begin_output_events(
+                ctx: *mut ::std::ffi::c_void,
+                num_frames: u32,
+            ) {
+                ::truce_aax::_begin_output_events::<$plugin_type>(ctx, num_frames);
+            }
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn truce_aax_next_output_event(
+                ctx: *mut ::std::ffi::c_void,
+                out: *mut ::truce_aax::TruceAaxNativeEvent,
+            ) -> u32 {
+                ::truce_aax::_next_output_event::<$plugin_type>(ctx, out)
+            }
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn truce_aax_finish_output_events(
+                ctx: *mut ::std::ffi::c_void,
+                status: u32,
+            ) {
+                ::truce_aax::_finish_output_events::<$plugin_type>(ctx, status);
             }
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn truce_aax_get_param(
@@ -1009,6 +1156,19 @@ pub unsafe fn _create<P: PluginExport>() -> *mut std::ffi::c_void {
             let mut plugin = P::create();
             plugin.init();
             let info = P::info();
+            let layouts = P::bus_layouts();
+            let Some(layout) = layouts.first() else {
+                return std::ptr::null_mut();
+            };
+            if !aax_layout_supported(layout) {
+                return std::ptr::null_mut();
+            }
+            let input_bus_count = layout.inputs.len();
+            let output_bus_count = layout.outputs.len();
+            let sidechain_channels = layout
+                .inputs
+                .get(1)
+                .map_or(0, |bus| bus.channels.channel_count());
             let param_infos = plugin.params().param_infos();
             let params_arc = plugin.params_arc();
             let meter_store = plugin.meter_store();
@@ -1029,11 +1189,18 @@ pub unsafe fn _create<P: PluginExport>() -> *mut std::ffi::c_void {
                 render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
                 param_infos,
                 min_subblock_samples: info.automation.min_subblock_samples,
+                midi_input_ports: info.midi_input_ports,
+                midi_output_ports: info.midi_output_ports,
+                input_bus_count,
+                output_bus_count,
+                sidechain_channels,
                 plugin_id_hash: state::shared_plugin_state_hash(&info),
                 audio: PluginCell::new(AaxAudio {
                     event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
-                    sysex_inputs_pending: false,
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                    native_output_cursor: LosslessEventCursor::default(),
+                    native_output_num_frames: 0,
+                    native_output_status: TRUCE_AAX_EVENT_END,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sample_rate: 44100.0,
                     max_block_size: 8192,
@@ -1082,11 +1249,10 @@ pub unsafe fn _reset<P: PluginExport>(
         let max_frames = (max_frames as usize).max(1024);
         audio.sample_rate = sample_rate;
         audio.max_block_size = max_frames;
-        // Size scratch to the widest declared layout: a multi-layout plugin
-        // gets one AAX component per stem, and this instance may be any of
-        // them, so pre-allocating for the max keeps `_process` off the audio
-        // thread's allocator when the stem is wider than the first layout.
-        let (num_in, num_out) = max_io_channels::<P>().unwrap_or((2, 2));
+        // Match AAX's exact flattening across compatible components: main +
+        // first sidechain input, one main output, and the dummy audio stems
+        // synthesized for audio-less and output-only plugins.
+        let (num_in, num_out) = aax_process_capacity(&P::bus_layouts());
         audio
             .scratch
             .ensure_capacity(num_in as usize, num_out as usize, max_frames);
@@ -1129,19 +1295,133 @@ pub unsafe fn _latency<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
     inst.latency_cache.load(Ordering::Relaxed)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn _process<P: PluginExport>(
+fn midi1_message_len(status: u8) -> Option<usize> {
+    if (0x80..=0xEF).contains(&status) {
+        return Some(if matches!(status & 0xF0, 0xC0 | 0xD0) {
+            2
+        } else {
+            3
+        });
+    }
+    match status {
+        0xF1 | 0xF3 => Some(2),
+        0xF2 => Some(3),
+        0xF6 | 0xF8 | 0xFA | 0xFB | 0xFC | 0xFE | 0xFF => Some(1),
+        _ => None,
+    }
+}
+
+fn raw_midi1_valid(message: RawMidi1) -> bool {
+    let bytes = message.bytes();
+    midi1_message_len(bytes[0]) == Some(bytes.len())
+        && bytes.iter().skip(1).all(|byte| byte & 0x80 == 0)
+}
+
+fn typed_midi1_roundtrip(body: &EventBody) -> Option<([u8; 3], usize)> {
+    let (len, bytes) = event_to_midi1(body)?;
+    let decoded = decode_short_message(bytes[0], bytes[1], bytes[2])?;
+    (decoded == *body).then_some((bytes, len))
+}
+
+fn push_native_input_event(list: &mut EventList, event: &TruceAaxNativeEvent) -> Result<(), u32> {
+    match event.kind {
+        TRUCE_AAX_NATIVE_EVENT_MIDI1 => {
+            let len = u8::try_from(event.data_len).map_err(|_| TRUCE_AAX_EVENT_INVALID)?;
+            let message = RawMidi1::new(event.midi, len).ok_or(TRUCE_AAX_EVENT_INVALID)?;
+            if !raw_midi1_valid(message) || !event.sysex.is_null() {
+                return Err(TRUCE_AAX_EVENT_INVALID);
+            }
+            let exact = ExactEvent::new(
+                event.sample_offset,
+                ExactEventBody::Midi1 { port: 0, message },
+            );
+            let body = decode_short_message(event.midi[0], event.midi[1], event.midi[2]);
+            if let Some(body) = body.filter(|body| {
+                typed_midi1_roundtrip(body) == Some((event.midi, event.data_len as usize))
+            }) {
+                list.try_push_with_exact(Event::new(event.sample_offset, body), exact)
+            } else {
+                list.try_push_exact(exact)
+            }
+            .map_err(|_| TRUCE_AAX_EVENT_QUEUE_FULL)
+        }
+        TRUCE_AAX_NATIVE_EVENT_SYSEX => {
+            if event.data_len != 0 && event.sysex.is_null() {
+                return Err(TRUCE_AAX_EVENT_INVALID);
+            }
+            let bytes = if event.data_len == 0 {
+                &[][..]
+            } else {
+                // SAFETY: the C++ bridge owns this payload for the duration of
+                // the synchronous process call and declared `data_len` bytes.
+                unsafe { slice::from_raw_parts(event.sysex, event.data_len as usize) }
+            };
+            if bytes.iter().any(|byte| byte & 0x80 != 0) {
+                return Err(TRUCE_AAX_EVENT_INVALID);
+            }
+            list.try_push_sysex_with_exact_on_port(
+                event.sample_offset,
+                0,
+                bytes,
+                ExactEvent::new(event.sample_offset, ExactEventBody::SysEx { port: 0 }),
+            )
+            .map_err(|_| TRUCE_AAX_EVENT_QUEUE_FULL)
+        }
+        _ => Err(TRUCE_AAX_EVENT_UNSUPPORTED),
+    }
+}
+
+fn ingest_native_input(
+    list: &mut EventList,
+    events: &[TruceAaxNativeEvent],
+    input_ports: u8,
+    num_frames: u32,
+) -> u32 {
+    let mut previous_offset = 0;
+    for (index, event) in events.iter().enumerate() {
+        if event.sample_offset >= num_frames
+            || (index != 0 && event.sample_offset < previous_offset)
+            || event.port != 0
+            || input_ports == 0
+            || event.reserved != 0
+            || event.pad != 0
+        {
+            list.clear();
+            return TRUCE_AAX_EVENT_INVALID;
+        }
+        previous_offset = event.sample_offset;
+        if let Err(status) = push_native_input_event(list, event) {
+            list.clear();
+            return status;
+        }
+    }
+    TRUCE_AAX_EVENT_END
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub unsafe fn _process_native<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     inputs: *const *const f32,
     outputs: *mut *mut f32,
     num_in: u32,
     num_out: u32,
+    input_bus_active: u32,
+    output_bus_active: u32,
     num_frames: u32,
-    events: *const TruceAaxMidiEvent,
+    events: *const TruceAaxNativeEvent,
     num_events: u32,
+    input_status: u32,
     transport_ptr: *const TruceAaxTransportSnapshot,
-) {
+) -> u32 {
     let nf = num_frames as usize;
+    let block_num_frames = num_frames;
+    let mut event_status = match input_status {
+        TRUCE_AAX_EVENT_END
+        | TRUCE_AAX_EVENT_UNSUPPORTED
+        | TRUCE_AAX_EVENT_INVALID
+        | TRUCE_AAX_EVENT_QUEUE_FULL => input_status,
+        _ => TRUCE_AAX_EVENT_INVALID,
+    };
     let ok = run_audio_block::<P>("AAX", || {
         // Shared `&AaxInstance` (never a whole-struct `&mut`) - the audio
         // scratch is reached through its ownership cell, so a concurrent
@@ -1161,7 +1441,11 @@ pub unsafe fn _process<P: PluginExport>(
                 }
             }
             audio.event_list.clear();
-            audio.sysex_inputs_pending = false;
+            audio.event_list.clear_overflow();
+            audio.output_events.clear();
+            audio.output_events.clear_overflow();
+            audio.sub_event_scratch.clear_overflow();
+            event_status = TRUCE_AAX_EVENT_INVALID;
             return;
         }
 
@@ -1196,29 +1480,23 @@ pub unsafe fn _process<P: PluginExport>(
         // borrowed simultaneously - the guard's `Deref` can't split-borrow.
         let scr = &mut *audio;
 
-        // Convert MIDI. `RenderAudio` reassembles SysEx from the MIDI
-        // packet stream and pushes it via `_push_sysex_input` before
-        // calling in here, so preserve any queued SysEx instead of
-        // clearing it; otherwise clear the previous block's events
-        // before appending short MIDI.
-        if scr.sysex_inputs_pending {
-            scr.sysex_inputs_pending = false;
-        } else {
-            scr.event_list.clear();
+        // Ingest one all-or-nothing native event transaction. A C++-side
+        // overflow/validation failure deliberately delivers no prefix.
+        scr.event_list.clear();
+        scr.event_list.clear_overflow();
+        scr.sub_event_scratch.clear_overflow();
+        if event_status == TRUCE_AAX_EVENT_END && num_events > 0 && events.is_null() {
+            event_status = TRUCE_AAX_EVENT_INVALID;
         }
-        if !events.is_null() && num_events > 0 {
+        if event_status == TRUCE_AAX_EVENT_END && num_events > 0 {
             let ev_slice = unsafe { slice::from_raw_parts(events, num_events as usize) };
-            for ev in ev_slice {
-                if let Some(body) = decode_short_message(ev.status, ev.data1, ev.data2) {
-                    scr.event_list.push(Event {
-                        sample_offset: ev.delta_frames,
-                        port: 0,
-                        body,
-                    });
-                }
-            }
+            event_status = ingest_native_input(
+                &mut scr.event_list,
+                ev_slice,
+                inst.midi_input_ports,
+                block_num_frames,
+            );
         }
-        scr.event_list.ensure_sorted_by_offset();
 
         // Build AudioBuffer from raw pointers, reusing the per-instance scratch.
         debug_assert!(
@@ -1236,6 +1514,31 @@ pub unsafe fn _process<P: PluginExport>(
                 len_u32(num_frames),
                 P::supports_in_place(),
             );
+            let sidechain_channels = inst.sidechain_channels.min(num_in);
+            let main_input_channels = num_in.saturating_sub(sidechain_channels);
+            let mut bus_routing = BusRouting::new();
+            for index in 0..inst.input_bus_count {
+                let (channels, mask) = match index {
+                    0 => (main_input_channels, 1),
+                    1 => (sidechain_channels, 2),
+                    _ => (0, 0),
+                };
+                let activation = if channels == 0 || mask == 0 || input_bus_active & mask == 0 {
+                    BusActivation::Inactive
+                } else {
+                    BusActivation::Active
+                };
+                debug_assert!(bus_routing.push_input(channels, activation));
+            }
+            for index in 0..inst.output_bus_count {
+                let channels = if index == 0 { num_out } else { 0 };
+                let activation = if channels == 0 || output_bus_active & 1 == 0 {
+                    BusActivation::Inactive
+                } else {
+                    BusActivation::Active
+                };
+                debug_assert!(bus_routing.push_output(channels, activation));
+            }
             let transport = if !transport_ptr.is_null() && (*transport_ptr).valid != 0 {
                 let t = &*transport_ptr;
                 TransportInfo {
@@ -1266,6 +1569,7 @@ pub unsafe fn _process<P: PluginExport>(
                 TransportInfo::default()
             };
             scr.output_events.clear();
+            scr.output_events.clear_overflow();
             inst.transport_slot.write(&transport);
 
             let mut transport_snap = transport;
@@ -1283,12 +1587,14 @@ pub unsafe fn _process<P: PluginExport>(
                 param_infos: &inst.param_infos,
                 min_subblock_samples: inst.min_subblock_samples,
             };
-            process_chunked(
+            process_chunked_with_bus_routing(
                 &mut *plugin,
                 inst.params_arc.as_ref() as &dyn Params,
                 &mut buffer,
                 chunk_args,
+                bus_routing,
             );
+            scr.output_events.ensure_sorted_by_offset();
             let _ = buffer;
             // Narrow rendered f64 output back to host f32 when needed.
             // No-op for `f32` plugins.
@@ -1311,7 +1617,9 @@ pub unsafe fn _process<P: PluginExport>(
                 }
             }
         }
+        return TRUCE_AAX_EVENT_INVALID;
     }
+    event_status
 }
 
 /// Test-only smoke helper for the `rt-paranoid` CI gate: drives a few
@@ -1346,15 +1654,18 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
         let mut count = 0;
         for _ in 0..3 {
             let ((), n) = audit(|| {
-                _process::<P>(
+                let _ = _process_native::<P>(
                     ctx,
                     in_ptrs.as_ptr(),
                     out_ptrs.as_mut_ptr(),
                     CH,
                     CH,
+                    1,
+                    1,
                     FRAMES,
                     std::ptr::null(),
                     0,
+                    TRUCE_AAX_EVENT_END,
                     std::ptr::null(),
                 );
             });
@@ -1370,165 +1681,193 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
     }
 }
 
-/// Map a truce `Event` body to a 3-byte AAX-shaped MIDI packet. Returns
-/// `None` for event types Pro Tools doesn't accept through the
-/// fixed-width MIDI channel-voice path (MIDI 2.0, `ParamChange`,
-/// Transport, `SysEx`, etc.). The AAX SDK's
-/// `AAX_IMIDINode::PostMIDIPacket` doc enumerates the supported set:
-/// `NoteOn` / `NoteOff`, Pitch bend, Polyphonic key pressure, Program
-/// change, Channel pressure, Bank-select-CC#0.
-///
-/// `SysEx` is **not** dropped here; it goes through a separate
-/// multi-packet path the C++ template assembles / fragments
-/// around `0xF0` ... `0xF7` framing
-/// (see `_push_sysex_input`, `_output_sysex_count`,
-/// `_output_sysex_at`). `try_encode_aax_midi` returning `None` for
-/// `SysEx` is correct: the channel-voice slot can't carry it.
-fn try_encode_aax_midi(event: &Event) -> Option<TruceAaxMidiEvent> {
-    // AAX is MIDI 1.0 only; down-convert any 2.0 output first.
-    let body = downconvert_to_midi1(&event.body).unwrap_or(event.body);
-    let (status, data1, data2) = match &body {
-        EventBody::NoteOn {
-            channel,
-            note,
-            velocity,
-            ..
-        } => (0x90 | (channel & 0x0F), *note, *velocity),
-        EventBody::NoteOff {
-            channel,
-            note,
-            velocity,
-            ..
-        } => (0x80 | (channel & 0x0F), *note, *velocity),
-        EventBody::Aftertouch {
-            channel,
-            note,
-            pressure,
-            ..
-        } => (0xA0 | (channel & 0x0F), *note, *pressure),
-        EventBody::ControlChange {
-            channel, cc, value, ..
-        } => (0xB0 | (channel & 0x0F), *cc, *value),
-        EventBody::ChannelPressure {
-            channel, pressure, ..
-        } => (0xD0 | (channel & 0x0F), *pressure, 0),
-        EventBody::PitchBend { channel, value, .. } => {
-            let (lsb, msb) = pitch_bend_to_bytes(*value);
-            (0xE0 | (channel & 0x0F), lsb, msb)
-        }
-        EventBody::ProgramChange {
-            channel, program, ..
-        } => (0xC0 | (channel & 0x0F), *program, 0),
-        _ => return None,
+enum NativeEncodeResult {
+    Emitted(TruceAaxNativeEvent),
+    Unsupported,
+    Invalid,
+}
+
+fn aax_output_port(port: u16, declared: u8) -> Result<(), NativeEncodeResult> {
+    if declared == 0 || port >= u16::from(declared) {
+        return Err(NativeEncodeResult::Invalid);
+    }
+    if port != 0 {
+        return Err(NativeEncodeResult::Unsupported);
+    }
+    Ok(())
+}
+
+fn encode_native_output(
+    event: LosslessEventRef<'_>,
+    list: &EventList,
+    declared_ports: u8,
+    num_frames: u32,
+) -> NativeEncodeResult {
+    let sample_offset = match event {
+        LosslessEventRef::Typed(event) => event.sample_offset,
+        LosslessEventRef::Exact(exact) => exact.sample_offset(),
     };
-    Some(TruceAaxMidiEvent {
-        delta_frames: event.sample_offset,
-        status,
-        data1,
-        data2,
-        _pad: 0,
-    })
-}
+    if sample_offset >= num_frames {
+        return NativeEncodeResult::Invalid;
+    }
 
-/// Number of plugin-emitted MIDI events the C++ template can drain
-/// from this block. The C++ side calls this immediately after
-/// `truce_aax_process` and follows with `_at` for each index. The
-/// per-call filter mirrors the iterator path in `_at` so the count and
-/// the indexable view agree.
-pub unsafe fn _output_event_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
-    let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
-    let audio = inst.audio.enter();
-    let n = audio
-        .output_events
-        .iter()
-        .filter(|e| try_encode_aax_midi(e).is_some())
-        .count();
-    len_u32(n)
-}
-
-/// Read the i-th encodable output MIDI event into `out`. Indices are
-/// stable within a single block (the queue isn't modified between
-/// `process()` and the `_count` / `_at` drain).
-pub unsafe fn _output_event_at<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    index: u32,
-    out: *mut TruceAaxMidiEvent,
-) {
-    let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
-    let audio = inst.audio.enter();
-    if let Some(packet) = audio
-        .output_events
-        .iter()
-        .filter_map(try_encode_aax_midi)
-        .nth(index as usize)
-    {
-        unsafe { *out = packet };
+    match event {
+        LosslessEventRef::Typed(event) => {
+            if let Err(status) = aax_output_port(u16::from(event.port), declared_ports) {
+                return status;
+            }
+            if let Some((midi, len)) = typed_midi1_roundtrip(&event.body) {
+                return NativeEncodeResult::Emitted(TruceAaxNativeEvent {
+                    sample_offset,
+                    kind: TRUCE_AAX_NATIVE_EVENT_MIDI1,
+                    data_len: u32::try_from(len).unwrap_or(0),
+                    midi,
+                    ..TruceAaxNativeEvent::default()
+                });
+            }
+            if event_to_midi1(&event.body).is_some() {
+                return NativeEncodeResult::Invalid;
+            }
+            if let EventBody::SysEx { .. } = event.body {
+                let Some(bytes) = list.sysex_bytes_checked(&event.body) else {
+                    return NativeEncodeResult::Invalid;
+                };
+                if bytes.iter().any(|byte| byte & 0x80 != 0) {
+                    return NativeEncodeResult::Invalid;
+                }
+                return NativeEncodeResult::Emitted(TruceAaxNativeEvent {
+                    sample_offset,
+                    kind: TRUCE_AAX_NATIVE_EVENT_SYSEX,
+                    data_len: len_u32(bytes.len()),
+                    sysex: bytes.as_ptr(),
+                    ..TruceAaxNativeEvent::default()
+                });
+            }
+            NativeEncodeResult::Unsupported
+        }
+        LosslessEventRef::Exact(exact) => {
+            if exact.qualifiers() != ExactEventQualifiers::default()
+                || !matches!(exact.metadata(), ExactEventMetadata::None)
+            {
+                return NativeEncodeResult::Unsupported;
+            }
+            match *exact.body() {
+                ExactEventBody::Midi1 { port, message } => {
+                    if let Err(status) = aax_output_port(port, declared_ports) {
+                        return status;
+                    }
+                    if !raw_midi1_valid(message) {
+                        return NativeEncodeResult::Invalid;
+                    }
+                    NativeEncodeResult::Emitted(TruceAaxNativeEvent {
+                        sample_offset,
+                        kind: TRUCE_AAX_NATIVE_EVENT_MIDI1,
+                        data_len: u32::try_from(message.len()).unwrap_or(0),
+                        midi: *message.storage(),
+                        ..TruceAaxNativeEvent::default()
+                    })
+                }
+                ExactEventBody::SysEx { port } => {
+                    if let Err(status) = aax_output_port(port, declared_ports) {
+                        return status;
+                    }
+                    let Some(bytes) = exact.sysex_bytes_checked() else {
+                        return NativeEncodeResult::Invalid;
+                    };
+                    if bytes.iter().any(|byte| byte & 0x80 != 0) {
+                        return NativeEncodeResult::Invalid;
+                    }
+                    NativeEncodeResult::Emitted(TruceAaxNativeEvent {
+                        sample_offset,
+                        kind: TRUCE_AAX_NATIVE_EVENT_SYSEX,
+                        data_len: len_u32(bytes.len()),
+                        sysex: bytes.as_ptr(),
+                        ..TruceAaxNativeEvent::default()
+                    })
+                }
+                _ => NativeEncodeResult::Unsupported,
+            }
+        }
     }
 }
 
-/// `SysEx` input - the AAX C++ template reassembles long messages
-/// across consecutive `AAX_CMidiPacket` slots (per the SDK's
-/// `0xF0` start / `0xF7` end framing) and calls this once per
-/// complete logical message with the inner bytes. We copy into
-/// the plug-in's `EventList` `SysEx` pool synchronously; pool-full
-/// failures drop the message rather than corrupt-split it.
-pub unsafe fn _push_sysex_input<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    delta_frames: u32,
-    bytes: *const u8,
-    len: u32,
-) {
+/// Preflight the complete lossless lane before C++ posts any packet. This
+/// makes Unsupported/Invalid/QueueFull transactional rather than emitting a
+/// valid prefix followed by an unreportable hole.
+pub unsafe fn _begin_output_events<P: PluginExport>(ctx: *mut std::ffi::c_void, num_frames: u32) {
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
-    if bytes.is_null() || len == 0 {
-        return;
-    }
     let mut audio = inst.audio.enter();
-    let scr = &mut *audio;
-    // First SysEx of the block clears the previous block's events and
-    // flags `_render` to keep what we queue here rather than clearing
-    // again.
-    if !scr.sysex_inputs_pending {
-        scr.event_list.clear();
-        scr.sysex_inputs_pending = true;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
-    let _ = scr.event_list.push_sysex(delta_frames, slice);
-}
-
-pub unsafe fn _output_sysex_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
-    let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
-    let audio = inst.audio.enter();
-    len_u32(
+    audio.native_output_cursor = LosslessEventCursor::default();
+    audio.native_output_num_frames = num_frames;
+    audio.native_output_status = if audio.output_events.overflow().is_some() {
+        TRUCE_AAX_EVENT_QUEUE_FULL
+    } else {
         audio
             .output_events
-            .iter()
-            .filter(|e| matches!(e.body, EventBody::SysEx { .. }))
-            .count(),
-    )
+            .lossless_iter()
+            .find_map(|event| {
+                match encode_native_output(
+                    event,
+                    &audio.output_events,
+                    inst.midi_output_ports,
+                    num_frames,
+                ) {
+                    NativeEncodeResult::Emitted(_) => None,
+                    NativeEncodeResult::Unsupported => Some(TRUCE_AAX_EVENT_UNSUPPORTED),
+                    NativeEncodeResult::Invalid => Some(TRUCE_AAX_EVENT_INVALID),
+                }
+            })
+            .unwrap_or(TRUCE_AAX_EVENT_END)
+    };
 }
 
-pub unsafe fn _output_sysex_at<P: PluginExport>(
+pub unsafe fn _next_output_event<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
-    index: u32,
-    out_delta_frames: *mut u32,
-    out_bytes: *mut *const u8,
-    out_len: *mut u32,
-) {
-    let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
-    let audio = inst.audio.enter();
-    if let Some(event) = audio
-        .output_events
-        .iter()
-        .filter(|e| matches!(e.body, EventBody::SysEx { .. }))
-        .nth(index as usize)
-    {
-        let bytes = audio.output_events.sysex_bytes(&event.body);
-        unsafe {
-            *out_delta_frames = event.sample_offset;
-            *out_bytes = bytes.as_ptr();
-            *out_len = len_u32(bytes.len());
-        }
+    out: *mut TruceAaxNativeEvent,
+) -> u32 {
+    if out.is_null() {
+        return TRUCE_AAX_EVENT_INVALID;
     }
+    let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+    let mut audio = inst.audio.enter();
+    let scr = &mut *audio;
+    if scr.native_output_status != TRUCE_AAX_EVENT_END {
+        return std::mem::replace(&mut scr.native_output_status, TRUCE_AAX_EVENT_END);
+    }
+    let Some(event) = scr
+        .output_events
+        .lossless_next(&mut scr.native_output_cursor)
+    else {
+        return TRUCE_AAX_EVENT_END;
+    };
+    match encode_native_output(
+        event,
+        &scr.output_events,
+        inst.midi_output_ports,
+        scr.native_output_num_frames,
+    ) {
+        NativeEncodeResult::Emitted(event) => {
+            unsafe { out.write(event) };
+            TRUCE_AAX_EVENT_EMITTED
+        }
+        NativeEncodeResult::Unsupported => TRUCE_AAX_EVENT_UNSUPPORTED,
+        NativeEncodeResult::Invalid => TRUCE_AAX_EVENT_INVALID,
+    }
+}
+
+pub unsafe fn _finish_output_events<P: PluginExport>(ctx: *mut std::ffi::c_void, status: u32) {
+    let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+    let mut audio = inst.audio.enter();
+    let status = audio.output_events.overflow().map_or_else(
+        || match status {
+            TRUCE_AAX_EVENT_END | TRUCE_AAX_EVENT_EMITTED => OutputEventStatus::Success,
+            TRUCE_AAX_EVENT_UNSUPPORTED => OutputEventStatus::Unsupported,
+            TRUCE_AAX_EVENT_QUEUE_FULL => OutputEventStatus::HostQueueFull,
+            _ => OutputEventStatus::Invalid,
+        },
+        OutputEventStatus::BufferFull,
+    );
+    audio.output_events.set_output_status(status);
 }
 
 pub unsafe fn _get_param<P: PluginExport>(ctx: *mut std::ffi::c_void, id: u32) -> f64 {
@@ -2111,14 +2450,12 @@ pub unsafe fn _free_state(data: *mut u8, len: u32) {
     }
 }
 
-// Plugin → host MIDI is wired through `truce_aax_output_event_count`
-// / `truce_aax_output_event_at` (defined as `_output_event_*` above).
-// The C++ template's `RenderAudio` reads them after `truce_aax_process`
-// and posts each packet via `AAX_IMIDINode::PostMIDIPacket` on the
-// `LocalOutput` node it registered in its hand-built component
-// descriptor. `AAX_CMonolithicParameters::StaticDescribe` only knows
-// how to register `LocalInput` / `Global` / `Transport` nodes, so the
-// hand-built descriptor is what makes plugin → host MIDI possible.
+// Plugin → host MIDI is wired through the preflighted sequential native
+// cursor above. The C++ template posts each exact MIDI1 packet or framed
+// SysEx event through the `LocalOutput` node in its hand-built component
+// descriptor. `AAX_CMonolithicParameters::StaticDescribe` only knows how to
+// register `LocalInput` / `Global` / `Transport` nodes, so the hand-built
+// descriptor is what makes plugin → host MIDI possible.
 // See `cargo-truce/templates/aax/TruceAAX_Describe.cpp` for the
 // descriptor build.
 

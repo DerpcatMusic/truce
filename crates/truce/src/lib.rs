@@ -115,11 +115,12 @@ mod prelude_impl {
     // name collision with the new user-facing `Plugin` trait and
     // signals it as an internal contract.
     pub use truce_core::{
-        AudioConfig, BusConfig, BusKind, BusLayout, ChannelConfig, Editor, Event, EventBody,
-        EventList, IntoEditor, PluginCategory, PluginContext, PluginExport, PluginInfo,
-        ProcessContext, ProcessMode, ProcessStatus, TransportInfo,
+        AudioConfig, BusActivation, BusConfig, BusKind, BusLayout, BusRoute, BusRouting,
+        ChannelConfig, Editor, Event, EventBody, EventList, IntoEditor, PluginCategory,
+        PluginContext, PluginExport, PluginInfo, ProcessContext, ProcessMode, ProcessStatus,
+        TransportInfo,
     };
-    pub use truce_derive::{ParamEnum, Params, State, plugin_info};
+    pub use truce_derive::{ParamEnum, Params, State, plugin_info, plugin_vst3_class_id};
     // `PluginLogic` itself is *not* re-exported here - each prelude
     // chooses its own leaf trait (`PluginLogic` for f32, aliased
     // `PluginLogic64 as PluginLogic` for f64) so plugin authors write

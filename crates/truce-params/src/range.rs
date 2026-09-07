@@ -9,6 +9,12 @@ pub enum ParamRange {
         min: f64,
         max: f64,
     },
+    /// Linear floating-point range snapped to a fixed plain-value interval.
+    Stepped {
+        min: f64,
+        max: f64,
+        step: f64,
+    },
     Logarithmic {
         min: f64,
         max: f64,
@@ -70,7 +76,7 @@ impl ParamRange {
             return 0.0;
         }
         match self {
-            Self::Linear { min, max } => {
+            Self::Linear { min, max } | Self::Stepped { min, max, .. } => {
                 if max == min {
                     return 0.0;
                 }
@@ -168,6 +174,13 @@ impl ParamRange {
         };
         match self {
             Self::Linear { min, max } => min + n * (max - min),
+            Self::Stepped { min, max, step } => {
+                if max == min || !step.is_finite() || *step <= 0.0 {
+                    return *min;
+                }
+                let plain = min + n * (max - min);
+                (min + ((plain - min) / step).round() * step).clamp(*min, *max)
+            }
             Self::Logarithmic { min, max } => {
                 // Match `normalize`'s asymmetric handling of bad bounds:
                 // if either end is non-positive or the range is empty,
@@ -228,6 +241,7 @@ impl ParamRange {
     pub fn min(&self) -> f64 {
         match self {
             Self::Linear { min, .. }
+            | Self::Stepped { min, .. }
             | Self::Logarithmic { min, .. }
             | Self::Skewed { min, .. }
             | Self::SymmetricalSkewed { min, .. } => *min,
@@ -245,6 +259,7 @@ impl ParamRange {
     pub fn max(&self) -> f64 {
         match self {
             Self::Linear { max, .. }
+            | Self::Stepped { max, .. }
             | Self::Logarithmic { max, .. }
             | Self::Skewed { max, .. }
             | Self::SymmetricalSkewed { max, .. } => *max,
@@ -272,6 +287,16 @@ impl ParamRange {
             | Self::Logarithmic { .. }
             | Self::Skewed { .. }
             | Self::SymmetricalSkewed { .. } => 0,
+            Self::Stepped { min, max, step } => {
+                if !step.is_finite() || *step <= 0.0 || max <= min {
+                    0
+                } else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        ((max - min) / step).round().clamp(0.0, f64::from(u32::MAX)) as u32
+                    }
+                }
+            }
             // Reversing doesn't change how many steps the inner range
             // has, only their order.
             Self::Reversed(inner) => return inner.step_count(),

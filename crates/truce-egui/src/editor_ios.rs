@@ -30,6 +30,10 @@ pub trait EditorUi<P: Params + ?Sized>: Send {
     fn ui(&mut self, ui: &mut egui::Ui, state: &PluginContext<P>);
     fn opened(&mut self, _state: &PluginContext<P>) {}
     fn state_changed(&mut self, _state: &PluginContext<P>) {}
+
+    /// The native editor view has closed. Framework-owned host parameter
+    /// gestures have already been terminated before this callback.
+    fn closed(&mut self) {}
 }
 
 impl<P: Params + ?Sized, F: FnMut(&mut egui::Ui, &PluginContext<P>) + Send> EditorUi<P> for F {
@@ -38,7 +42,7 @@ impl<P: Params + ?Sized, F: FnMut(&mut egui::Ui, &PluginContext<P>) + Send> Edit
     }
 }
 
-pub struct EguiEditor<P: Params + ?Sized> {
+pub struct EguiEditor<P: Params + ?Sized + 'static> {
     params: Arc<P>,
     size: (u32, u32),
     /// Resize-capability flag exposed via `Editor::can_resize`. The
@@ -62,7 +66,7 @@ pub struct EguiEditor<P: Params + ?Sized> {
 // SAFETY: see truce-gui::editor_ios for the symmetric rationale -
 // UIKit + CADisplayLink + wgpu surface presentation all happen on
 // the main thread, where the AUv3 host calls Editor methods.
-unsafe impl<P: Params + ?Sized> Send for EguiEditor<P> {}
+unsafe impl<P: Params + ?Sized + 'static> Send for EguiEditor<P> {}
 
 struct Inner<P: Params + ?Sized> {
     child_view: *mut AnyObject,
@@ -75,6 +79,7 @@ struct Inner<P: Params + ?Sized> {
     ui: Arc<Mutex<Box<dyn EditorUi<P>>>>,
     params: Arc<P>,
     context: PluginContext<P>,
+    lifecycle: crate::lifecycle::EditorLifecycle,
     pending_events: Vec<egui::Event>,
     last_pointer: egui::Pos2,
 }
@@ -165,12 +170,45 @@ impl<P: Params + 'static> EguiEditor<P> {
     }
 }
 
+impl<P: Params + ?Sized + 'static> EguiEditor<P> {
+    fn close_view(&mut self) {
+        let Some(inner) = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+
+        inner.lifecycle.close();
+        // SAFETY: `child_view`/`display_link` were built by
+        // `install_editor_view` for this `P`; `take()` above guarantees
+        // no other path touches them.
+        unsafe { teardown_editor_view::<P>(inner.child_view, inner.display_link) };
+
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner
+                .ui
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closed();
+        }));
+        if closed.is_err() {
+            log::error!("egui EditorUi::closed panic swallowed");
+        }
+        // EguiRenderer drops here, releasing wgpu surface / device / queue.
+        drop(inner);
+    }
+}
+
 impl<P: Params + 'static> Editor for EguiEditor<P> {
     fn size(&self) -> (u32, u32) {
         self.size
     }
 
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
+        self.close_view();
         let RawWindowHandle::UiKit(parent_ptr) = parent else {
             log::warn!("EguiEditor (iOS) got non-UiKit parent handle");
             return;
@@ -245,7 +283,9 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
             return;
         };
 
+        let lifecycle = crate::lifecycle::EditorLifecycle::new(&context);
         let egui_ctx = egui::Context::default();
+        lifecycle.install(&egui_ctx);
         // Pin egui's logical→physical scale to the device backing
         // scale (3x on Retina iPhones). Without this, egui paints
         // at 1x pixels-per-point into a 3x-sized wgpu surface and
@@ -291,6 +331,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
             ui: Arc::clone(&self.ui),
             params: Arc::clone(&self.params),
             context: typed_ctx,
+            lifecycle,
             pending_events: Vec::with_capacity(16),
             last_pointer: egui::pos2(-1.0, -1.0),
         };
@@ -302,20 +343,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
     }
 
     fn close(&mut self) {
-        let Some(inner) = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        else {
-            return;
-        };
-        // SAFETY: `child_view`/`display_link` were built by
-        // `install_editor_view` for this `P`; `take()` above guarantees
-        // no other path touches them.
-        unsafe { teardown_editor_view::<P>(inner.child_view, inner.display_link) };
-        // EguiRenderer drops here, releasing wgpu surface / device / queue.
-        drop(inner);
+        self.close_view();
     }
 
     fn set_size(&mut self, width: u32, height: u32) -> bool {
@@ -353,6 +381,12 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
 
     fn aspect_ratio(&self) -> Option<(u32, u32)> {
         self.aspect_ratio
+    }
+}
+
+impl<P: Params + ?Sized + 'static> Drop for EguiEditor<P> {
+    fn drop(&mut self) {
+        self.close_view();
     }
 }
 
@@ -601,7 +635,7 @@ unsafe fn set_display_link_preferred_fps(link: *mut AnyObject, fps: isize) {
 /// the link returned alongside it. Both pointers are consumed - the
 /// link is released and the ivar `Arc` reclaimed - so callers must not
 /// reuse them afterwards. Must run on the main thread.
-unsafe fn teardown_editor_view<P: Params + 'static>(
+unsafe fn teardown_editor_view<P: Params + ?Sized + 'static>(
     child_view: *mut AnyObject,
     display_link: *mut AnyObject,
 ) {

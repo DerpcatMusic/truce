@@ -25,6 +25,10 @@ truce build --clap` / `install --clap` selects it at the CLI.
 - GUI embedding (clap-gui extension)
 - Note port configuration (clap-note-ports extension)
 
+`ProcessContext::bus_routing` preserves the selected CLAP port configuration's
+flattened bus ranges. Activation is `Unknown`: process-buffer presence and
+pointer validity describe audio storage, not whether the host routed a bus.
+
 ## Key macro
 
 - **`export_clap!`** -- generates the CLAP entry point for a `PluginExport` type

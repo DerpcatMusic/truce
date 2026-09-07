@@ -263,6 +263,13 @@ pub fn vst3_cid(id: &str) -> [u8; 16] {
     hash.to_le_bytes()
 }
 
+/// Resolve an optional exact VST3 class ID, preserving the historical
+/// [`vst3_cid`] derivation when no override is declared.
+#[must_use]
+pub fn resolve_vst3_cid(explicit: Option<[u8; 16]>, id: &str) -> [u8; 16] {
+    explicit.unwrap_or_else(|| vst3_cid(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

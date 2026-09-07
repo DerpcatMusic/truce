@@ -9,7 +9,7 @@
 //! the whole audio block.
 //!
 //! Every format wrapper routes its `process()` call through
-//! [`process_chunked`]. On formats whose host events all carry
+//! [`process_chunked_with_bus_routing`]. On formats whose host events all carry
 //! `sample_offset = 0` (VST2, AAX, LV2 in v1, AU until ramp decoding
 //! lands) the loop runs once per block and the splitting machinery
 //! is inert.
@@ -17,8 +17,11 @@
 use truce_params::{ParamFlags, ParamInfo, Params};
 
 use crate::buffer::AudioBuffer;
+use crate::bus_routing::BusRouting;
 use crate::config::ProcessMode;
-use crate::events::{Event, EventBody, EventList, TransportInfo};
+use crate::events::{
+    Event, EventBody, EventList, ExactEvent, ExactEventBody, LosslessEventRef, TransportInfo,
+};
 use crate::plugin::PluginRuntime;
 use crate::process::{ProcessContext, ProcessStatus};
 use crate::sample::Sample;
@@ -102,6 +105,22 @@ where
     S: Sample,
     P: PluginRuntime<Sample = S>,
 {
+    process_chunked_with_bus_routing(plugin, params, buffer, args, BusRouting::new())
+}
+
+/// Routed twin of [`process_chunked`], used by format adapters that have a
+/// truthful allocation-free bus snapshot for the current block.
+pub fn process_chunked_with_bus_routing<S, P>(
+    plugin: &mut P,
+    params: &dyn Params,
+    buffer: &mut AudioBuffer<S>,
+    args: ChunkedProcess<'_>,
+    bus_routing: BusRouting,
+) -> ProcessStatus
+where
+    S: Sample,
+    P: PluginRuntime<Sample = S>,
+{
     let ChunkedProcess {
         events,
         sub_event_scratch,
@@ -170,6 +189,7 @@ where
 
         let mut sub_buffer = buffer.slice(block_start, block_end - block_start);
         let sub_output_start = output_events.len();
+        let sub_exact_output_start = output_events.exact_len();
 
         // Advance the playhead to this sub-block's start so a plugin that
         // re-derives phase from the transport sees the right position.
@@ -181,7 +201,8 @@ where
             block_end - block_start,
             output_events,
         )
-        .with_process_mode(process_mode);
+        .with_process_mode(process_mode)
+        .with_bus_routing(bus_routing);
         if let Some(f) = params_fn {
             ctx = ctx.with_params(f);
         }
@@ -194,7 +215,12 @@ where
         // Re-base any events the plugin pushed during this sub-block
         // back into block-relative coordinates so the wrapper's
         // per-event encode loop sees host-block-rate timings.
-        rebase_output_events(output_events, sub_output_start, block_start);
+        rebase_output_events(
+            output_events,
+            sub_output_start,
+            sub_exact_output_start,
+            block_start,
+        );
 
         block_start = block_end;
     }
@@ -343,8 +369,14 @@ fn rebase_events_into(
     block_end: usize,
 ) {
     scratch.clear();
-    for ev in events.iter() {
-        let off = ev.sample_offset as usize;
+    if let Some(error) = events.overflow() {
+        scratch.record_overflow(error);
+    }
+    for event in events.lossless_iter() {
+        let off = match event {
+            LosslessEventRef::Typed(event) => event.sample_offset,
+            LosslessEventRef::Exact(event) => event.sample_offset(),
+        } as usize;
         if off < block_start {
             continue;
         }
@@ -356,19 +388,78 @@ fn rebase_events_into(
         // practice` (audio blocks cap at a few thousand samples).
         #[allow(clippy::cast_possible_truncation)]
         let rebased_offset = (off - block_start) as u32;
-        match ev.body {
-            // Re-copy the payload so the scratch carries its own pool
-            // entry; a pool-full drop matches the documented `SysEx`
-            // overflow behaviour and can't occur in practice (the
-            // scratch pool matches the source pool's size).
-            EventBody::SysEx { .. } => {
-                let _ = scratch.push_sysex_on_port(
-                    rebased_offset,
-                    ev.port,
-                    events.sysex_bytes(&ev.body),
-                );
+        match event {
+            LosslessEventRef::Typed(event) => match event.body {
+                // Re-copy the payload so the scratch carries its own pool
+                // entry; a pool-full drop matches the documented `SysEx`
+                // overflow behaviour and can't occur in practice (the
+                // scratch pool matches the source pool's size).
+                EventBody::SysEx { .. } => {
+                    let _ = scratch.push_sysex_on_port(
+                        rebased_offset,
+                        event.port,
+                        events.sysex_bytes(&event.body),
+                    );
+                }
+                body => scratch.push(Event::on_port(rebased_offset, event.port, body)),
+            },
+            LosslessEventRef::Exact(exact) => {
+                let rebased_exact = ExactEvent::new(rebased_offset, *exact.body())
+                    .with_qualifiers(exact.qualifiers())
+                    .with_metadata(exact.metadata());
+                let exact_is_sysex = matches!(exact.body(), ExactEventBody::SysEx { .. });
+                let exact_owns_sysex = exact_is_sysex && exact.fallback().is_none();
+                let token = if exact_owns_sysex {
+                    let Some(bytes) = exact.sysex_bytes_checked() else {
+                        continue;
+                    };
+                    scratch.try_push_exact_sysex_token(rebased_offset, bytes, rebased_exact)
+                } else if let Some(fallback) = exact.fallback() {
+                    match fallback.body {
+                        EventBody::SysEx { .. } => scratch.try_push_sysex_with_exact_on_port_token(
+                            rebased_offset,
+                            fallback.port,
+                            events.sysex_bytes(&fallback.body),
+                            rebased_exact,
+                        ),
+                        body => scratch.try_push_with_exact_token(
+                            Event::on_port(rebased_offset, fallback.port, body),
+                            rebased_exact,
+                        ),
+                    }
+                } else {
+                    scratch.try_push_exact_token(rebased_exact)
+                };
+                let Ok(token) = token else {
+                    continue;
+                };
+                for companion in exact.companions() {
+                    match companion.body {
+                        EventBody::SysEx { .. } => {
+                            if exact_owns_sysex {
+                                let _ = scratch.try_push_exact_sysex_view_companion(
+                                    token,
+                                    rebased_offset,
+                                    companion.port,
+                                );
+                            } else {
+                                let _ = scratch.try_push_sysex_exact_companion(
+                                    token,
+                                    rebased_offset,
+                                    companion.port,
+                                    events.sysex_bytes(&companion.body),
+                                );
+                            }
+                        }
+                        body => {
+                            let _ = scratch.try_push_exact_companion(
+                                token,
+                                Event::on_port(rebased_offset, companion.port, body),
+                            );
+                        }
+                    }
+                }
             }
-            body => scratch.push(Event::on_port(rebased_offset, ev.port, body)),
         }
     }
 }
@@ -381,16 +472,18 @@ fn rebase_events_into(
 /// with sub-block-relative offsets (e.g. "MIDI out on sample 10 of
 /// the sub-block"). The wrapper's per-event host-encode loop expects
 /// host-block-rate timings, so shift here once per sub-block.
-fn rebase_output_events(output_events: &mut EventList, from: usize, sub_block_start: usize) {
+fn rebase_output_events(
+    output_events: &mut EventList,
+    event_from: usize,
+    exact_from: usize,
+    sub_block_start: usize,
+) {
     #[allow(clippy::cast_possible_truncation)]
     let shift = sub_block_start as u32;
     if shift == 0 {
         return;
     }
-    let slice = output_events.events_mut();
-    for ev in slice.iter_mut().skip(from) {
-        ev.sample_offset = ev.sample_offset.saturating_add(shift);
-    }
+    output_events.shift_offsets_from(event_from, exact_from, shift);
 }
 
 #[cfg(test)]

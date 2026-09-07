@@ -23,10 +23,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use truce_core::buffer::RawBufferScratch;
+use truce_core::bus_routing::{BusActivation, BusRouting, bus_layout_fits_routing};
 use truce_core::cast::{sample_count_usize, sample_rate_u32};
-use truce_core::chunked_process::{ChunkedProcess, process_chunked};
+use truce_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
 use truce_core::config::{AudioConfig, ProcessMode};
-use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList};
+use truce_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus};
 use truce_core::export::PluginExport;
 use truce_core::info::PluginCategory;
 use truce_params::{ParamInfo, Params};
@@ -626,6 +627,15 @@ pub fn start_audio<P: PluginExport>(opts: &Options) -> Result<AudioHandles<P>, B
     // match its output width but falls back to the device default (the
     // plugin output then maps onto whatever channels the device gives).
     let layout_index = selected_layout_index::<P>(opts);
+    if let Some(layout) = P::bus_layouts().get(layout_index)
+        && !bus_layout_fits_routing(layout)
+    {
+        return Err(format!(
+            "selected bus layout {layout_index} exceeds BusRouting's limit of 32 buses per \
+             direction and 65,535 channels per bus"
+        )
+        .into());
+    }
     let (num_in, num_out, num_main_in) = layout_at_index::<P>(layout_index);
     let requested_channels = u16::try_from(num_out).ok().filter(|&c| c > 0);
     let config: cpal::StreamConfig =
@@ -839,6 +849,7 @@ pub fn start_audio<P: PluginExport>(opts: &Options) -> Result<AudioHandles<P>, B
                 num_in,
                 num_out,
                 num_main_in,
+                layout_index,
                 is_effect,
                 res,
             );
@@ -1077,6 +1088,7 @@ fn output_worker<P: PluginExport>(
     // reassigned - not re-derived from ambiguous totals - on a runtime
     // `SetLayout` switch below.
     mut num_main_in: usize,
+    mut layout_index: usize,
     is_effect: bool,
     res: OutputResources<P>,
 ) {
@@ -1091,6 +1103,7 @@ fn output_worker<P: PluginExport>(
         num_in,
         num_out,
         num_main_in,
+        layout_index,
         is_effect,
         false,
         &res,
@@ -1119,6 +1132,7 @@ fn output_worker<P: PluginExport>(
                     num_in,
                     num_out,
                     num_main_in,
+                    layout_index,
                     is_effect,
                     false,
                     &res,
@@ -1136,6 +1150,7 @@ fn output_worker<P: PluginExport>(
                         num_in,
                         num_out,
                         num_main_in,
+                        layout_index,
                         is_effect,
                         false,
                         &res,
@@ -1146,6 +1161,18 @@ fn output_worker<P: PluginExport>(
                 }
             }
             OutputCmd::SetLayout { index } => {
+                let layouts = P::bus_layouts();
+                let Some(layout) = layouts.get(index) else {
+                    eprintln!("bus-layout: index {index} is not declared");
+                    continue;
+                };
+                if !bus_layout_fits_routing(layout) {
+                    eprintln!(
+                        "bus-layout: index {index} exceeds BusRouting's limit of 32 buses per \
+                         direction and 65,535 channels per bus"
+                    );
+                    continue;
+                }
                 let host = cpal::default_host();
                 let name = res.current_name.lock().ok().and_then(|g| g.clone());
                 let device = match name.as_deref() {
@@ -1175,6 +1202,7 @@ fn output_worker<P: PluginExport>(
                 num_in = new_in;
                 num_out = new_out;
                 num_main_in = new_main_in;
+                layout_index = index;
                 stream = None;
                 if let Err(e) = open_output_stream::<P>(
                     name.as_deref(),
@@ -1185,6 +1213,7 @@ fn output_worker<P: PluginExport>(
                     num_in,
                     num_out,
                     num_main_in,
+                    layout_index,
                     is_effect,
                     true,
                     &res,
@@ -1197,6 +1226,7 @@ fn output_worker<P: PluginExport>(
                     num_in = old_in;
                     num_out = old_out;
                     num_main_in = old_main_in;
+                    layout_index = res.layout.load(Ordering::Relaxed);
                     config.channels = old_channels;
                     if let Err(e2) = reopen_output_or_default::<P>(
                         name.as_deref(),
@@ -1206,6 +1236,7 @@ fn output_worker<P: PluginExport>(
                         num_in,
                         num_out,
                         num_main_in,
+                        layout_index,
                         is_effect,
                         true,
                         &res,
@@ -1238,6 +1269,7 @@ fn reopen_output_or_default<P: PluginExport>(
     num_in: usize,
     num_out: usize,
     num_main_in: usize,
+    layout_index: usize,
     is_effect: bool,
     force_reset: bool,
     res: &OutputResources<P>,
@@ -1252,6 +1284,7 @@ fn reopen_output_or_default<P: PluginExport>(
         num_in,
         num_out,
         num_main_in,
+        layout_index,
         is_effect,
         force_reset,
         res,
@@ -1269,6 +1302,7 @@ fn reopen_output_or_default<P: PluginExport>(
         num_in,
         num_out,
         num_main_in,
+        layout_index,
         is_effect,
         force_reset,
         res,
@@ -1291,6 +1325,7 @@ fn open_output_stream<P: PluginExport>(
     // num_in) are the sidechain bus. Resolved by the caller from the
     // selected layout index (see `layout_at_index`).
     num_main_in: usize,
+    layout_index: usize,
     is_effect: bool,
     // Force a `reset()` even when the frame bound didn't grow. A bus-layout
     // switch changes the channel arrangement, so the plugin has to re-prepare
@@ -1394,6 +1429,7 @@ fn open_output_stream<P: PluginExport>(
         p.reset(&AudioConfig::new(sample_rate, frame_bound));
     }
     scratch.ensure_capacity(num_in, num_out, frame_bound);
+    let bus_routing = bus_routing_at_index::<P>(layout_index);
     // `num_main_in` (the main/sidechain split of the selected layout) is
     // resolved by the caller and passed in - the layout is fixed for the
     // stream's lifetime.
@@ -1411,6 +1447,7 @@ fn open_output_stream<P: PluginExport>(
                         num_out,
                         sample_rate,
                         is_effect,
+                        bus_routing,
                         &plugin_a,
                         &pending_a,
                         &pending_state_a,
@@ -1740,6 +1777,40 @@ fn layout_at_index<P: PluginExport>(idx: usize) -> (usize, usize, usize) {
     })
 }
 
+fn bus_routing_at_index<P: PluginExport>(idx: usize) -> BusRouting {
+    let mut routing = BusRouting::new();
+    let Some(layout) = P::bus_layouts().into_iter().nth(idx) else {
+        return routing;
+    };
+    for bus in layout.inputs {
+        let state = if bus.enabled {
+            BusActivation::Active
+        } else {
+            BusActivation::Inactive
+        };
+        let channels = if bus.enabled {
+            bus.channels.channel_count()
+        } else {
+            0
+        };
+        assert!(routing.push_input(channels, state));
+    }
+    for bus in layout.outputs {
+        let state = if bus.enabled {
+            BusActivation::Active
+        } else {
+            BusActivation::Inactive
+        };
+        let channels = if bus.enabled {
+            bus.channels.channel_count()
+        } else {
+            0
+        };
+        assert!(routing.push_output(channels, state));
+    }
+    routing
+}
+
 /// Whether the output device advertises a config with exactly `ch`
 /// channels. Used to reject a `--bus-layout` wider than the hardware.
 fn device_supports_output_channels(device: &cpal::Device, ch: u16) -> bool {
@@ -1857,6 +1928,7 @@ fn audio_callback<P: PluginExport>(
     num_out: usize,
     sample_rate: f64,
     is_effect: bool,
+    bus_routing: BusRouting,
     plugin: &Arc<Mutex<P>>,
     pending: &Arc<ArrayQueue<MidiEvent>>,
     pending_state: &Arc<ArrayQueue<Vec<u8>>>,
@@ -1917,6 +1989,7 @@ fn audio_callback<P: PluginExport>(
     // arrive one block late at offset 0 instead.
     event_list.clear();
     output_events.clear();
+    output_events.clear_overflow();
     while let Some(ev) = pending.pop() {
         event_list.push(Event {
             sample_offset: 0,
@@ -2069,13 +2142,25 @@ fn audio_callback<P: PluginExport>(
         param_infos,
         min_subblock_samples,
     };
-    process_chunked(
+    process_chunked_with_bus_routing(
         &mut *plugin,
         params_arc.as_ref() as &dyn Params,
         &mut audio_buffer,
         chunk_args,
+        bus_routing,
     );
     let _ = audio_buffer;
+    let output_status = output_events.overflow().map_or_else(
+        || {
+            if output_events.is_empty() {
+                OutputEventStatus::Success
+            } else {
+                OutputEventStatus::Unsupported
+            }
+        },
+        OutputEventStatus::BufferFull,
+    );
+    output_events.set_output_status(output_status);
     // Narrow rendered f64 output back to host f32 when the plugin's
     // `Sample = f64`. No-op for `f32` plugins.
     // SAFETY: `ptr_scratch.outputs` lives through this function;

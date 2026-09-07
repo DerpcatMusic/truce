@@ -91,7 +91,18 @@ impl FloatParam {
         // whatever thread the host calls the setter from). `new` debug-
         // asserts the ordering; this keeps release safe regardless.
         let (lo, hi) = (self.info.range.min(), self.info.range.max());
-        self.value.store(v.clamp(lo.min(hi), lo.max(hi)));
+        let clamped = v.clamp(lo.min(hi), lo.max(hi));
+        let value = if matches!(
+            self.info.range.base(),
+            crate::range::ParamRange::Stepped { .. }
+        ) {
+            self.info
+                .range
+                .denormalize(self.info.range.normalize(clamped))
+        } else {
+            clamped
+        };
+        self.value.store(value);
     }
 
     /// Internal: raw target value at `f64` precision (host-side

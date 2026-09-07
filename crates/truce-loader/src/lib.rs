@@ -31,7 +31,10 @@
 //! // `Sample` resolves through the prelude alias (`f32` for `prelude` /
 //! // `prelude32` / `prelude64m`, `f64` for `prelude64`).
 //! #[unsafe(no_mangle)]
-//! pub fn truce_init_state(params: *const ()) -> *mut () { /* Box<State> */ }
+//! pub fn truce_init_state(
+//!     params: *const (),
+//!     tasks: Option<AnyTaskSpawner>,
+//! ) -> *mut () { /* Box<State> */ }
 //! #[unsafe(no_mangle)]
 //! pub fn truce_process(state: *mut (), params: *const (), /* ... */) { }
 //!
@@ -88,23 +91,102 @@ pub use loader::NativeLoader;
 /// precision-mismatched load.
 #[macro_export]
 macro_rules! export_plugin {
-    ($logic:ty, $params:ty) => {
+    ($logic:ty, $params:ty $(, tasks: [$($task:ty),+])?) => {
+        /// Start this logic generation's own task pool before any DSP call
+        /// can schedule onto it. The shell calls this export on its loader
+        /// thread before activation and rejects the generation if no worker
+        /// can be created.
+        #[unsafe(no_mangle)]
+        pub fn truce_warm_tasks() -> bool {
+            #[allow(unused_mut)]
+            let mut ready = true;
+            $(
+                let _ = ::core::marker::PhantomData::<($($task,)+)>;
+                ready = $crate::__macro_deps::truce_core::tasks::warm_hot_reload_pool();
+            )?
+            ready
+        }
+
+        /// Pause this generation at a worker-entry boundary. A timeout is
+        /// reversible: the pool resumes without losing its queued work.
+        #[unsafe(no_mangle)]
+        pub fn truce_quiesce_tasks(timeout: ::std::time::Duration) -> bool {
+            #[allow(unused_mut)]
+            let mut quiescent = true;
+            $(
+                let _ = ::core::marker::PhantomData::<($($task,)+)>;
+                quiescent = $crate::__macro_deps::truce_core::tasks::quiesce_hot_reload_pool(timeout);
+            )?
+            quiescent
+        }
+
+        /// Stop and join this generation's worker pool. The loader closes all
+        /// task lanes before calling this off-thread.
+        #[unsafe(no_mangle)]
+        pub fn truce_shutdown_tasks() {
+            $(
+                let _ = ::core::marker::PhantomData::<($($task,)+)>;
+                $crate::__macro_deps::truce_core::tasks::shutdown_hot_reload_pool();
+            )?
+        }
+
+        /// Build this logic generation's typed managed-task lanes. The
+        /// queues and handler vtables originate in the same dylib as the
+        /// task values that `init` / `process` enqueue into them.
+        #[unsafe(no_mangle)]
+        pub fn truce_build_tasks(
+            params_ptr: *const (),
+        ) -> ::core::option::Option<
+            $crate::__macro_deps::truce_core::tasks::AnyTaskSpawner,
+        > {
+            #[allow(unused_mut)]
+            let mut bundle =
+                $crate::__macro_deps::truce_core::tasks::TaskSpawnerBundle::new();
+            $(
+                // SAFETY: the shell passes `Arc::as_ptr(&params)` and owns
+                // that Arc for the complete loader/task-generation lifetime.
+                let params: Arc<$params> = unsafe {
+                    Arc::increment_strong_count(params_ptr.cast::<$params>());
+                    Arc::from_raw(params_ptr.cast::<$params>())
+                };
+                $(
+                    let run = {
+                        let params = Arc::clone(&params);
+                        move |task| {
+                            <$task as $crate::__macro_deps::truce_plugin::BackgroundTask>::run_once(
+                                task,
+                                &params,
+                            )
+                        }
+                    };
+                    let spawner = if <$task as $crate::__macro_deps::truce_plugin::BackgroundTask>::SERIALIZED {
+                        $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new_managed_serialized(run)
+                    } else {
+                        $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new_managed(run)
+                    };
+                    bundle.push(spawner);
+                )+
+            )?
+            bundle.into_any()
+        }
+
         /// Build the initial DSP state; returns an erased `Box<State>`.
         #[unsafe(no_mangle)]
-        pub fn truce_init_state(params_ptr: *const ()) -> *mut () {
+        pub fn truce_init_state(
+            params_ptr: *const (),
+            tasks: ::core::option::Option<
+                $crate::__macro_deps::truce_core::tasks::AnyTaskSpawner,
+            >,
+        ) -> *mut () {
             let params: &$params = unsafe { &*(params_ptr as *const $params) };
-            // Background tasks are not yet wired through the hot-reload
-            // dylib boundary; pass an empty context (no spawner).
-            let cx = $crate::__macro_deps::truce_core::tasks::InitContext::new(
-                ::core::option::Option::None,
-            );
+            let cx = $crate::__macro_deps::truce_core::tasks::InitContext::new(tasks);
             let state = <$logic as $crate::PluginLogicCore<Sample>>::init(params, &cx);
             Box::into_raw(Box::new(state)).cast::<()>()
         }
 
         /// Drop a state allocated by *this* dylib's `truce_init_state`.
-        /// Called by the shell through the origin dylib (kept alive by
-        /// the loader's leaked-handle policy) so `State`'s `Drop` runs
+        /// Called by the shell through the origin dylib (kept mapped by
+        /// the loader's retired-generation ownership) so `State`'s `Drop` runs
         /// with the code that produced it.
         #[unsafe(no_mangle)]
         pub fn truce_drop_state(state: *mut ()) {

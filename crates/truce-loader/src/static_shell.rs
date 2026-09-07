@@ -66,6 +66,14 @@ pub struct StaticShell<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample =
 // `parking_lot::Mutex`.
 unsafe impl<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample> Send for StaticShell<P, L, S> {}
 
+impl<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample> Drop for StaticShell<P, L, S> {
+    fn drop(&mut self) {
+        if let Some(tasks) = &self.tasks {
+            tasks.close();
+        }
+    }
+}
+
 impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static, S: Sample>
     StaticShell<P, L, S>
 {
@@ -197,6 +205,7 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
             &mut *context.output_events,
         )
         .with_process_mode(context.process_mode)
+        .with_bus_routing(context.bus_routing)
         .with_params(&param_fn)
         .with_meters(&meter_fn);
         // Stamp the background-task spawner so `ctx.tasks::<T>()` works.
@@ -369,6 +378,7 @@ macro_rules! export_static {
     (
         params: $params:ty,
         info: $info:expr,
+        $(vst3_class_id: $vst3_class_id:expr,)?
         logic: $logic:ty,
         $(tasks: [$($task:ty),+],)?
     ) => {
@@ -406,6 +416,15 @@ macro_rules! export_static {
             {
                 $info
             }
+
+            $(
+                fn vst3_class_id() -> Option<[u8; 16]>
+                where
+                    Self: Sized,
+                {
+                    $vst3_class_id
+                }
+            )?
 
             fn bus_layouts() -> Vec<$crate::__macro_deps::truce_core::bus::BusLayout>
             where
@@ -486,7 +505,7 @@ macro_rules! export_static {
                         let __task_run = {
                             let params = std::sync::Arc::clone(&params);
                             move |task| {
-                                <$task as $crate::__macro_deps::truce_plugin::BackgroundTask>::run(
+                                <$task as $crate::__macro_deps::truce_plugin::BackgroundTask>::run_once(
                                     task, &params,
                                 )
                             }
@@ -495,9 +514,9 @@ macro_rules! export_static {
                         // for this lane; the const folds the branch at
                         // compile time.
                         let __spawner = if <$task as $crate::__macro_deps::truce_plugin::BackgroundTask>::SERIALIZED {
-                            $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new_serialized(__task_run)
+                            $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new_managed_serialized(__task_run)
                         } else {
-                            $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new(__task_run)
+                            $crate::__macro_deps::truce_core::tasks::TaskSpawner::<$task>::new_managed(__task_run)
                         };
                         __task_bundle.push(__spawner);
                     })+

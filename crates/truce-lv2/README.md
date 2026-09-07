@@ -29,6 +29,14 @@ truce build --lv2` / `install --lv2` selects it at the CLI.
 - Turtle (`manifest.ttl`, `plugin.ttl`) sidecars emitted by the
   `export_lv2!` proc-macro at compile time
 
+LV2 ports are fixed by the bundle's RDF and have no runtime bus-activation
+callback. The format can make a declared port optional with
+`lv2:connectionOptional`, but Truce's compile-time TTL currently knows only the
+category-derived main I/O, not runtime `bus_layouts()`. Sidechains therefore
+remain unavailable in LV2 instead of being advertised with fake activation.
+`ProcessContext::bus_routing` consequently reports only the generated main
+input/output ranges and whether their port pointers are connected.
+
 ## Key macro
 
 - **`export_lv2!`** -- generates the LV2 entry point for a `PluginExport` type
