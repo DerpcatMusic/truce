@@ -3779,6 +3779,14 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             editor.state_changed();
         }
 
+        // State and preset loads change values outside host automation.
+        if !data.host_params.is_null()
+            && !data.host.is_null()
+            && let Some(rescan) = (*data.host_params).rescan
+        {
+            rescan(data.host, CLAP_PARAM_RESCAN_VALUES);
+        }
+
         true
     })
 }
@@ -3850,6 +3858,14 @@ unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
         }
         if let Some(ref mut editor) = data.gui.enter().editor {
             editor.state_changed();
+        }
+
+        // State and preset loads change values outside host automation.
+        if !data.host_params.is_null()
+            && !data.host.is_null()
+            && let Some(rescan) = (*data.host_params).rescan
+        {
+            rescan(data.host, CLAP_PARAM_RESCAN_VALUES);
         }
 
         // Tell the host the preset landed so it can update its
