@@ -22,12 +22,13 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,6 +42,7 @@ jobs:
   test:
     name: ubuntu-24.04 (stable)
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -52,10 +54,16 @@ jobs:
       # out of the cache. Caching it bit us with `cargo` resolving
       # to a stale `rustup-init` after restore — see the workflow
       # history if this needs revisiting.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
         with:
           key: ubuntu-24.04
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            crates/truce-slint -> target
+            crates/truce-vizia -> target
+            crates/truce-gpu-examples -> target
 
       - name: Linux system deps
         run: |
@@ -215,15 +223,20 @@ jobs:
   sub-workspaces-slint:
     name: ubuntu-24.04 (truce-slint sub-workspace)
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
         with:
           key: ubuntu-24.04-sub-workspaces-slint
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            crates/truce-slint -> target
 
       - name: Linux system deps
         run: |
@@ -306,15 +319,20 @@ jobs:
   sub-workspaces-vizia:
     name: ubuntu-24.04 (truce-vizia sub-workspace)
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
         with:
           key: ubuntu-24.04-sub-workspaces-vizia
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            crates/truce-vizia -> target
 
       - name: Linux system deps
         run: |

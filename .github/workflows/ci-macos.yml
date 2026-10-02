@@ -14,12 +14,13 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     name: macos-14 (stable)
     runs-on: macos-14
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -48,10 +49,16 @@ jobs:
       # out of the cache. Caching it bit us with `cargo` resolving
       # to a stale `rustup-init` after restore — see the workflow
       # history if this needs revisiting.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
         with:
           key: macos-14
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            crates/truce-slint -> target
+            crates/truce-vizia -> target
+            crates/truce-gpu-examples -> target
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -193,13 +200,17 @@ jobs:
     # latest image makes such OS-behaviour regressions fail here, pre-release.
     name: gui hitTest (windowed, newest macOS)
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
         with:
           key: macos-gui-window
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
       - name: windowed hitTest smoke
         run: ./scripts/gui-window-test.sh
 
@@ -211,6 +222,7 @@ jobs:
   sub-workspaces:
     name: macos-latest (sub-workspaces)
     runs-on: macos-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -230,10 +242,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
         with:
           key: macos-sub-workspaces
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            crates/truce-slint -> target
+            crates/truce-vizia -> target
 
       - name: Cache pluginval
         id: cache-pluginval

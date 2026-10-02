@@ -14,12 +14,13 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     name: windows-latest (stable)
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -31,10 +32,16 @@ jobs:
       # out of the cache. Caching it bit us with `cargo` resolving
       # to a stale `rustup-init` after restore — see the workflow
       # history if this needs revisiting.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
         with:
           key: windows-latest
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            crates/truce-slint -> target
+            crates/truce-vizia -> target
+            crates/truce-gpu-examples -> target
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -177,15 +184,21 @@ jobs:
   sub-workspaces:
     name: windows-latest (sub-workspaces)
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 (Node 24)
         with:
           key: windows-sub-workspaces
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            crates/truce-slint -> target
+            crates/truce-vizia -> target
 
       - name: Cache pluginval
         id: cache-pluginval
